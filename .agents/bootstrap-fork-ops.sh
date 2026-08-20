@@ -17,9 +17,16 @@ die() {
 }
 
 is_fork_url() {
-  case "$1" in
+  local remote_url="$1"
+  while [[ "$remote_url" == */ ]]; do
+    remote_url="${remote_url%/}"
+  done
+
+  case "$remote_url" in
     "https://github.com/nisavid/computer-use-linux" | "$fork_https_url" | \
+      "git@github.com:nisavid/computer-use-linux" | \
       "git@github.com:nisavid/computer-use-linux.git" | \
+      "ssh://git@github.com/nisavid/computer-use-linux" | \
       "ssh://git@github.com/nisavid/computer-use-linux.git")
       return 0
       ;;
@@ -30,9 +37,16 @@ is_fork_url() {
 }
 
 is_upstream_url() {
-  case "$1" in
+  local remote_url="$1"
+  while [[ "$remote_url" == */ ]]; do
+    remote_url="${remote_url%/}"
+  done
+
+  case "$remote_url" in
     "https://github.com/agent-sh/computer-use-linux" | "$upstream_https_url" | \
+      "git@github.com:agent-sh/computer-use-linux" | \
       "git@github.com:agent-sh/computer-use-linux.git" | \
+      "ssh://git@github.com/agent-sh/computer-use-linux" | \
       "ssh://git@github.com/agent-sh/computer-use-linux.git")
       return 0
       ;;
@@ -74,7 +88,10 @@ main() {
     git -C "$repo_root" remote add upstream "$upstream_https_url"
   fi
 
-  git -C "$repo_root" remote set-url --push upstream DISABLED
+  if git -C "$repo_root" config --get-all remote.upstream.pushurl >/dev/null; then
+    git -C "$repo_root" config --unset-all remote.upstream.pushurl
+  fi
+  git -C "$repo_root" config --add remote.upstream.pushurl DISABLED
   git -C "$repo_root" fetch --no-tags upstream \
     "+refs/heads/main:$upstream_main_ref"
 

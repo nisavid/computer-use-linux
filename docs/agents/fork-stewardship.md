@@ -34,7 +34,8 @@ contract aligned.
 
 ## Local bootstrap
 
-After a fresh clone, run:
+After a fresh clone, or before an upstream-track operation when
+`upstream-main` is missing, run:
 
 ```sh
 ./.agents/bootstrap-fork-ops.sh

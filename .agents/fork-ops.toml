@@ -59,8 +59,8 @@ owner_remote = "upstream"
 tracking_ref = "refs/remotes/upstream/main"
 update_policy = "fetch-only"
 sync_eligible = false
-evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main or record the divergence"]
-notes = "This track supports inspection and does not authorize autonomous synchronization."
+evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main"]
+notes = "This track supports inspection and does not authorize autonomous synchronization. If the ancestry check exits 1, record the divergence before proceeding."
 
 [[local_surfaces]]
 kind = "config"
