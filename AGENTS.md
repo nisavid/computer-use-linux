@@ -36,6 +36,11 @@ authority and operating contract. Use `fork-ops` for supported configuration,
 capability, and status operations. Do not infer authority for planned Fork Ops
 operations that its current capability report does not implement.
 
+After a fresh clone, or before an upstream-track operation when the track is
+missing, run `.agents/bootstrap-fork-ops.sh`. It verifies the fork origin,
+provisions the read-only `upstream` remote, disables upstream pushes, and
+fetches upstream `main`.
+
 ## Operating Policy
 
 - This repository uses agentic engineering and operations. Agents should perform assigned tasks autonomously until they reach a boundary that requires stakeholder policy or an unavailable control surface.

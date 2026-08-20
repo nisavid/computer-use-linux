@@ -10,7 +10,7 @@ At that baseline, the fork has no product, package, binary, or runtime behavior
 divergence. Its carried changes are agent-maintenance infrastructure:
 
 - `.agnix.toml`
-- `.agents/fork-ops.toml`
+- `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`
 - `AGENTS.md` and its `CLAUDE.md` compatibility link
 - `docs/agents/`
 
@@ -31,6 +31,19 @@ Use these sources in descending order:
 Escalate when these sources conflict or a consequential stakeholder policy is
 unknown. Record durable fork-policy decisions here and keep the machine-readable
 contract aligned.
+
+## Local bootstrap
+
+After a fresh clone, run:
+
+```sh
+./.agents/bootstrap-fork-ops.sh
+```
+
+The script verifies that `origin` names this fork, creates or verifies the
+`upstream` remote, sets its push URL to `DISABLED`, fetches upstream `main`, and
+verifies the remote-tracking ref. It is idempotent. Stop on an identity mismatch
+instead of rewriting an unexpected remote.
 
 ## Change targets
 
