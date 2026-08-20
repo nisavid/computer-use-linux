@@ -88,14 +88,12 @@ main() {
     git -C "$repo_root" remote add upstream "$upstream_https_url"
   fi
 
-  if git -C "$repo_root" config --get-all remote.upstream.pushurl >/dev/null; then
-    git -C "$repo_root" config --unset-all remote.upstream.pushurl
-  fi
-  git -C "$repo_root" config --add remote.upstream.pushurl DISABLED
+  git -C "$repo_root" config --local --replace-all remote.upstream.pushurl ''
+  git -C "$repo_root" config --local --add remote.upstream.pushurl DISABLED
   git -C "$repo_root" fetch --no-tags upstream \
     "+refs/heads/main:$upstream_main_ref"
 
-  [[ "$(git -C "$repo_root" remote get-url --push upstream)" == DISABLED ]] ||
+  [[ "$(git -C "$repo_root" remote get-url --push --all upstream)" == DISABLED ]] ||
     die 'upstream push URL is not disabled'
   upstream_sha="$(git -C "$repo_root" rev-parse --verify "$upstream_main_ref^{commit}")" ||
     die 'upstream main was not fetched'
