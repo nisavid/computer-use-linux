@@ -5,13 +5,19 @@ Issues and specs for this repository live in GitHub Issues for
 
 ## Repository boundary
 
-- Pass `--repo nisavid/computer-use-linux` to every `gh issue` command.
+These rules govern agent-, skill-, and operator-issued tracker operations from
+a checkout. Checked-in automation may use repository context supplied by its
+execution environment when that repository-relative behavior is part of the
+workflow contract.
+
+- Pass `--repo nisavid/computer-use-linux` to every such `gh issue` command.
 - Pass an explicit `--repo` to every `gh pr` command: use
   `nisavid/computer-use-linux` for fork-local pull requests and
   `agent-sh/computer-use-linux` for upstream contribution pull requests.
 - Use explicit `repos/nisavid/computer-use-linux/...` paths for tracker-related
   `gh api` calls.
-- Never rely on GitHub CLI repository inference in this checkout.
+- Never rely on GitHub CLI repository inference for agent, skill, or interactive
+  operator commands in this checkout.
 - Operations against `agent-sh/computer-use-linux` require separate, explicit
   direction. This tracker configuration does not authorize upstream issues.
 
@@ -59,6 +65,6 @@ When a skill says to fetch a ticket, read it from
 - **Resolve**: Post the answer, close the ticket, then add a short linked
   context pointer to the map's Decisions-so-far section.
 
-Every issue command and issue-related API request must explicitly target
-`nisavid/computer-use-linux`. `gh pr` commands must follow the repository
-rules above.
+Every agent-, skill-, and operator-issued issue command and issue-related API
+request must explicitly target `nisavid/computer-use-linux`. `gh pr` commands
+must follow the repository rules above.
