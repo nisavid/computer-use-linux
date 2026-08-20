@@ -73,15 +73,16 @@ main() {
   command -v git >/dev/null 2>&1 || die 'git is required'
 
   local repo_root origin_url upstream_url upstream_sha
+  local -a configured_push_urls=()
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
     die 'run this script from a computer-use-linux checkout'
 
-  origin_url="$(git -C "$repo_root" remote get-url origin 2>/dev/null)" ||
+  origin_url="$(git -C "$repo_root" config --local --get remote.origin.url 2>/dev/null)" ||
     die 'origin is missing'
   is_fork_url "$origin_url" ||
     die "origin does not identify nisavid/computer-use-linux: $origin_url"
 
-  if upstream_url="$(git -C "$repo_root" remote get-url upstream 2>/dev/null)"; then
+  if upstream_url="$(git -C "$repo_root" config --local --get remote.upstream.url 2>/dev/null)"; then
     is_upstream_url "$upstream_url" ||
       die "upstream does not identify agent-sh/computer-use-linux: $upstream_url"
   else
@@ -93,8 +94,13 @@ main() {
   git -C "$repo_root" fetch --no-tags upstream \
     "+refs/heads/main:$upstream_main_ref"
 
-  [[ "$(git -C "$repo_root" remote get-url --push --all upstream)" == DISABLED ]] ||
-    die 'upstream push URL is not disabled'
+  mapfile -t configured_push_urls < <(
+    git -C "$repo_root" config --local --get-all remote.upstream.pushurl
+  )
+  ((${#configured_push_urls[@]} == 2)) &&
+    [[ -z "${configured_push_urls[0]}" ]] &&
+    [[ "${configured_push_urls[1]}" == DISABLED ]] ||
+    die 'upstream push URL config is not safely disabled'
   upstream_sha="$(git -C "$repo_root" rev-parse --verify "$upstream_main_ref^{commit}")" ||
     die 'upstream main was not fetched'
 
