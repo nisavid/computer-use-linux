@@ -59,5 +59,6 @@ When a skill says to fetch a ticket, read it from
 - **Resolve**: Post the answer, close the ticket, then add a short linked
   context pointer to the map's Decisions-so-far section.
 
-Every tracker command and API request must explicitly target
-`nisavid/computer-use-linux`.
+Every issue command and issue-related API request must explicitly target
+`nisavid/computer-use-linux`. `gh pr` commands must follow the repository
+rules above.

@@ -1,0 +1,101 @@
+schema_version = "0.1"
+
+[repository]
+host = "github"
+owner = "nisavid"
+name = "computer-use-linux"
+default_branch = "main"
+
+[authority]
+source_order = ["explicit-user-direction", "current-upstream-product-truth", "fork-local-policy", "source-and-tests", "revalidated-agent-notes"]
+upstream_canon = "Upstream source, documentation, releases, and maintainer guidance are canonical for product behavior unless fork-local authority defines a divergence."
+inference_labeling = "Label important inferences when direct evidence is unavailable."
+required_context_paths = ["AGENTS.md", "docs/agents/domain.md", "docs/agents/fork-stewardship.md"]
+pre_change_requirements = ["Verify current refs and worktree state.", "Review the fork divergence inventory.", "Identify the affected generated and runtime surfaces.", "Select validation gates for the affected behavior."]
+durable_discovery_destinations = ["AGENTS.md for always-loaded operating rules.", "docs/agents/fork-stewardship.md for maintained fork policy."]
+escalation_policy = "Escalate consequential conflicts, unknown stakeholder policy, unavailable control surfaces, and upstream operations without explicit direction."
+
+[change_targets]
+default = "fork"
+upstream_contribution = "explicit-only"
+upstream_issues = "explicit-only"
+selective_upstreaming = "explicit-only"
+
+[[fork_remotes]]
+name = "origin"
+owner = "nisavid"
+purpose = "fork-origin"
+url = "https://github.com/nisavid/computer-use-linux.git"
+push = true
+
+[[upstreams]]
+id = "computer-use-linux"
+name = "computer-use-linux"
+owner = "agent-sh"
+remote = "upstream"
+url = "https://github.com/agent-sh/computer-use-linux.git"
+push_url = "DISABLED"
+default_branch = "main"
+push = false
+
+[[release_channels]]
+id = "stable"
+upstream = "computer-use-linux"
+kind = "github_latest_release"
+selection_source = "github-releases"
+include_drafts = false
+include_prereleases = false
+notes = "Select the current stable upstream release from live GitHub Releases."
+
+[[upstream_tracks]]
+id = "upstream-main"
+upstream = "computer-use-linux"
+ref = "refs/remotes/upstream/main"
+role = "current upstream main scouting track"
+source_type = "upstream_ref"
+source = "refs/remotes/upstream/main"
+source_ref = "refs/remotes/upstream/main"
+owner_remote = "upstream"
+tracking_ref = "refs/remotes/upstream/main"
+update_policy = "fetch-only"
+sync_eligible = false
+evidence_checks = ["git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main or record the divergence"]
+notes = "This track supports inspection and does not authorize autonomous synchronization."
+
+[[local_surfaces]]
+kind = "config"
+path = ".agents/fork-ops.toml"
+domain = "identity"
+portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "agent_instruction"
+path = "AGENTS.md"
+domains = ["authority", "workflow"]
+portability_hints = ["shared-with-fork-policy", "repo-ops-candidate"]
+repo_ops_candidate_scope = "Operating Policy only"
+
+[[local_surfaces]]
+kind = "agent_instruction"
+path = "CLAUDE.md"
+domain = "workflow"
+portability_hint = "shared-with-fork-policy"
+notes = "Compatibility link to AGENTS.md."
+
+[[local_surfaces]]
+kind = "doc"
+path = "docs/agents/fork-stewardship.md"
+domain = "authority"
+portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "doc"
+path = "docs/agents/issue-tracker.md"
+domain = "issue-routing"
+portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "config"
+path = ".agnix.toml"
+domain = "agent-document-validation"
+portability_hint = "shared-with-fork-policy"
