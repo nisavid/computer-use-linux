@@ -11,7 +11,7 @@ source_order = ["explicit-user-direction", "current-upstream-product-truth", "fo
 upstream_canon = "Upstream source, documentation, releases, and maintainer guidance are canonical for product behavior unless fork-local authority defines a divergence."
 inference_labeling = "Label important inferences when direct evidence is unavailable."
 required_context_paths = ["AGENTS.md", "docs/agents/domain.md", "docs/agents/fork-stewardship.md"]
-pre_change_requirements = ["Verify current refs and worktree state.", "Review the fork divergence inventory.", "Identify the affected generated and runtime surfaces.", "Select validation gates for the affected behavior."]
+pre_change_requirements = ["Run ./.agents/bootstrap-fork-ops.sh before upstream-track operations.", "Verify current refs and worktree state.", "Review the fork divergence inventory.", "Identify the affected generated and runtime surfaces.", "Select validation gates for the affected behavior."]
 durable_discovery_destinations = ["AGENTS.md for always-loaded operating rules.", "docs/agents/fork-stewardship.md for maintained fork policy."]
 escalation_policy = "Escalate consequential conflicts, unknown stakeholder policy, unavailable control surfaces, and upstream operations without explicit direction."
 
@@ -59,7 +59,7 @@ owner_remote = "upstream"
 tracking_ref = "refs/remotes/upstream/main"
 update_policy = "fetch-only"
 sync_eligible = false
-evidence_checks = ["git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main or record the divergence"]
+evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main or record the divergence"]
 notes = "This track supports inspection and does not authorize autonomous synchronization."
 
 [[local_surfaces]]
@@ -67,6 +67,13 @@ kind = "config"
 path = ".agents/fork-ops.toml"
 domain = "identity"
 portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "script"
+path = ".agents/bootstrap-fork-ops.sh"
+domain = "identity"
+portability_hint = "fork-specific"
+notes = "Provision and verify the read-only upstream remote after a fresh clone."
 
 [[local_surfaces]]
 kind = "agent_instruction"
