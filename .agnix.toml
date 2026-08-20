@@ -6,6 +6,9 @@ exclude = [
   "node_modules/**",
 ]
 
+[files]
+exclude = ["docs/agents/**"]
+
 [rules]
 skills = true
 mcp = true
