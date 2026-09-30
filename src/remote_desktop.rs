@@ -722,15 +722,6 @@ pub async fn type_text_with_keysyms(
     Ok(())
 }
 
-pub async fn press_keycode_chord(
-    session: &PortalKeyboardSession,
-    modifiers: &[i32],
-    keycode: i32,
-) -> Result<()> {
-    let modifiers: Vec<PortalKey> = modifiers.iter().copied().map(PortalKey::Keycode).collect();
-    press_key_chord(session, &modifiers, PortalKey::Keycode(keycode)).await
-}
-
 /// Press `key` while holding `modifiers`. Keysyms are resolved by the
 /// compositor against the live keymap, so remapped modifiers still act as
 /// the requested modifier; keycodes are physical positions.
@@ -965,6 +956,12 @@ impl PortalPointerSession {
 }
 
 impl PortalKeyboardSession {
+    /// Wait for bounded release and session-close cleanup started by a failed
+    /// keyboard operation before restoring shared clipboard state.
+    pub(crate) async fn wait_for_input_cleanup(&self) {
+        let _guard = self.input_lock.lock().await;
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
     }

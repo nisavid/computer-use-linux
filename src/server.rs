@@ -8,9 +8,9 @@ use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
-    press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
-    start_portal_pointer_session, type_text_with_keysyms, PointerButton, PortalKey,
-    PortalKeyboardSession, PortalPointerSession, ScrollDirection,
+    scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
+    type_text_with_keysyms, PointerButton, PortalKey, PortalKeyboardSession, PortalPointerSession,
+    ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
@@ -1754,9 +1754,18 @@ impl ComputerUseLinux {
     async fn type_text(
         &self,
         Parameters(params): Parameters<TypeTextParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let mut input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        if context.ct.is_cancelled() {
+            return Json(action_result_with_focus(
+                "type_text",
+                Err("Text input cancelled before dispatch.".to_string()),
+                received,
+                None,
+            ));
+        }
         let window_target = params.window_target();
         let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
@@ -1791,9 +1800,45 @@ impl ComputerUseLinux {
                     };
                     let paste_shortcut =
                         kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
-                    let _clipboard_guard = self.kde_clipboard_lock.lock().await;
-                    match run_kde_clipboard_paste_text(&session, &params.text, paste_shortcut).await
-                    {
+                    let clipboard_guard = Arc::clone(&self.kde_clipboard_lock).lock_owned().await;
+                    let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel::<()>();
+                    let cancellation = context.ct.clone();
+                    let owned_session = session.clone();
+                    let text = params.text.clone();
+                    // The owned task retains both locks through restoration.
+                    // Dropping this caller also signals cancellation before
+                    // dispatch; it cannot detach a new paste into the target.
+                    let operation = tokio::spawn(async move {
+                        let _clipboard_guard = clipboard_guard;
+                        let cancelled = async move {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => {},
+                                _ = cancel_receiver => {},
+                            }
+                        };
+                        let result = run_kde_clipboard_paste_text(
+                            &owned_session,
+                            &text,
+                            paste_shortcut,
+                            cancelled,
+                        )
+                        .await;
+                        (input_guard, result)
+                    });
+                    let (guard, paste_result) = match operation.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Json(action_result_with_focus(
+                                "type_text",
+                                Err(format!("KDE clipboard task failed: {error}")),
+                                received,
+                                kde_focus,
+                            ));
+                        }
+                    };
+                    drop(cancel_sender);
+                    input_guard = guard;
+                    match paste_result {
                         Ok(message) => {
                             let notes = self.input_landing_notes(kde_focus.as_ref(), true).await;
                             return Json(with_notes(
@@ -3026,14 +3071,9 @@ impl ComputerUseLinux {
         if self.should_prefer_xdotool_keyboard() {
             return false;
         }
-        if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD") {
-            return self.is_wayland_session() && !self.is_kde_wayland_session();
-        }
-        !self.is_kde_wayland_session()
-            && should_prefer_portal_backend_by_default(
-                self.is_wayland_session(),
-                ydotool_backend_available().await,
-            )
+        // Literal text needs layout-safe input. A stock raw-event daemon
+        // cannot establish the Wayland target's effective keymap and state.
+        self.is_wayland_session() && !self.is_kde_wayland_session()
     }
 
     /// Portal keyboard policy for `press_key` chords. Unlike literal text
@@ -5243,10 +5283,6 @@ fn ydotool_type_timeout(text: &str) -> Duration {
     Duration::from_secs(INPUT_COMMAND_TIMEOUT.as_secs().saturating_add(text_seconds))
 }
 
-const EVDEV_KEY_LEFTCTRL: i32 = 29;
-const EVDEV_KEY_LEFTSHIFT: i32 = 42;
-const EVDEV_KEY_V: i32 = 47;
-const EVDEV_KEY_INSERT: i32 = 110;
 const KDE_CLIPBOARD_RESTORE_MIN_DELAY_MS: u64 = 1_500;
 const KDE_CLIPBOARD_RESTORE_MAX_DELAY_MS: u64 = 5_000;
 const KDE_CLIPBOARD_RESTORE_CHARS_PER_SECOND: u64 = 250;
@@ -5269,6 +5305,14 @@ struct KdeClipboardPasteError {
 }
 
 impl KdeClipboardPasteError {
+    fn cancelled() -> Self {
+        Self {
+            message: "Text input cancelled before paste dispatch.".to_string(),
+            can_fallback_to_ydotool: false,
+            clear_portal_keyboard_session: false,
+        }
+    }
+
     fn before_text_input(message: String) -> Self {
         Self {
             message,
@@ -5286,36 +5330,82 @@ impl KdeClipboardPasteError {
     }
 }
 
-async fn run_kde_clipboard_paste_text(
+async fn run_kde_clipboard_paste_text<F>(
     session: &PortalKeyboardSession,
     text: &str,
     paste_shortcut: KdeClipboardPasteShortcut,
-) -> std::result::Result<String, KdeClipboardPasteError> {
-    let previous = kde_clipboard_contents()
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
-    kde_set_clipboard_contents(text)
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
+    cancelled: F,
+) -> std::result::Result<String, KdeClipboardPasteError>
+where
+    F: Future<Output = ()>,
+{
+    tokio::pin!(cancelled);
+    let previous = tokio::select! {
+        biased;
+        _ = &mut cancelled => return Err(KdeClipboardPasteError::cancelled()),
+        previous = kde_clipboard_contents() => {
+            previous.map_err(KdeClipboardPasteError::before_text_input)?
+        }
+    };
+    // A clipboard write may already have taken effect before its bounded
+    // reply arrives. Complete it before observing cancellation and cleanup.
+    if let Err(write_error) = kde_set_clipboard_contents(text).await {
+        let restore_result = restore_kde_clipboard_text(text, &previous).await;
+        let message = match restore_result {
+            Ok(()) => write_error,
+            Err(restore_error) => format!(
+                "{write_error}; previous KDE clipboard contents could not be restored: {restore_error}"
+            ),
+        };
+        return Err(KdeClipboardPasteError {
+            message,
+            can_fallback_to_ydotool: false,
+            clear_portal_keyboard_session: false,
+        });
+    }
+    tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            let mut error = KdeClipboardPasteError::cancelled();
+            if let Err(restore_error) = restore_kde_clipboard_text(text, &previous).await {
+                error.message.push_str(&format!("; previous KDE clipboard contents could not be restored: {restore_error}"));
+            }
+            return Err(error);
+        }
+        _ = std::future::ready(()) => {}
+    }
 
-    let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
-    let paste_result = press_keycode_chord(session, modifiers, keycode)
+    let (modifiers, key) = kde_clipboard_paste_chord(paste_shortcut);
+    let paste_result = press_key_chord(session, modifiers, key)
         .await
         .map_err(|error| format!("{error:#}"));
 
+    session.wait_for_input_cleanup().await;
     sleep(kde_clipboard_restore_delay(text)).await;
-    let restore_result = kde_set_clipboard_contents(&previous).await;
+    let restore_result = restore_kde_clipboard_text(text, &previous).await;
 
     match (paste_result, restore_result) {
-        (Ok(_), Ok(_)) => Ok("Action pasted through KDE clipboard integration.".to_string()),
+        (Ok(_), Ok(_)) => Ok("Paste shortcut sent through KDE clipboard integration.".to_string()),
         (Err(error), Ok(_)) => Err(KdeClipboardPasteError::after_portal_input(error)),
         (Ok(_), Err(restore_error)) => Ok(format!(
-            "Action pasted through KDE clipboard integration. Warning: previous KDE clipboard contents could not be restored: {restore_error}"
+            "Paste shortcut sent through KDE clipboard integration. Warning: previous KDE clipboard contents could not be restored: {restore_error}"
         )),
         (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::after_portal_input(
             format!("{error}; previous KDE clipboard contents could not be restored: {restore_error}"),
         )),
     }
+}
+
+async fn restore_kde_clipboard_text(
+    prepared: &str,
+    previous: &str,
+) -> std::result::Result<(), String> {
+    // Klipper has no compare-and-set method. Preserve a change already
+    // visible at cleanup; the read and subsequent write are not atomic.
+    if kde_clipboard_contents().await? == prepared {
+        kde_set_clipboard_contents(previous).await?;
+    }
+    Ok(())
 }
 
 /// Paste chord for KDE clipboard text input.
@@ -5398,13 +5488,25 @@ fn kde_clipboard_shortcut_for_focus(
     }
 }
 
-fn kde_clipboard_paste_chord(shortcut: KdeClipboardPasteShortcut) -> (&'static [i32], i32) {
+fn kde_clipboard_paste_chord(
+    shortcut: KdeClipboardPasteShortcut,
+) -> (&'static [PortalKey], PortalKey) {
     match shortcut {
-        KdeClipboardPasteShortcut::Standard => (&[EVDEV_KEY_LEFTCTRL], EVDEV_KEY_V),
-        KdeClipboardPasteShortcut::CtrlShiftV => {
-            (&[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT], EVDEV_KEY_V)
-        }
-        KdeClipboardPasteShortcut::ShiftInsert => (&[EVDEV_KEY_LEFTSHIFT], EVDEV_KEY_INSERT),
+        KdeClipboardPasteShortcut::Standard => (
+            &[PortalKey::Keysym(xkey::Control_L as i32)],
+            PortalKey::Keysym(xkey::v as i32),
+        ),
+        KdeClipboardPasteShortcut::CtrlShiftV => (
+            &[
+                PortalKey::Keysym(xkey::Control_L as i32),
+                PortalKey::Keysym(xkey::Shift_L as i32),
+            ],
+            PortalKey::Keysym(xkey::v as i32),
+        ),
+        KdeClipboardPasteShortcut::ShiftInsert => (
+            &[PortalKey::Keysym(xkey::Shift_L as i32)],
+            PortalKey::Keysym(xkey::Insert as i32),
+        ),
     }
 }
 
@@ -5431,9 +5533,7 @@ async fn kde_set_clipboard_contents(text: &str) -> std::result::Result<(), Strin
 }
 
 async fn kde_clipboard_connection() -> std::result::Result<ZbusConnection, String> {
-    ZbusConnection::session()
-        .await
-        .map_err(|error| format!("failed to connect to session bus for KDE clipboard: {error}"))
+    kde_clipboard_dbus_operation("session bus connection", ZbusConnection::session()).await
 }
 
 async fn kde_clipboard_proxy(
@@ -6940,22 +7040,6 @@ mod tests {
         assert_eq!(
             kde_clipboard_restore_delay(&capped_text),
             Duration::from_millis(KDE_CLIPBOARD_RESTORE_MAX_DELAY_MS)
-        );
-    }
-
-    #[test]
-    fn kde_clipboard_maps_each_paste_shortcut_to_its_chord() {
-        assert_eq!(
-            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::Standard),
-            (&[EVDEV_KEY_LEFTCTRL][..], EVDEV_KEY_V)
-        );
-        assert_eq!(
-            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::CtrlShiftV),
-            (&[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT][..], EVDEV_KEY_V)
-        );
-        assert_eq!(
-            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::ShiftInsert),
-            (&[EVDEV_KEY_LEFTSHIFT][..], EVDEV_KEY_INSERT)
         );
     }
 
