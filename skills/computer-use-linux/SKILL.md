@@ -129,10 +129,10 @@ Pi native tools skip this MCP `command` config; see [Pi setup](references/pi-set
 9. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
 10. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
 
-For text readback, layout-sensitive failures, or desktop-input regressions,
-use [input verification](references/input-verification.md). It covers requested
-scope, ambiguous dispatch, and fixtures that keep tests off the user's input
-seat.
+Before typing or reading back text, and when diagnosing layout-sensitive
+failures or desktop-input regressions, read [input verification](references/input-verification.md).
+It covers requested scope, ambiguous dispatch, and fixtures that keep tests off
+the user's input seat.
 
 Plain left element/index/selector `click` prefers native AT-SPI `click`,
 `press`, or `toggle` over toolkit bounds, avoiding coordinate
