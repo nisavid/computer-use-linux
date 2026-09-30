@@ -3,11 +3,20 @@
 ## Current policy
 
 `nisavid/computer-use-linux` is a maintained fork of
-`agent-sh/computer-use-linux`. The onboarding baseline is upstream `main` at
-`663930fef8d1bee64b7b8f833b68cff3196059e3`.
+`agent-sh/computer-use-linux`. The current synchronization baseline is upstream
+`main` at `418892f10e6840c45d92e4911f499f2e33994c94` (v0.7.7).
 
-At that baseline, the fork has no product, package, binary, or runtime behavior
-divergence. Its carried changes are agent-maintenance infrastructure:
+The `nisavid/input-assumptions` candidate carries the selected desktop input
+repairs from consumer revision `3436cda38d1f6ce1e777186b99c99edbf98aa133`:
+bounded process-output draining, strict accessibility scope and ownership,
+semantic KDE paste with cancellation cleanup, portal cancellation, and
+request-specific verified automatic raw typing. It also carries the associated
+tests, protocol documentation, skill guidance, and research handoff in
+`docs/research/`. See [the qualification handoff](../research/local-repair-qualification.md)
+for the supported profile and remaining publication/adoption gates. These local
+commits do not establish an installed repair or a released artifact.
+
+The fork's agent-maintenance infrastructure remains:
 
 - `.agnix.toml`
 - `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`
@@ -77,7 +86,7 @@ gates.
 
 The fork has no independent release channel. Do not create or push version
 tags, publish fork GitHub releases, or publish to crates.io or npm without
-explicit direction. Keep the versions in `Cargo.toml` and `npm/package.json`
+explicit direction. Keep the versions in `Cargo.toml` and `package.json`
 equal, and treat a release tag, binaries, checksums, and package artifacts as one
 reviewed release unit.
 
