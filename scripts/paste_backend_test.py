@@ -38,6 +38,11 @@ KLIPPER_IFACE = "org.kde.klipper.klipper"
 CONTROL_SERVICE = "org.computeruse.PrivateFixture"
 CONTROL_PATH = "/org/computeruse/PrivateFixture"
 CONTROL_IFACE = "org.computeruse.PrivateFixture"
+WINDOW_SERVICE = "dev.avifenesh.ComputerUseLinux.WindowControl"
+WINDOW_PATH = "/dev/avifenesh/ComputerUseLinux/WindowControl"
+TARGET_WINDOW = 1001
+OTHER_WINDOW = 1002
+OTHER_FIELD = "OTHER_ORIGINAL"
 
 children: list[subprocess.Popen[bytes]] = []
 log_handles: list[Any] = []
@@ -78,7 +83,7 @@ def child_env(root: Path, *, bus_address: str = "", backend_path: str = "") -> d
         env["DBUS_SESSION_BUS_ADDRESS"] = bus_address
     if backend_path:
         env["PASTE_FIXTURE_STATE"] = backend_path
-    if env["PASTE_FIXTURE_SCENARIO"] in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start"):
+    if env["PASTE_FIXTURE_SCENARIO"] in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe"):
         env.update({
             "XDG_CURRENT_DESKTOP": "GNOME",
             "DESKTOP_SESSION": "gnome",
@@ -88,8 +93,16 @@ def child_env(root: Path, *, bus_address: str = "", backend_path: str = "") -> d
             "PASTE_FIXTURE_RAW_TRACE": str(root / "raw-cli.jsonl"),
         })
         env.pop("COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD")
-        if env["PASTE_FIXTURE_SCENARIO"] == "gnome-forced-raw":
+        if env["PASTE_FIXTURE_SCENARIO"] in ("gnome-forced-raw", "gnome-cancel-raw-probe"):
             env["COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD"] = "1"
+    if env["PASTE_FIXTURE_SCENARIO"] == "wtype-after-portal-denial":
+        env.update({
+            "XDG_CURRENT_DESKTOP": "sway",
+            "DESKTOP_SESSION": "sway",
+            "XDG_SESSION_DESKTOP": "sway",
+            "PASTE_FIXTURE_ROOT": str(root),
+        })
+        env.pop("COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD")
     return env
 
 
@@ -136,6 +149,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+import time
 args = sys.argv[1:]
 if args and args[0] in ('help', '--help'):
     print('Usage: ydotool <cmd> <args>\\nAvailable commands:\\n  click\\n  mousemove\\n  type\\n  key\\n  debug')
@@ -146,6 +160,9 @@ if not endpoint.is_relative_to(root) or not endpoint.is_socket():
     sys.exit(125)
 probe = 'XDG_RUNTIME_DIR' not in os.environ
 event = {'event': 'raw_cli', 'argv': args, 'probe': probe, 'socket': str(endpoint)}
+delayed_probe = probe and args == ['mousemove', '--absolute', '--', '0', '0'] and os.environ.get('PASTE_FIXTURE_SCENARIO') == 'gnome-cancel-raw-probe'
+if delayed_probe:
+    event['delayed_reply'] = True
 if probe:
     if not args or args[0] not in ('mousemove', 'click', 'key', 'type'):
         sys.exit(125)
@@ -160,6 +177,26 @@ else:
     sys.exit(125)
 with open(os.environ['PASTE_FIXTURE_RAW_TRACE'], 'a', encoding='utf-8') as trace:
     trace.write(json.dumps(event, ensure_ascii=False) + '\\n')
+if delayed_probe:
+    time.sleep(.35)
+''', encoding="utf-8")
+    path.chmod(0o700)
+
+
+def install_recording_wtype_shim(root: Path) -> None:
+    path = root / "bin" / "wtype"
+    path.write_text('''#!/usr/bin/python3
+import dbus
+import os
+from pathlib import Path
+import sys
+root = Path(os.environ['PASTE_FIXTURE_ROOT']).resolve(strict=True)
+if sys.argv[1:] != ['-'] or os.environ['DBUS_SESSION_BUS_ADDRESS'] != f'unix:path={root / "runtime" / "bus"}':
+    sys.exit(125)
+text = sys.stdin.read()
+bus = dbus.SessionBus()
+control = dbus.Interface(bus.get_object('org.computeruse.PrivateFixture', '/org/computeruse/PrivateFixture'), 'org.computeruse.PrivateFixture')
+control.RecordWtype(text)
 ''', encoding="utf-8")
     path.chmod(0o700)
 
@@ -216,6 +253,8 @@ class FixtureState:
         self.held: set[str] = set()
         self.trace: list[dict[str, Any]] = []
         self.sessions: set[str] = set()
+        self.focused_window = OTHER_WINDOW
+        self.other_field = OTHER_FIELD
         self.save()
 
     def save(self) -> None:
@@ -229,6 +268,8 @@ class FixtureState:
                 "held_keys": sorted(self.held),
                 "trace": self.trace,
                 "sessions": sorted(self.sessions),
+                "focused_window": self.focused_window,
+                "other_field": self.other_field,
             },
         )
 
@@ -282,7 +323,7 @@ class FixtureState:
             # mean paste; physical evdev 47 maps to Programmer Dvorak's k.
             if (code == 118 and control) or (code == 65379 and shift):
                 self._replace_selection_from_clipboard()
-            elif not control and not shift and os.environ.get("PASTE_FIXTURE_SCENARIO") in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start"):
+            elif not control and not shift and os.environ.get("PASTE_FIXTURE_SCENARIO") in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe"):
                 # The tested repertoire uses Latin-1, Greek lambda's legacy
                 # X11 keysym, or the direct Unicode keysym encoding.
                 character = None
@@ -359,14 +400,14 @@ class _PortalObject(dbus.service.Object):
         obj = ResponseObject(self.bus_name, path, self.retained).obj
         return path
 
-    def _schedule_response(self, path: str, results: dict[str, Any], delay_ms: int = 5, trace_event: str | None = None) -> None:
+    def _schedule_response(self, path: str, results: dict[str, Any], delay_ms: int = 5, trace_event: str | None = None, response_code: int = 0) -> None:
         def emit() -> bool:
             obj = self.retained.get(path)
             if obj is not None:
                 if trace_event:
                     self.state.trace.append({"event": trace_event})
                     self.state.save()
-                obj.Response(dbus.UInt32(0), results)
+                obj.Response(dbus.UInt32(response_code), results)
             GLib.timeout_add(1000, lambda: self.retained.pop(path, None) is not None and False)
             return GLib.SOURCE_REMOVE
 
@@ -411,6 +452,12 @@ class _PortalObject(dbus.service.Object):
         request = self._response(sender, options)
         self.state.trace.append({"event": "Start", "sender": sender, "session": str(session), "parent_window": str(parent_window), "request": request})
         self.state.save()
+        if os.environ.get("PASTE_FIXTURE_SCENARIO") == "wtype-after-portal-denial":
+            self.state.focused_window = OTHER_WINDOW
+            self.state.trace.append({"event": "portal_focus_change", "focused_window": OTHER_WINDOW})
+            self.state.save()
+            self._schedule_response(request, dbus.Dictionary({}, signature="sv"), delay_ms=50, trace_event="StartDenied", response_code=2)
+            return dbus.ObjectPath(request)
         self._schedule_response(
             request,
             dbus.Dictionary({"devices": dbus.UInt32(1, variant_level=1)}, signature="sv"),
@@ -488,19 +535,70 @@ class _FixtureControlObject(dbus.service.Object):
         return [json.dumps(event, ensure_ascii=False, sort_keys=True) for event in self.state.trace]
 
 
+    @dbus.service.method(CONTROL_IFACE, in_signature="", out_signature="s")
+    def GetWindowState(self) -> str:
+        return json.dumps({"focused_window": self.state.focused_window, "other_field": self.state.other_field})
+
+    @dbus.service.method(CONTROL_IFACE, in_signature="s", out_signature="")
+    def RecordWtype(self, text: str) -> None:
+        destination = self.state.focused_window
+        self.state.trace.append({"event": "wtype", "text": str(text), "destination_window": destination})
+        if destination == TARGET_WINDOW:
+            start, end = self.state.selection
+            self.state.field = self.state.field[:start] + str(text) + self.state.field[end:]
+        elif destination == OTHER_WINDOW:
+            self.state.other_field += str(text)
+        else:
+            raise dbus.exceptions.DBusException("recording wtype has no constructed destination")
+        self.state.save()
+
+
+class _WindowControlObject(dbus.service.Object):
+    def __init__(self, bus_name: Any, state: FixtureState) -> None:
+        super().__init__(bus_name, WINDOW_PATH)
+        self.state = state
+
+    @dbus.service.method(WINDOW_SERVICE, in_signature="", out_signature="s")
+    def ListWindows(self) -> str:
+        self.state.trace.append({"event": "ListWindows", "focused_window": self.state.focused_window})
+        self.state.save()
+        return json.dumps([
+            {"window_id": window, "title": title, "app_id": app_id, "wm_class": None,
+             "pid": os.getpid(), "bounds": {"x": 0, "y": 0, "width": 200, "height": 100},
+             "workspace": 0, "focused": self.state.focused_window == window,
+             "hidden": False, "client_type": "wayland", "backend": "fixture"}
+            for window, title, app_id in ((TARGET_WINDOW, "Target field", "fixture-target"), (OTHER_WINDOW, "Other field", "fixture-other"))
+        ])
+
+    @dbus.service.method(WINDOW_SERVICE, in_signature="t", out_signature="bs")
+    def ActivateWindow(self, window: int) -> tuple[bool, str]:
+        if int(window) not in (TARGET_WINDOW, OTHER_WINDOW):
+            return False, "unknown constructed window"
+        self.state.focused_window = int(window)
+        self.state.trace.append({"event": "ActivateWindow", "window_id": int(window)})
+        self.state.save()
+        return True, "activated constructed window"
+
+
 def backend_main(state_path: Path, ready_path: Path) -> int:
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus()
-    names = [
-        dbus.service.BusName(PORTAL_SERVICE, bus=bus, do_not_queue=True),
-        dbus.service.BusName(KLIPPER_SERVICE, bus=bus, do_not_queue=True),
-        dbus.service.BusName(CONTROL_SERVICE, bus=bus, do_not_queue=True),
-    ]
+    names = {
+        name: dbus.service.BusName(name, bus=bus, do_not_queue=True)
+        for name in (KLIPPER_SERVICE, CONTROL_SERVICE)
+    }
     state = FixtureState(state_path)
     retained: dict[str, Any] = {}
-    _PortalObject(names[0], state, retained)
-    _KlipperObject(names[1], state)
-    _FixtureControlObject(names[2], state)
+    # The bus config has no activation directories, so an omitted portal
+    # service is unavailable throughout this scenario.
+    if os.environ.get("PASTE_FIXTURE_SCENARIO") != "gnome-no-literal-backend":
+        names[PORTAL_SERVICE] = dbus.service.BusName(PORTAL_SERVICE, bus=bus, do_not_queue=True)
+        _PortalObject(names[PORTAL_SERVICE], state, retained)
+    _KlipperObject(names[KLIPPER_SERVICE], state)
+    _FixtureControlObject(names[CONTROL_SERVICE], state)
+    if os.environ.get("PASTE_FIXTURE_SCENARIO") == "wtype-after-portal-denial":
+        names[WINDOW_SERVICE] = dbus.service.BusName(WINDOW_SERVICE, bus=bus, do_not_queue=True)
+        _WindowControlObject(names[WINDOW_SERVICE], state)
     loop = GLib.MainLoop()
     ready_path.write_text("ready\n", encoding="utf-8")
     try:
@@ -517,12 +615,16 @@ def inspect_backend(env: dict[str, str]) -> dict[str, Any]:
     obj = bus.get_object(CONTROL_SERVICE, CONTROL_PATH)
     iface = dbus.Interface(obj, CONTROL_IFACE)
     trace = [json.loads(str(line)) for line in iface.GetTrace()]
-    return {
+    snapshot = {
+        "portal_owner_present": bool(bus.name_has_owner(PORTAL_SERVICE)),
         "field": str(iface.GetField()),
         "clipboard": str(iface.GetClipboard()),
         "held_keys": [str(key) for key in iface.GetHeldKeys()],
         "trace": trace,
     }
+    if os.environ.get("PASTE_FIXTURE_SCENARIO") == "wtype-after-portal-denial":
+        snapshot.update(json.loads(str(iface.GetWindowState())))
+    return snapshot
 
 
 def inspect_fixture_from_runner(root: Path, bus_address: str) -> dict[str, Any]:
@@ -603,13 +705,26 @@ def call_mcp(binary: Path, env: dict[str, str], root: Path) -> dict[str, Any]:
     if not initialized.get("protocolVersion"):
         raise RuntimeError("MCP initialize response omitted protocolVersion")
     client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-    if env["PASTE_FIXTURE_SCENARIO"] in ("cancel-prepared", "cancel-dispatched", "gnome-cancel-start"):
+    if env["PASTE_FIXTURE_SCENARIO"] in ("cancel-prepared", "cancel-dispatched", "gnome-cancel-start", "gnome-cancel-raw-probe"):
         client.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "type_text", "arguments": {"text": TEST_TEXT}}})
         state_path = root / "fixture-state.json"
         if env["PASTE_FIXTURE_SCENARIO"] == "cancel-prepared":
             wait_until("prepared clipboard", lambda: json.loads(state_path.read_text())["clipboard"] == TEST_TEXT)
         elif env["PASTE_FIXTURE_SCENARIO"] == "gnome-cancel-start":
             wait_until("portal Start request", lambda: any(event["event"] == "Start" for event in json.loads(state_path.read_text())["trace"]))
+        elif env["PASTE_FIXTURE_SCENARIO"] == "gnome-cancel-raw-probe":
+            trace_path = root / "raw-cli.jsonl"
+            wait_until("delayed raw capability probe", lambda: trace_path.exists() and any(json.loads(line).get("delayed_reply") for line in trace_path.read_text().splitlines()))
+            before_cancel = json.loads(state_path.read_text())
+            raw_before = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            assert all(event["probe"] for event in raw_before), "raw typing began before the cancellation trigger"
+            assert before_cancel["field"] == INITIAL_FIELD and not before_cancel["held_keys"], "input changed before cancellation"
+            atomic_json(root / "cancel-observation.json", {
+                "probe_before_notification": raw_before[-1],
+                "runtime_raw_before_notification": [],
+                "field_before_notification": before_cancel["field"],
+                "held_keys_before_notification": before_cancel["held_keys"],
+            })
         else:
             wait_until("keyboard dispatch", lambda: bool(json.loads(state_path.read_text())["held_keys"]))
         if env["PASTE_FIXTURE_SCENARIO"] == "gnome-cancel-start":
@@ -629,10 +744,19 @@ def call_mcp(binary: Path, env: dict[str, str], root: Path) -> dict[str, Any]:
             # input operation that resumes after the delayed portal reply.
             wait_until("delayed portal Start response", lambda: any(event["event"] == "StartResponse" for event in json.loads(state_path.read_text())["trace"]))
             time.sleep(.25)
+        elif env["PASTE_FIXTURE_SCENARIO"] == "gnome-cancel-raw-probe":
+            # Observe after support resolution as well as after the MCP reply,
+            # so caller cancellation cannot conceal a detached typing command.
+            trace_path = root / "raw-cli.jsonl"
+            wait_until("final raw capability probe", lambda: any(event["probe"] and event["argv"] == ["type", "--file", "-"] for event in (json.loads(line) for line in trace_path.read_text().splitlines())))
+            time.sleep(.25)
         if "error" in response:
             return {"rpc_error": response["error"]}
         return response.get("result", {})
-    return client.rpc(2, "tools/call", {"name": "type_text", "arguments": {"text": TEST_TEXT}})
+    arguments: dict[str, Any] = {"text": TEST_TEXT}
+    if env["PASTE_FIXTURE_SCENARIO"] == "wtype-after-portal-denial":
+        arguments["window_id"] = TARGET_WINDOW
+    return client.rpc(2, "tools/call", {"name": "type_text", "arguments": arguments})
 
 
 def terminate_children() -> None:
@@ -698,13 +822,17 @@ def run(binary: Path, evidence_path: Path | None) -> int:
     scenario = clean["PASTE_FIXTURE_SCENARIO"]
     report["scenario"] = scenario
     raw_receiver = None
-    if scenario in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start"):
+    if scenario == "wtype-after-portal-denial":
+        install_recording_wtype_shim(root)
+        report["claim_scope"] = "constructed window-control DBus and wtype routing after portal denial; no compositor qualification"
+        report["expected"].update({"focused_window": TARGET_WINDOW, "other_field": OTHER_FIELD})
+    if scenario in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe"):
         report["claim_scope"] = "synthetic GNOME-style portal routing and field behavior; no compositor qualification"
         install_supported_raw_shim(root)
         raw_receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         raw_receiver.bind(clean["YDOTOOL_SOCKET"])
         raw_receiver.setblocking(False)
-    if scenario in ("gnome-forced-raw", "gnome-cancel-start"):
+    if scenario in ("gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe"):
         report["expected"]["field"] = INITIAL_FIELD
     if scenario in ("cancel-prepared", "write-error"):
         report["expected"]["field"] = INITIAL_FIELD
@@ -712,6 +840,21 @@ def run(binary: Path, evidence_path: Path | None) -> int:
         report["expected"]["clipboard"] = USER_CLIPBOARD
     status = 1
     try:
+        if scenario == "gnome-no-literal-backend":
+            # Check the private child's PATH plus directories the server may
+            # append. Refuse to start if a wtype file is visible; callers can
+            # hide it in the disposable mount namespace before rerunning.
+            wtype_paths = [root / "bin" / "wtype"] + [
+                Path(directory) / "wtype"
+                for directory in ("/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin", "/bin")
+            ]
+            report["unavailable_literal_backends"] = {
+                "portal": "service omitted on private bus with no activation directories",
+                "wtype_files": {str(path): path.is_file() for path in wtype_paths},
+                "raw_identity_channel": "none; fixture exposes only its recording datagram socket",
+            }
+            if any(path.is_file() for path in wtype_paths):
+                raise RuntimeError("hide wtype in the disposable namespace before this scenario")
         bus = start_child(root, "dbus-daemon", ["/usr/bin/dbus-daemon", "--nofork", f"--config-file={bus_conf}"], clean)
         wait_until("private D-Bus socket", lambda: (root / "runtime" / "bus").is_socket())
 
@@ -779,8 +922,28 @@ def run(binary: Path, evidence_path: Path | None) -> int:
             restores = [event for event in observed["trace"] if event["event"] == "clipboard_set" and event["value"] == INITIAL_CLIPBOARD]
             if not restores or any(event["held_keys"] for event in restores):
                 failures.append({"field": "restore ordering", "expected": "restore after keyboard cleanup", "observed": restores})
-        if scenario in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start"):
-            if scenario != "gnome-cancel-start" and not result.get("structuredContent", {}).get("ok"):
+        if scenario == "wtype-after-portal-denial":
+            trace = observed["trace"]
+            events = [event["event"] for event in trace]
+            wtype = [event for event in trace if event["event"] == "wtype"]
+            if result.get("structuredContent", {}).get("ok") is not True:
+                failures.append({"field": "MCP literal fallback ok", "expected": True, "observed": result})
+            if len(wtype) != 1 or wtype[0]["destination_window"] != TARGET_WINDOW or wtype[0]["text"] != TEST_TEXT:
+                failures.append({"field": "wtype destination", "expected": {"count": 1, "window_id": TARGET_WINDOW, "text": TEST_TEXT}, "observed": wtype})
+            try:
+                start = events.index("Start")
+                changed = events.index("portal_focus_change", start)
+                denied = events.index("StartDenied", changed)
+                assert any(event["event"] == "ActivateWindow" and event["window_id"] == TARGET_WINDOW for event in trace[:start])
+                assert any(event["event"] == "ListWindows" and event["focused_window"] == TARGET_WINDOW for event in trace[:start])
+                assert any(event["event"] == "ActivateWindow" and event["window_id"] == TARGET_WINDOW for event in trace[denied + 1:events.index("wtype")])
+                assert any(event["event"] == "ListWindows" and event["focused_window"] == TARGET_WINDOW for event in trace[denied + 1:events.index("wtype")])
+            except (ValueError, AssertionError):
+                failures.append({"field": "target verification after denied portal", "expected": "target activated and freshly queried before and after portal focus change", "observed": trace})
+            if any(event["event"] in ("key", "literal_keysym", "semantic_paste", "clipboard_set") for event in trace):
+                failures.append({"field": "denied portal dispatch", "expected": "only one wtype submission", "observed": trace})
+        if scenario in ("gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe"):
+            if scenario in ("gnome-portal-with-raw", "gnome-forced-raw") and not result.get("structuredContent", {}).get("ok"):
                 failures.append({"field": "MCP ok", "expected": True, "observed": result})
             raw_dispatch = [event for event in observed["raw_cli"] if not event["probe"]]
             if scenario == "gnome-portal-with-raw":
@@ -796,11 +959,25 @@ def run(binary: Path, evidence_path: Path | None) -> int:
                                      "observed": {"raw_dispatch": raw_dispatch, "datagrams": observed["raw_datagrams"]}})
                 if any(event["event"] in ("CreateSession", "key", "literal_keysym") for event in observed["trace"]):
                     failures.append({"field": "forced raw compatibility", "expected": "no portal input", "observed": observed["trace"]})
-            else:
+            elif scenario == "gnome-cancel-start":
                 if result.get("structuredContent", {}).get("ok"):
                     failures.append({"field": "MCP ok after cancellation", "expected": False, "observed": True})
                 if raw_dispatch or observed["raw_datagrams"] or any(event["event"] in ("key", "literal_keysym") for event in observed["trace"]):
                     failures.append({"field": "cancelled Start dispatch", "expected": "no keyboard or raw input",
+                                     "observed": {"portal_trace": observed["trace"], "raw_dispatch": raw_dispatch, "datagrams": observed["raw_datagrams"]}})
+            elif scenario == "gnome-cancel-raw-probe":
+                if result.get("structuredContent", {}).get("ok") is not False:
+                    failures.append({"field": "MCP ok after raw-probe cancellation", "expected": False, "observed": result})
+                if raw_dispatch or observed["raw_datagrams"] or any(event["event"] in ("key", "literal_keysym", "semantic_paste", "clipboard_set") for event in observed["trace"]):
+                    failures.append({"field": "cancelled raw probe dispatch", "expected": "no input or clipboard mutation",
+                                     "observed": {"portal_trace": observed["trace"], "raw_dispatch": raw_dispatch, "datagrams": observed["raw_datagrams"]}})
+            elif scenario == "gnome-no-literal-backend":
+                if observed["portal_owner_present"]:
+                    failures.append({"field": "portal availability", "expected": False, "observed": True})
+                if result.get("structuredContent", {}).get("ok") is not False:
+                    failures.append({"field": "MCP ok without literal backend", "expected": False, "observed": result})
+                if raw_dispatch or observed["raw_datagrams"] or any(event["event"] in ("key", "literal_keysym", "semantic_paste", "clipboard_set") for event in observed["trace"]):
+                    failures.append({"field": "unverified automatic fallback", "expected": "no input or clipboard mutation",
                                      "observed": {"portal_trace": observed["trace"], "raw_dispatch": raw_dispatch, "datagrams": observed["raw_datagrams"]}})
         report["assertions"] = {"pass": not failures, "failures": failures}
         if failures:
@@ -830,7 +1007,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="path to computer-use-linux MCP binary")
     parser.add_argument("--save-evidence", type=Path, help="optional path for synthetic-only JSON result")
-    parser.add_argument("--scenario", choices=("paste", "cancel-prepared", "cancel-dispatched", "clipboard-changed", "write-error", "portal-error", "release-delayed", "gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start"), default="paste")
+    parser.add_argument("--scenario", choices=("paste", "cancel-prepared", "cancel-dispatched", "clipboard-changed", "write-error", "portal-error", "release-delayed", "gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe", "wtype-after-portal-denial"), default="paste")
     parser.add_argument("--backend", nargs=2, metavar=("STATE", "READY"), help=argparse.SUPPRESS)
     parser.add_argument("--inspect", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()

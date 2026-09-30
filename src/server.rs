@@ -1940,83 +1940,35 @@ impl ComputerUseLinux {
                 }
             }
         }
-        // X11: xdotool type resolves keysyms against the live XKB layout.
-        // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
-        // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
-        if self.should_prefer_xdotool_keyboard() {
-            let delay_ms = xdotool_type_delay_ms();
-            let args = xdotool_type_args_with_delay(&params.text, delay_ms);
-            let command_timeout = xdotool_type_timeout(&params.text, delay_ms);
-            let text = params.text.clone();
-            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_xdotool_or_fallback_with_timeout(
-                    Path::new("xdotool"),
-                    &args,
-                    command_timeout,
-                    || run_ydotool_type_text(&text),
-                )
-                .await
-            })
-            .await;
-            let _input_guard = input_guard;
-            let used_xdotool = result
-                .as_ref()
-                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Xdotool);
-            let mut output = action_result_with_focus(
-                "type_text",
-                result.map(|result| vec![result.output]),
-                received,
-                focus.clone(),
-            );
-            if used_xdotool {
-                output.message = "Action sent through xdotool (X11 XTEST).".to_string();
-            }
-            if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                output = with_notes(output, notes);
-            }
-            return Json(output);
-        }
-        if self.should_prefer_wtype_keyboard() {
-            let text = params.text.clone();
-            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, || {
-                    run_ydotool_type_text(&text)
-                })
-                .await
-            })
-            .await;
-            let _input_guard = input_guard;
-            let used_wtype = result
-                .as_ref()
-                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Wtype);
-            let mut output = action_result_with_focus(
-                "type_text",
-                result.map(|result| vec![result.output]),
-                received,
-                focus.clone(),
-            );
-            if used_wtype {
-                output.message =
-                    "Action sent through wtype (Wayland virtual-keyboard protocol).".to_string();
-            }
-            if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                output = with_notes(output, notes);
-            }
-            return Json(output);
-        }
+        let owner = self.clone();
         let text = params.text.clone();
-        let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-            run_ydotool_type_text(&text)
-                .await
-                .map(|output| vec![output])
+        let command_focus = focus.clone();
+        let (guard, result) = run_cancellation_safe_input(input_guard, async move {
+            Ok(owner
+                .run_literal_text_command(&text, &window_target, command_focus, move || {
+                    cancellation.is_cancelled()
+                })
+                .await)
         })
         .await;
-        let _input_guard = input_guard;
-        let mut output = action_result_with_focus("type_text", result, received, focus.clone());
-        if output.ok && focus.is_some() {
-            let notes = self.input_landing_notes(focus.as_ref(), true).await;
+        let _input_guard = guard;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => LiteralTextInputResult {
+                focus,
+                result: Err(error),
+            },
+        };
+        let mut output = match outcome.result {
+            Ok(message) => {
+                successful_action_with_focus("type_text", &message, received, outcome.focus.clone())
+            }
+            Err(error) => {
+                action_result_with_focus("type_text", Err(error), received, outcome.focus.clone())
+            }
+        };
+        if output.ok && outcome.focus.is_some() {
+            let notes = self.input_landing_notes(outcome.focus.as_ref(), true).await;
             output = with_notes(output, notes);
         }
         Json(output)
@@ -2075,7 +2027,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.7.7",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through direct uinput, the remote desktop portal, or compatible desktop fallback routes, and submit literal type_text through KDE clipboard integration with a semantic paste shortcut, portal keysyms, native-X11 xdotool, or compatible Wayland wtype. Automatic raw typing requires a verified daemon/device association and request-specific native-Xorg map, state, and focus qualification; unknown or mismatching cases stop before input. Explicitly forced ydotool typing remains layout-dependent. Successful responses describe dispatch; verify the application value before claiming insertion. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Explicit observation scopes must resolve; element actions require verified scope and a current matching AT-SPI owner. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -3532,6 +3484,96 @@ impl ComputerUseLinux {
                 focus.focused_window.as_ref().map(|window| window.window_id)
             ))
         }
+    }
+
+    async fn run_literal_text_command<F>(
+        &self,
+        text: &str,
+        target: &WindowTarget,
+        mut focus: Option<WindowFocusResult>,
+        cancelled: F,
+    ) -> LiteralTextInputResult
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        let result = async {
+            if cancelled() {
+                return Err("Text input cancelled before dispatch.".to_string());
+            }
+            focus = self.focus_target_for_input(target).await?;
+            if cancelled() {
+                return Err("Text input cancelled before dispatch.".to_string());
+            }
+            if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD") {
+                run_ydotool_type_text(text, &cancelled).await?;
+                return Ok("Action sent through forced ydotool (layout-dependent compatibility).".to_string());
+            }
+            if self.should_prefer_xdotool_keyboard() {
+                let delay_ms = xdotool_type_delay_ms();
+                let args = xdotool_type_args_with_delay(text, delay_ms);
+                match run_xdotool_with_timeout(
+                    Path::new("xdotool"), &args, xdotool_type_timeout(text, delay_ms),
+                ).await {
+                    XdotoolAttempt::Finished(result) => {
+                        result?;
+                        return Ok("Action sent through xdotool (X11 XTEST).".to_string());
+                    }
+                    XdotoolAttempt::Unavailable => {}
+                }
+            }
+            if cancelled() {
+                return Err("Text input cancelled before dispatch.".to_string());
+            }
+            if self.should_prefer_wtype_keyboard() {
+                run_wtype_type_text_or_fallback(Path::new("wtype"), text, || async {
+                    Err("wtype became unavailable before input; refusing to replay.".to_string())
+                }).await?;
+                return Ok("Action sent through wtype (Wayland virtual-keyboard protocol).".to_string());
+            }
+            let identity_socket = env::var_os("COMPUTER_USE_LINUX_YDOTOOL_IDENTITY_SOCKET")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| "No literal backend is available and ydotool's daemon/device association is unverified. Configure COMPUTER_USE_LINUX_YDOTOOL_IDENTITY_SOCKET for a verified daemon, or use a literal backend. No input was sent.".to_string())?;
+            let raw_socket = ydotool_socket().map(PathBuf::from)
+                .ok_or_else(|| "No ydotool raw socket is available for verified typing.".to_string())?;
+            let display = env::var("DISPLAY")
+                .map_err(|_| "A native X11 display is required to qualify raw typing.".to_string())?;
+            let support = ydotool::ensure_supported_async().await?;
+            let prepared = crate::verified_typing::prepare(crate::verified_typing::Request {
+                executable: support.executable,
+                identity_socket,
+                raw_socket,
+                text: text.to_string(),
+                display,
+            }).await.map_err(|error| error.to_string())?;
+            if cancelled() {
+                return Err("Text input cancelled before dispatch.".to_string());
+            }
+            focus = self.focus_target_for_input(target).await?;
+            let (expected_pid, expected_window) = match focus.as_ref() {
+                Some(focus) => {
+                    let window = focus.focused_window.as_ref().ok_or_else(||
+                        "The target's current focus could not be verified for raw typing.".to_string())?;
+                    if !matches!(window.backend.as_str(), registry::X11_BACKEND | registry::I3_BACKEND) {
+                        return Err("The target backend does not expose a native X11 window identity for verified raw typing.".to_string());
+                    }
+                    let pid = window.pid.ok_or_else(||
+                        "The target window's process owner is unknown; refusing raw typing.".to_string())?;
+                    let xid = u32::try_from(window.window_id).map_err(|_|
+                        "The target's native X11 window identity is invalid.".to_string())?;
+                    (Some(pid), Some(xid))
+                }
+                None => (None, None),
+            };
+            tokio::task::spawn_blocking(move ||
+                prepared.dispatch_after_focus(expected_pid, expected_window, cancelled)
+            ).await.map_err(|error| format!("Verified typing worker failed: {error}"))?
+                .map_err(|error| if error.may_have_submitted {
+                    format!("{error}. Input may have been submitted; inspect the application before retrying.")
+                } else { error.to_string() })?;
+            Ok("Verified raw keyboard strokes submitted through ydotool. Read back the application value to confirm insertion.".to_string())
+        }.await;
+        LiteralTextInputResult { focus, result }
     }
 
     fn cache_desktop_size(&self, width: u32, height: u32) {
@@ -5291,8 +5333,14 @@ async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
     }
 }
 
-async fn run_ydotool_type_text(text: &str) -> std::result::Result<Output, String> {
+async fn run_ydotool_type_text(
+    text: &str,
+    cancelled: impl Fn() -> bool,
+) -> std::result::Result<Output, String> {
     let support = ydotool::ensure_supported_async().await?;
+    if cancelled() {
+        return Err("Text input cancelled before dispatch.".to_string());
+    }
     let mut command = TokioCommand::new(&support.executable);
     command.args(["type", "--file", "-"]);
     if let Some(socket) = ydotool_socket() {
@@ -5630,6 +5678,11 @@ enum KeyboardCommandBackend {
     Wtype,
     Xdotool,
     Ydotool,
+}
+
+struct LiteralTextInputResult {
+    focus: Option<WindowFocusResult>,
+    result: std::result::Result<String, String>,
 }
 
 struct KeyboardCommandResult {

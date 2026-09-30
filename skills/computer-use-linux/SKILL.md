@@ -1,6 +1,6 @@
 ---
 name: computer-use-linux
-description: "Linux desktop observation and control via native Pi tools or the computer-use-linux MCP server: accessibility trees, screenshots, window targeting, and input synthesis (click, type, scroll)."
+description: "Use when observing or controlling a local Linux GUI, configuring computer-use-linux, or diagnosing desktop input that did not land: native Pi/MCP tools, accessibility trees, screenshots, window targeting, and input."
 author: agent-sh
 license: MIT
 platforms: [linux]
@@ -128,6 +128,11 @@ Pi native tools skip this MCP `command` config; see [Pi setup](references/pi-set
 8. Use coordinates only when the UI surface has no useful accessibility tree.
 9. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
 10. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
+
+For text readback, layout-sensitive failures, or desktop-input regressions,
+use [input verification](references/input-verification.md). It covers requested
+scope, ambiguous dispatch, and fixtures that keep tests off the user's input
+seat.
 
 Plain left element/index/selector `click` prefers native AT-SPI `click`,
 `press`, or `toggle` over toolkit bounds, avoiding coordinate

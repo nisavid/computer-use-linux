@@ -35,6 +35,7 @@
   "files": [
     "LICENSE",
     "README.md",
+    "docs/verified-typing.md",
     "skills/computer-use-linux/SKILL.md",
     "skills/computer-use-linux/references/",
     "npm/README.md",

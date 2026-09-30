@@ -20,6 +20,16 @@ screenshot crop origin and divide preview coordinates by screenshot `scale`.
 Do not use widget-local or raw GDK surface coordinates. A window target is
 required.
 
+Explicit observation and element-action scopes must resolve to the requested
+application and current AT-SPI owner. Input success describes dispatch; confirm
+the resulting application value. Automatic raw typing requires a verified
+daemon/device association and a supported native-Xorg keymap/state profile.
+Stock ydotoold alone is insufficient for that fallback. Explicitly forced
+ydotool typing remains layout-dependent. See the repository's
+[verified typing](../docs/verified-typing.md) contract and packaged
+[input verification](../skills/computer-use-linux/references/input-verification.md)
+procedure.
+
 ```bash
 npm install -g @agent-sh/computer-use-linux
 computer-use-linux doctor
