@@ -118,6 +118,11 @@ Pi native tools skip this MCP `command` config; see [Pi setup](references/pi-set
 
 ## Procedure
 
+For text tasks, including checks of an already correct value, and input-failure
+diagnoses, read [input verification](references/input-verification.md) before
+the desktop-control steps below. It covers requested scope, ambiguous dispatch,
+and fixtures that keep tests off the user's input seat.
+
 1. In Pi, call `computer_use_linux_tools` with the exact tools or capability you need. Enabled tools use the `computer_use_linux_<name>` prefix, appear starting on the next model turn, and remain active for the session.
 2. Begin every desktop-control turn with `get_app_state`, scoped to the app you are working in: pass `app_name_or_bundle_identifier` or a window target (`window_id`, `pid`, `app_id`, `wm_class`, `title`). Without a target the result is the whole desktop AT-SPI tree, `tree_scoped` is `false`, and `message` warns; that can flood context. Use `include_screenshot: false` when the accessibility tree is sufficient. If `accessibility_tree_truncated` is `true`, the tree is incomplete: scope to a narrower target and raise `max_nodes` or `max_depth` (hard caps 2000 and 64) rather than lowering them. The compact readiness block identifies missing setup.
 3. Use `doctor` only when you need the full diagnostic report.
@@ -128,11 +133,6 @@ Pi native tools skip this MCP `command` config; see [Pi setup](references/pi-set
 8. Use coordinates only when the UI surface has no useful accessibility tree.
 9. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
 10. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
-
-Before typing or reading back text, and when diagnosing layout-sensitive
-failures or desktop-input regressions, read [input verification](references/input-verification.md).
-It covers requested scope, ambiguous dispatch, and fixtures that keep tests off
-the user's input seat.
 
 Plain left element/index/selector `click` prefers native AT-SPI `click`,
 `press`, or `toggle` over toolkit bounds, avoiding coordinate
