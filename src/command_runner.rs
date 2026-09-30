@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use std::{
     io::{self, Read},
-    os::{fd::AsRawFd, unix::process::CommandExt as _},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::process::CommandExt as _,
+    },
     process::{Command as StdCommand, Output, Stdio},
     thread,
     time::Instant as StdInstant,
@@ -119,6 +122,7 @@ pub(crate) fn output_blocking_with_timeout(
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     loop {
+        let previous_output_lengths = (stdout_bytes.len(), stderr_bytes.len());
         if !stdout_eof {
             match drain_nonblocking(&mut stdout, &mut stdout_bytes) {
                 Ok(eof) => stdout_eof = eof,
@@ -159,7 +163,19 @@ pub(crate) fn output_blocking_with_timeout(
             terminate_blocking_process(&mut child, pgid);
             return Err(timeout_error(action, timeout));
         }
-        thread::sleep(BLOCKING_POLL_INTERVAL);
+        if (stdout_bytes.len(), stderr_bytes.len()) == previous_output_lengths {
+            let wait = deadline
+                .saturating_duration_since(StdInstant::now())
+                .min(BLOCKING_POLL_INTERVAL);
+            if let Err(error) = wait_for_output(
+                (!stdout_eof).then(|| stdout.as_raw_fd()),
+                (!stderr_eof).then(|| stderr.as_raw_fd()),
+                wait,
+            ) {
+                terminate_blocking_process(&mut child, pgid);
+                return Err(error).with_context(|| format!("failed to wait for {action} output"));
+            }
+        }
     }
 }
 
@@ -364,6 +380,35 @@ async fn read_pipe(mut pipe: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>>
         output.extend_from_slice(&buffer[..length]);
     }
     Ok(output)
+}
+
+/// Wait for either output pipe without delaying a writer that becomes ready.
+/// EOF streams are disabled so their persistent hangup cannot cause a busy loop.
+fn wait_for_output(
+    stdout_fd: Option<RawFd>,
+    stderr_fd: Option<RawFd>,
+    wait: Duration,
+) -> io::Result<()> {
+    let mut pipes = [stdout_fd, stderr_fd].map(|fd| libc::pollfd {
+        fd: fd.unwrap_or(-1),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let timeout_ms = wait.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as libc::nfds_t, timeout_ms) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    if pipes.iter().any(|pipe| pipe.revents & libc::POLLNVAL != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid output pipe",
+        ));
+    }
+    Ok(())
 }
 
 fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
