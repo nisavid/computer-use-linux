@@ -1,20 +1,22 @@
 use crate::atspi_tree::{
-    focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    set_element_value, snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
-    Bounds, FocusedElementSummary, ValueSetInvocation,
+    focused_element_summary_in_app, list_accessible_apps, object_ref_owner_pid,
+    perform_action as invoke_accessibility_action, perform_named_action, probe_focused_element,
+    set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
+    AccessibleAppSummary, Bounds, FocusProbe, FocusedElementSummary, ValueSetInvocation,
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
 use crate::remote_desktop::{
-    click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
-    scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
-    type_text_with_keysyms, PointerButton, PortalKeyboardSession, PortalPointerSession,
-    ScrollDirection,
+    click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
+    press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
+    start_portal_pointer_session, type_text_with_keysyms, PointerButton, PortalKey,
+    PortalKeyboardSession, PortalPointerSession, ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
     ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
+use crate::terminal::{terminal_paste_shortcut, TerminalPasteShortcut};
 use crate::windowing::registry;
 use crate::windows::{
     focus_window_target, focused_window, list_windows, resolve_window_target,
@@ -25,13 +27,16 @@ use crate::ydotool;
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     schemars::JsonSchema,
     tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env,
+    ffi::OsString,
     future::Future,
     os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
@@ -43,6 +48,7 @@ use tokio::{
     process::Command as TokioCommand,
     time::{sleep, timeout},
 };
+use xkeysym::key as xkey;
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
 const INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,10 +57,22 @@ const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
+const SHELL_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_ENABLE_SHELL";
+const COMPLETION_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE";
+const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 30;
+const SHELL_MAX_TIMEOUT_SECS: u64 = 120;
+const SHELL_MAX_COMMAND_BYTES: usize = 64 * 1024;
+const SHELL_MAX_CWD_BYTES: usize = 4096;
+const SHELL_MAX_ENV_ENTRIES: usize = 64;
+const SHELL_MAX_ENV_BYTES: usize = 64 * 1024;
+const SHELL_RESPONSE_STREAM_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
     last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
+    /// Pid the cached snapshot was taken for, when get_app_state had a target.
+    /// Element indices are only meaningful against that app (#167).
+    last_snapshot_pid: Arc<Mutex<Option<u32>>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
     portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
@@ -95,7 +113,20 @@ fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
 
 impl ComputerUseLinux {
     fn mcp_tool_router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        self.router_with_completion(env::var(COMPLETION_ENABLE_ENV).as_deref() == Ok("1"))
+    }
+
+    fn router_with_completion(
+        &self,
+        enabled: bool,
+    ) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
+        if !enabled {
+            router.map.remove("complete_interaction");
+        }
+        if !shell_execution_enabled() {
+            router.map.remove("run_shell");
+        }
         for route in router.map.values_mut() {
             let input_schema = Arc::make_mut(&mut route.attr.input_schema);
             for value in input_schema.values_mut() {
@@ -113,6 +144,27 @@ impl ComputerUseLinux {
 
 #[tool_router]
 impl ComputerUseLinux {
+    #[tool(
+        name = "complete_interaction",
+        description = "Send a desktop notification that this agent has finished its interaction. Available only with COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE=1. This cue does not acquire or release an exclusive desktop lock. Delivery is best effort and bounded; it may be suppressed by desktop notification settings.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn complete_interaction(&self) -> Json<CompletionOutput> {
+        if env::var(COMPLETION_ENABLE_ENV).as_deref() != Ok("1") {
+            return Json(CompletionOutput {
+                ok: true,
+                cue: "skipped".into(),
+                note: "Completion notifications are disabled.".into(),
+            });
+        }
+        Json(send_completion_notification(Path::new("notify-send"), Duration::from_secs(2)).await)
+    }
+
     #[tool(
         name = "doctor",
         description = "Report Linux Computer Use desktop integration readiness.",
@@ -284,7 +336,9 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>()
+            .expect("get_app_state output schema"),
+        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -295,7 +349,7 @@ impl ComputerUseLinux {
     async fn get_app_state(
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
-    ) -> Json<GetAppStateOutput> {
+    ) -> Result<CallToolResult, ErrorData> {
         let verbose = params.verbose.unwrap_or(false);
         let diagnostics = tokio::task::spawn_blocking(doctor_report)
             .await
@@ -307,6 +361,14 @@ impl ComputerUseLinux {
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
+        // Whether the caller asked for any scope at all. `tree_scoped` can still
+        // come back false when a target matched no AT-SPI root, and that case
+        // needs different advice than "pass a target".
+        let accessibility_target_requested = screenshot_target_requested
+            || params
+                .app_name_or_bundle_identifier
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
         let app_filter = self
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
@@ -340,13 +402,26 @@ impl ComputerUseLinux {
         } else {
             (None, None)
         };
+        let mut tree_scoped = false;
+        let mut tree_root_pid = None;
+        let mut accessibility_tree_truncated = false;
         let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
             if diagnostics.readiness.can_build_accessibility_tree {
                 let target_pid = window_context.as_ref().and_then(|window| window.pid);
-                match snapshot_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth).await {
-                    Ok(nodes) => {
-                        let raw_count = nodes.len();
-                        (compact_accessibility_tree(nodes), raw_count, None)
+                match snapshot_accessibility_tree(
+                    app_filter.as_deref(),
+                    target_pid,
+                    max_nodes,
+                    max_depth,
+                )
+                .await
+                {
+                    Ok(snapshot) => {
+                        tree_scoped = snapshot.scoped;
+                        tree_root_pid = snapshot.root_pid;
+                        accessibility_tree_truncated = snapshot.truncated;
+                        let raw_count = snapshot.nodes.len();
+                        (compact_accessibility_tree(snapshot.nodes), raw_count, None)
                     }
                     Err(error) => (Vec::new(), 0, Some(format!("{error:#}"))),
                 }
@@ -361,7 +436,12 @@ impl ComputerUseLinux {
                 )
             };
         if accessibility_error.is_none() {
-            self.cache_nodes(&accessibility_tree);
+            // Record a pid only when the tree's roots were matched by it. A pid
+            // with no AT-SPI root falls back to every app, or to an app-name
+            // match that can be another app entirely; recording the pid then
+            // would let that app's index pass the target check instead of
+            // taking the per-node owner lookup.
+            self.cache_snapshot(&accessibility_tree, tree_root_pid);
         } else {
             self.clear_cached_nodes();
         }
@@ -395,6 +475,18 @@ impl ComputerUseLinux {
         } else if let Some(error) = &window_error {
             message.push_str(&format!(" Window target resolution failed: {error}"));
         }
+        if let Some(warning) = unscoped_accessibility_tree_warning(
+            tree_scoped,
+            accessibility_error.is_none(),
+            accessibility_target_requested,
+        ) {
+            message.push(' ');
+            message.push_str(warning);
+        }
+        if let Some(note) = truncated_accessibility_tree_note(accessibility_tree_truncated) {
+            message.push(' ');
+            message.push_str(note);
+        }
 
         // Full diagnostics are huge (portal/process dumps); emit them only on
         // request. The compact readiness block always travels, and failures get
@@ -408,21 +500,24 @@ impl ComputerUseLinux {
         {
             message.push_str(" Pass verbose=true for full diagnostics.");
         }
-        Json(GetAppStateOutput {
+        let output = GetAppStateOutput {
             app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
             window_context,
             window_error,
             window_permissions_hint,
             backend: "linux-atspi".to_string(),
-            screenshot,
+            screenshot: screenshot.as_ref().map(ScreenshotSummary::from),
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
+            tree_scoped,
+            accessibility_tree_truncated,
             accessibility_error,
             readiness,
             diagnostics: include_full.then_some(diagnostics),
             message,
-        })
+        };
+        app_state_result(output, screenshot)
     }
 
     #[tool(
@@ -530,8 +625,8 @@ impl ComputerUseLinux {
             caption["off_screen_note"] = serde_json::json!(note);
         }
         Ok(CallToolResult::success(vec![
-            Content::image(data_url_payload(&capture.data_url), capture.mime_type),
-            Content::text(caption.to_string()),
+            ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
+            ContentBlock::text(caption.to_string()),
         ]))
     }
 
@@ -570,24 +665,25 @@ impl ComputerUseLinux {
         }
     }
 
-    /// Try a coordinate click through the absolute uinput pointer. `Some(ok)` if
-    /// the backend was used; `None` to fall through to portal / ydotool.
+    /// Try a coordinate click through the absolute uinput pointer. Returns the
+    /// requested and emitted coordinates from that backend, or `None` to fall
+    /// through.
     async fn try_abs_click(
         &self,
         x: i32,
         y: i32,
         button: Option<&str>,
         count: u32,
-    ) -> Option<bool> {
+    ) -> Option<crate::abs_pointer::PointerLanding> {
+        let btn = crate::abs_pointer::PointerButton::from_name(button)?;
         if !self.ensure_abs_pointer().await {
             return None;
         }
-        let btn = crate::abs_pointer::PointerButton::from_name(button);
         let abs_pointer = Arc::clone(&self.abs_pointer);
         tokio::task::spawn_blocking(move || {
             let mut guard = abs_pointer.lock().ok()?;
             let pointer = guard.as_mut()?;
-            Some(pointer.click(x, y, btn, count).is_ok())
+            pointer.click(x, y, btn, count).ok()
         })
         .await
         .ok()
@@ -596,7 +692,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -608,6 +704,7 @@ impl ComputerUseLinux {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let mut portal_target_point = None;
+        let mut target_pid = params.pid;
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
@@ -633,6 +730,7 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            target_pid = focus_target_pid(focus.as_ref()).or(target_pid);
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -677,6 +775,23 @@ impl ComputerUseLinux {
                     .and_then(|(x, y)| coordinate_map.portal_point(x, y));
             }
         }
+        if params.x.zip(params.y).is_none() {
+            if let Some(node) = self.cached_node_for(
+                params.element_index,
+                &params.selector(),
+                ElementResolvePurpose::Click,
+            ) {
+                if let Err(message) = self.check_node_target(&node, target_pid).await {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message,
+                        received,
+                    });
+                }
+            }
+        }
         let target = match self.resolve_click_target(&params) {
             Ok(target) => target,
             Err(message) => {
@@ -695,15 +810,22 @@ impl ComputerUseLinux {
             action_index,
         } = target
         {
-            let action_index = action_index.to_string();
-            return match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
+            let invocation = if let Some(name) = action_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                perform_named_action(&object_ref, name).await
+            } else {
+                invoke_accessibility_action(&object_ref, Some(&action_index.to_string())).await
+            };
+            return match invocation {
                 Ok(invocation) => Json(ActionOutput {
                     ok: invocation.ok,
                     implemented: true,
                     action: "click".to_string(),
                     message: if invocation.ok {
                         format!(
-                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
+                            "Invoked the primary AT-SPI action{} without pointer-coordinate conversion.",
                             action_name
                                 .as_deref()
                                 .filter(|name| !name.is_empty())
@@ -740,11 +862,9 @@ impl ComputerUseLinux {
         // relative-only device (faked `--absolute` via pin-to-corner + relative
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
-        // absolute pointer lands exactly at the screenshot pixel.
-        // Off-screen coordinates "succeed" at the uinput layer while landing on
-        // no visible pixel — surface that instead of a silent no-op.
-        let off_screen_note = self.off_screen_note_for_point(x, y).await;
-        if self
+        // absolute pointer uses screenshot-pixel coordinates directly and
+        // reports the point it emitted after desktop-edge clamping.
+        if let Some(landing) = self
             .try_abs_click(
                 x,
                 y,
@@ -752,7 +872,6 @@ impl ComputerUseLinux {
                 params.click_count.unwrap_or(1).clamp(1, 10),
             )
             .await
-            == Some(true)
         {
             return Json(with_notes(
                 ActionOutput {
@@ -762,9 +881,10 @@ impl ComputerUseLinux {
                     message: "Action sent through the uinput absolute pointer.".to_string(),
                     received,
                 },
-                off_screen_note.clone(),
+                abs_pointer_clamp_note(landing),
             ));
         }
+        let off_screen_note = self.off_screen_note_for_point(x, y).await;
         if let Some(session) = self.cached_portal_pointer_session() {
             let Some((portal_x, portal_y)) =
                 portal_target_point.or_else(|| self.logical_portal_point(&session, x, y))
@@ -998,6 +1118,7 @@ impl ComputerUseLinux {
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let mut portal_target_point = None;
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+        let mut target_pid = params.pid;
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
         let window_target = params.window_target();
@@ -1023,6 +1144,7 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            target_pid = focus_target_pid(focus.as_ref()).or(target_pid);
             tokio::time::sleep(Duration::from_millis(120)).await;
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
@@ -1106,6 +1228,23 @@ impl ComputerUseLinux {
                     .x
                     .zip(params.y)
                     .and_then(|(x, y)| coordinate_map.portal_point(x, y));
+            }
+        }
+        if params.x.is_none() && params.y.is_none() {
+            if let Some(node) = self.cached_node_for(
+                params.element_index,
+                &ElementSelector::default(),
+                ElementResolvePurpose::Click,
+            ) {
+                if let Err(message) = self.check_node_target(&node, target_pid).await {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "scroll".to_string(),
+                        message,
+                        received,
+                    });
+                }
             }
         }
         let target_point =
@@ -1217,27 +1356,46 @@ impl ComputerUseLinux {
                 Err(_) => {}
             }
         }
-        let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
-            "up" => (0, units),
-            "down" => (0, -units),
-            "left" => (units, 0),
-            "right" => (-units, 0),
-            _ => {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "scroll".to_string(),
-                    message: "Unsupported scroll direction; expected up, down, left, or right."
-                        .to_string(),
-                    received,
-                });
-            }
+        let (dx, dy) = match direction {
+            ScrollDirection::Up => (0, units),
+            ScrollDirection::Down => (0, -units),
+            ScrollDirection::Left => (units, 0),
+            ScrollDirection::Right => (-units, 0),
         };
         let mut sequence = Vec::new();
         if let Some((x, y)) = target_point {
             sequence.push(absolute_mousemove_args(x, y));
         }
         sequence.push(wheel_mousemove_args(dx, dy));
+        // X11: ydotool's absolute move warps through (0, 0), so the pointer
+        // re-enters the window. GTK 3 resets its XI2 scroll valuators on that
+        // enter, and the one wheel event only re-baselines them (delta 0).
+        // The call reported success while the window did not move (#184).
+        // XTEST wheel buttons have no valuators, so GTK takes the button path.
+        if self.should_prefer_xdotool_pointer() {
+            let repeat = u32::try_from(units.max(1)).unwrap_or(1);
+            let xdotool_args = xdotool_pointer_scroll_args(target_point, repeat, direction);
+            let command_timeout = xdotool_scroll_timeout(repeat, XDOTOOL_SCROLL_CLICK_DELAY_MS);
+            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
+                run_xdotool_pointer_or_fallback_with_timeout(
+                    Path::new("xdotool"),
+                    &xdotool_args,
+                    command_timeout,
+                    || async { run_ydotool_sequence(&sequence).await },
+                )
+                .await
+            })
+            .await;
+            let _input_guard = input_guard;
+            let used_xdotool = result
+                .as_ref()
+                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Xdotool);
+            let mut output = action_result("scroll", result.map(|result| result.outputs), received);
+            if output.ok && used_xdotool {
+                output.message = "Action sent through xdotool (X11 XTEST).".to_string();
+            }
+            return Json(with_notes(output, off_screen_note));
+        }
         let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
             run_ydotool_sequence(&sequence).await
         })
@@ -1368,7 +1526,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "press_key",
-        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). On Wayland, chords are sent through an active remote desktop portal keyboard session when one is available (or when ydotool is absent), falling back to ydotool otherwise. Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app.",
+        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). On Wayland, chords are sent through an active remote desktop portal keyboard session when one is available (or when ydotool is absent), falling back to ydotool otherwise. Portal chords send modifiers and named keys as keysyms so remapped keys (e.g. Caps Lock swapped with Control) follow the active keymap; letters and digits are physical US positions. Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1406,9 +1564,18 @@ impl ComputerUseLinux {
         if self.should_prefer_portal_keyboard_for_chords().await {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
-                    let modifiers: Vec<i32> =
-                        chord_modifiers.iter().map(|m| i32::from(*m)).collect();
-                    match press_keycode_chord(&session, &modifiers, i32::from(chord_key)).await {
+                    // KDE keeps physical keycodes: its keysym path is untested
+                    // here, and #191 was reported against mutter.
+                    let (modifiers, key) = portal_key_chord(&params.key)
+                        .filter(|_| !self.is_kde_wayland_session())
+                        .unwrap_or_else(|| {
+                            let modifiers = chord_modifiers
+                                .iter()
+                                .map(|m| PortalKey::Keycode(i32::from(*m)))
+                                .collect();
+                            (modifiers, PortalKey::Keycode(i32::from(chord_key)))
+                        });
+                    match press_key_chord(&session, &modifiers, key).await {
                         Ok(()) => {
                             let notes = self.input_landing_notes(focus.as_ref(), false).await;
                             return Json(with_notes(
@@ -1495,6 +1662,23 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "run_shell",
+        description = "Execute one explicitly approved /bin/sh command with same-user host authority. This tool is absent unless the server operator starts computer-use-linux with COMPUTER_USE_LINUX_ENABLE_SHELL=1. It is not sandboxed: the command can read or modify files and use the network with the server user's permissions. The inherited environment is cleared to a small desktop/runtime allowlist; pass any additional variables explicitly. Execution time and output are bounded: returned streams are truncated to 512 KiB, while a stream exceeding the 8 MiB collection ceiling fails the call without returning partial output. An audit digest is written to server stderr.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn run_shell(
+        &self,
+        Parameters(params): Parameters<RunShellParams>,
+    ) -> Json<RunShellOutput> {
+        Json(execute_shell(params).await)
+    }
+
+    #[tool(
         name = "type_text",
         description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector.",
         annotations(
@@ -1510,7 +1694,8 @@ impl ComputerUseLinux {
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        let focus = match self.focus_target_for_input(&params.window_target()).await {
+        let window_target = params.window_target();
+        let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
@@ -1525,16 +1710,35 @@ impl ComputerUseLinux {
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
+                    let kde_focus = if window_target.has_target() {
+                        match self.focus_target_for_input(&window_target).await {
+                            Ok(focus) => focus,
+                            Err(message) => {
+                                return Json(ActionOutput {
+                                    ok: false,
+                                    implemented: true,
+                                    action: "type_text".to_string(),
+                                    message,
+                                    received,
+                                });
+                            }
+                        }
+                    } else {
+                        focus.clone()
+                    };
+                    let paste_shortcut =
+                        kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
                     let _clipboard_guard = self.kde_clipboard_lock.lock().await;
-                    match run_kde_clipboard_paste_text(&session, &params.text).await {
+                    match run_kde_clipboard_paste_text(&session, &params.text, paste_shortcut).await
+                    {
                         Ok(message) => {
-                            let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                            let notes = self.input_landing_notes(kde_focus.as_ref(), true).await;
                             return Json(with_notes(
                                 successful_action_with_focus(
                                     "type_text",
                                     &message,
                                     received,
-                                    focus,
+                                    kde_focus,
                                 ),
                                 notes,
                             ));
@@ -1548,7 +1752,7 @@ impl ComputerUseLinux {
                                     "type_text",
                                     Err(error.message),
                                     received,
-                                    focus,
+                                    kde_focus,
                                 ));
                             }
                         }
@@ -1593,12 +1797,17 @@ impl ComputerUseLinux {
         // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
         // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
         if self.should_prefer_xdotool_keyboard() {
-            let args = xdotool_type_args(&params.text);
+            let delay_ms = xdotool_type_delay_ms();
+            let args = xdotool_type_args_with_delay(&params.text, delay_ms);
+            let command_timeout = xdotool_type_timeout(&params.text, delay_ms);
             let text = params.text.clone();
             let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_xdotool_or_fallback(Path::new("xdotool"), &args, || {
-                    run_ydotool_type_text(&text)
-                })
+                run_xdotool_or_fallback_with_timeout(
+                    Path::new("xdotool"),
+                    &args,
+                    command_timeout,
+                    || run_ydotool_type_text(&text),
+                )
                 .await
             })
             .await;
@@ -1614,6 +1823,35 @@ impl ComputerUseLinux {
             );
             if used_xdotool {
                 output.message = "Action sent through xdotool (X11 XTEST).".to_string();
+            }
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
+        if self.should_prefer_wtype_keyboard() {
+            let text = params.text.clone();
+            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
+                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, || {
+                    run_ydotool_type_text(&text)
+                })
+                .await
+            })
+            .await;
+            let _input_guard = input_guard;
+            let used_wtype = result
+                .as_ref()
+                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Wtype);
+            let mut output = action_result_with_focus(
+                "type_text",
+                result.map(|result| vec![result.output]),
+                received,
+                focus.clone(),
+            );
+            if used_wtype {
+                output.message =
+                    "Action sent through wtype (Wayland virtual-keyboard protocol).".to_string();
             }
             if output.ok && focus.is_some() {
                 let notes = self.input_landing_notes(focus.as_ref(), true).await;
@@ -1689,10 +1927,284 @@ impl ComputerUseLinux {
     // The rmcp tool_handler macro only accepts a string literal here, so this
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
-    version = "0.4.9",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    version = "0.7.7",
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
+
+fn shell_execution_enabled() -> bool {
+    shell_execution_enabled_value(env::var(SHELL_ENABLE_ENV).ok().as_deref())
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CompletionOutput {
+    ok: bool,
+    cue: String,
+    note: String,
+}
+
+async fn send_completion_notification(program: &Path, limit: Duration) -> CompletionOutput {
+    let mut command = TokioCommand::new(program);
+    command.args([
+        "--app-name=computer-use-linux",
+        "--expire-time=3000",
+        "Desktop interaction finished",
+        "The agent has finished its desktop interaction.",
+    ]);
+    let sent =
+        crate::command_runner::output_with_timeout(command, "send completion notification", limit)
+            .await;
+    match sent {
+        Ok(output) if output.status.success() => CompletionOutput {
+            ok: true,
+            cue: "notification".into(),
+            note: "Notification submitted; desktop settings control whether it is displayed."
+                .into(),
+        },
+        _ => CompletionOutput {
+            ok: true,
+            cue: "skipped".into(),
+            note:
+                "Notification unavailable, failed, or timed out. The interaction is still complete."
+                    .into(),
+        },
+    }
+}
+
+fn shell_execution_enabled_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn inherited_shell_environment_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "LANG"
+            | "TERM"
+            | "XDG_RUNTIME_DIR"
+            | "DISPLAY"
+            | "WAYLAND_DISPLAY"
+            | "DBUS_SESSION_BUS_ADDRESS"
+    ) || name.starts_with("LC_")
+}
+
+fn inherited_shell_environment(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(String, String)> {
+    variables
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+                return None;
+            };
+            inherited_shell_environment_allowed(&name).then_some((name, value))
+        })
+        .collect()
+}
+
+fn shell_command_sha256(command: &str) -> String {
+    Sha256::digest(command.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bounded_shell_stream(bytes: &[u8]) -> (String, bool) {
+    let truncated = bytes.len() > SHELL_RESPONSE_STREAM_BYTES;
+    let visible = if truncated {
+        &bytes[..SHELL_RESPONSE_STREAM_BYTES]
+    } else {
+        bytes
+    };
+    (String::from_utf8_lossy(visible).into_owned(), truncated)
+}
+
+fn shell_error_output(
+    command_sha256: String,
+    cwd: String,
+    timeout_seconds: u64,
+    error: impl Into<String>,
+) -> RunShellOutput {
+    RunShellOutput {
+        ok: false,
+        command_sha256,
+        cwd,
+        timeout_seconds,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        error: Some(error.into()),
+    }
+}
+
+async fn execute_shell(params: RunShellParams) -> RunShellOutput {
+    let command_sha256 = shell_command_sha256(&params.command);
+    let timeout_seconds = params.timeout_seconds.unwrap_or(SHELL_DEFAULT_TIMEOUT_SECS);
+    let requested_cwd = params.cwd.as_deref().unwrap_or(".").to_string();
+
+    if !shell_execution_enabled() {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!(
+                "shell execution is disabled; restart the MCP server with {SHELL_ENABLE_ENV}=1 to opt in"
+            ),
+        );
+    }
+    if params.command.trim().is_empty() {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            "command must not be empty",
+        );
+    }
+    if params.command.len() > SHELL_MAX_COMMAND_BYTES {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!("command exceeds the {SHELL_MAX_COMMAND_BYTES}-byte limit"),
+        );
+    }
+    if requested_cwd.len() > SHELL_MAX_CWD_BYTES {
+        return shell_error_output(
+            command_sha256,
+            "<rejected: cwd too long>".to_string(),
+            timeout_seconds,
+            format!("cwd exceeds the {SHELL_MAX_CWD_BYTES}-byte limit"),
+        );
+    }
+    if !(1..=SHELL_MAX_TIMEOUT_SECS).contains(&timeout_seconds) {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!("timeout_seconds must be between 1 and {SHELL_MAX_TIMEOUT_SECS}"),
+        );
+    }
+    if params.env.len() > SHELL_MAX_ENV_ENTRIES {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!("env contains more than {SHELL_MAX_ENV_ENTRIES} entries"),
+        );
+    }
+    let env_bytes = params
+        .env
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .sum::<usize>();
+    if env_bytes > SHELL_MAX_ENV_BYTES {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!("env exceeds the {SHELL_MAX_ENV_BYTES}-byte limit"),
+        );
+    }
+    if let Some(invalid) = params.env.keys().find(|name| !valid_environment_name(name)) {
+        return shell_error_output(
+            command_sha256,
+            requested_cwd,
+            timeout_seconds,
+            format!("invalid environment variable name: {invalid}"),
+        );
+    }
+
+    let cwd = match std::fs::canonicalize(&requested_cwd) {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => {
+            return shell_error_output(
+                command_sha256,
+                requested_cwd,
+                timeout_seconds,
+                "cwd is not a directory",
+            )
+        }
+        Err(error) => {
+            return shell_error_output(
+                command_sha256,
+                requested_cwd,
+                timeout_seconds,
+                format!("failed to resolve cwd: {error}"),
+            )
+        }
+    };
+    let cwd_display = cwd.display().to_string();
+
+    let mut child = TokioCommand::new("/bin/sh");
+    // Do not use a login shell: profile scripts could reintroduce credentials
+    // after env_clear() and contaminate or prevent the requested command.
+    child.args(["-c", &params.command]);
+    child.current_dir(&cwd);
+    child.env_clear();
+    let mut inherited_path = false;
+    for (name, value) in inherited_shell_environment(env::vars_os()) {
+        inherited_path |= name == "PATH";
+        child.env(name, value);
+    }
+    if !inherited_path {
+        child.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    }
+    child.envs(&params.env);
+
+    eprintln!(
+        "[computer-use-linux] run_shell start sha256={command_sha256} cwd={cwd_display:?} timeout_seconds={timeout_seconds}"
+    );
+    match crate::command_runner::output_with_timeout(
+        child,
+        "run approved shell command",
+        Duration::from_secs(timeout_seconds),
+    )
+    .await
+    {
+        Ok(output) => {
+            let exit_code = output.status.code();
+            let (stdout, stdout_truncated) = bounded_shell_stream(&output.stdout);
+            let (stderr, stderr_truncated) = bounded_shell_stream(&output.stderr);
+            eprintln!(
+                "[computer-use-linux] run_shell finish sha256={command_sha256} exit_code={exit_code:?} stdout_bytes={} stderr_bytes={} stdout_truncated={stdout_truncated} stderr_truncated={stderr_truncated}",
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            RunShellOutput {
+                ok: output.status.success(),
+                command_sha256,
+                cwd: cwd_display,
+                timeout_seconds,
+                exit_code,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                error: None,
+            }
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            eprintln!(
+                "[computer-use-linux] run_shell error sha256={command_sha256} error={error:?}"
+            );
+            shell_error_output(command_sha256, cwd_display, timeout_seconds, error)
+        }
+    }
+}
 
 pub async fn serve_mcp() -> Result<()> {
     ComputerUseLinux::default()
@@ -1816,6 +2328,35 @@ struct WindowGeometryOutput {
     received: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct RunShellParams {
+    /// Shell program text passed to `/bin/sh -c` without loading login profiles.
+    command: String,
+    /// Existing directory in which to start the shell. Symlinks are resolved.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Additional environment entries. The ambient process environment is not inherited wholesale.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// Wall-clock timeout in seconds (default 30, maximum 120).
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct RunShellOutput {
+    ok: bool,
+    command_sha256: String,
+    cwd: String,
+    timeout_seconds: u64,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct AppCandidate {
     name: String,
@@ -1825,24 +2366,44 @@ struct AppCandidate {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct GetAppStateParams {
+    /// App name or AT-SPI id that limits the accessibility tree. Omit only when
+    /// you need the whole desktop tree; unscoped results can flood context.
     #[serde(default)]
     app_name_or_bundle_identifier: Option<String>,
+    /// Compositor window id. Also scopes the accessibility tree to that window's
+    /// application when possible.
     #[serde(default)]
     window_id: Option<u64>,
+    /// Process id. Also scopes the accessibility tree to that process when it
+    /// exposes AT-SPI.
     #[serde(default)]
     pid: Option<u32>,
+    /// Terminal tty device (for example /dev/pts/3). Resolves a window target
+    /// and scopes the tree when possible.
     #[serde(default)]
     tty: Option<String>,
+    /// Terminal emulator pid. Resolves a window target and scopes the tree when
+    /// possible.
     #[serde(default)]
     terminal_pid: Option<u32>,
+    /// Terminal command substring. Resolves a window target and scopes the tree
+    /// when possible.
     #[serde(default)]
     terminal_command: Option<String>,
+    /// Terminal working directory. Resolves a window target and scopes the tree
+    /// when possible.
     #[serde(default)]
     terminal_cwd: Option<String>,
+    /// Application id. Also scopes the accessibility tree when it matches an
+    /// AT-SPI root.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class. Also scopes the accessibility tree when it matches
+    /// an AT-SPI root.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring. Also scopes the accessibility tree when it
+    /// matches an AT-SPI root.
     #[serde(default)]
     title: Option<String>,
     /// Maximum raw AT-SPI nodes to inspect before compaction (default 1000, hard max 2000).
@@ -1851,6 +2412,8 @@ struct GetAppStateParams {
     /// Maximum AT-SPI traversal depth (default 32, hard max 64).
     #[serde(default)]
     max_depth: Option<u32>,
+    /// Include a size-bounded screenshot (default true). Set false when the
+    /// accessibility tree is enough.
     #[serde(default)]
     include_screenshot: Option<bool>,
     /// Maximum returned screenshot width in pixels (default 1920, hard-capped).
@@ -1980,6 +2543,74 @@ impl ScreenshotParams {
     }
 }
 
+/// Screenshot metadata for `get_app_state`. The image bytes travel as a
+/// separate `image` content block (issue #145), not inside this JSON.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ScreenshotSummary {
+    mime_type: String,
+    source: String,
+    /// Width of the returned image payload.
+    width: u32,
+    /// Height of the returned image payload.
+    height: u32,
+    /// Coordinate-space width before payload downscaling.
+    coordinate_width: u32,
+    /// Coordinate-space height before payload downscaling.
+    coordinate_height: u32,
+    /// Returned pixels per coordinate-space pixel.
+    scale: f32,
+    resized: bool,
+    bytes: usize,
+    original_bytes: usize,
+    max_bytes: usize,
+    format: ScreenshotOutputFormat,
+    quality: Option<u8>,
+}
+
+impl From<&ScreenshotCapture> for ScreenshotSummary {
+    fn from(capture: &ScreenshotCapture) -> Self {
+        Self {
+            mime_type: capture.mime_type.clone(),
+            source: capture.source.clone(),
+            width: capture.width,
+            height: capture.height,
+            coordinate_width: capture.coordinate_width,
+            coordinate_height: capture.coordinate_height,
+            scale: capture.scale,
+            resized: capture.resized,
+            bytes: capture.bytes,
+            original_bytes: capture.original_bytes,
+            max_bytes: capture.max_bytes,
+            format: capture.format,
+            quality: capture.quality,
+        }
+    }
+}
+
+/// Assemble the `get_app_state` result: the screenshot (when present) as a
+/// structured image block first, then the JSON report as text and as
+/// `structured_content`. Inlining the base64 in the JSON made hosts treat a
+/// 100KB+ image as plain text tokens (issue #145).
+fn app_state_result(
+    output: GetAppStateOutput,
+    screenshot: Option<ScreenshotCapture>,
+) -> Result<CallToolResult, ErrorData> {
+    let value = serde_json::to_value(&output).map_err(|error| {
+        ErrorData::internal_error(
+            format!("failed to serialize get_app_state output: {error}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::structured(value);
+    if let Some(capture) = screenshot {
+        result.content.insert(
+            0,
+            ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
+        );
+    }
+    Ok(result)
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct GetAppStateOutput {
     app_name_or_bundle_identifier: Option<String>,
@@ -1987,10 +2618,19 @@ struct GetAppStateOutput {
     window_error: Option<String>,
     window_permissions_hint: Option<String>,
     backend: String,
-    screenshot: Option<ScreenshotCapture>,
+    /// Screenshot metadata; the image itself is the first `image` content block.
+    screenshot: Option<ScreenshotSummary>,
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
+    /// True when the snapshot was limited to selected app roots rather than the
+    /// full desktop AT-SPI registry.
+    tree_scoped: bool,
+    /// True when max_nodes, max_depth, or the child read budget stopped
+    /// traversal with unread elements left, so the tree is incomplete. Recover
+    /// by scoping to a narrower app or window target and raising max_nodes or
+    /// max_depth (hard caps 2000 and 64). Failed element reads do not count.
+    accessibility_tree_truncated: bool,
     accessibility_error: Option<String>,
     /// Compact readiness summary (always present).
     readiness: crate::diagnostics::ReadinessReport,
@@ -2033,9 +2673,10 @@ struct ClickParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret `x`/`y` as relative to the targeted window's top-left corner
-    /// (the same coordinate space as a window-cropped `screenshot`). Requires a
-    /// window target; ignored otherwise.
+    /// Interpret `x`/`y` from the clipped window screenshot crop origin, in
+    /// coordinate pixels before preview resizing. Divide preview pixels by its
+    /// scale first. This is not a toolkit widget or raw GDK surface origin.
+    /// Requires a window target; missing targets are rejected.
     #[serde(default)]
     relative: Option<bool>,
 }
@@ -2154,9 +2795,10 @@ struct ScrollParams {
     wm_class: Option<String>,
     #[serde(default)]
     window_title: Option<String>,
-    /// Interpret `x`/`y` as relative to the targeted window's top-left corner
-    /// (the same coordinate space as a window-cropped `screenshot`). Requires a
-    /// window target; ignored otherwise.
+    /// Interpret `x`/`y` from the clipped window screenshot crop origin, in
+    /// coordinate pixels before preview resizing. Divide preview pixels by its
+    /// scale first. This is not a toolkit widget or raw GDK surface origin.
+    /// Requires a window target; missing targets are rejected.
     #[serde(default)]
     relative: Option<bool>,
 }
@@ -2293,12 +2935,12 @@ impl ComputerUseLinux {
         session_is_wayland(session_type.as_deref(), wayland_display.as_deref())
     }
 
-    // The Wayland remote-desktop portal is now a *fallback* for input: when a
-    // compatible ydotool CLI and working `ydotoold` socket are present we prefer
-    // ydotool, because it injects input without a permission prompt. GNOME
-    // refuses to persist remote-desktop
-    // grants (`org.freedesktop.portal.Error: Remote desktop sessions cannot
-    // persist`), so the portal would otherwise re-prompt on every new session.
+    // The Wayland remote-desktop portal is a fallback for input: when a
+    // compatible ydotool CLI and working `ydotoold` socket are present we
+    // prefer ydotool, because it injects input without a permission prompt.
+    // Without `COMPUTER_USE_LINUX_PERSIST_REMOTE_DESKTOP=1` the portal asks
+    // again on every new process. That opt-in sends `persist_mode=2` on
+    // RemoteDesktop SelectDevices and reuses the single-use restore token.
     // `COMPUTER_USE_LINUX_FORCE_YDOTOOL_*=1` always uses ydotool;
     // `COMPUTER_USE_LINUX_FORCE_PORTAL_*=1` always uses the portal.
     async fn should_prefer_portal_pointer_backend(&self) -> bool {
@@ -2380,6 +3022,17 @@ impl ComputerUseLinux {
             self.is_wayland_session(),
             env_var_non_empty("DISPLAY"),
             xdotool_available(),
+        )
+    }
+
+    fn should_prefer_wtype_keyboard(&self) -> bool {
+        prefer_wtype_keyboard(
+            env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD"),
+            self.is_wayland_session(),
+            crate::diagnostics::wtype_compatible_wayland_desktop(
+                env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+            ),
+            wtype_available(),
         )
     }
 
@@ -2852,17 +3505,15 @@ impl ComputerUseLinux {
             .as_ref()
             .and_then(|window| window.pid)
             .or(focus.requested_window.pid);
-        match timeout(Duration::from_millis(1500), focused_element_summary(pid)).await {
-            Ok(Ok(Some(element))) => Some(describe_focused_element(&element, expects_editable)),
-            Ok(Ok(None)) => Some(
-                "WARNING: AT-SPI reports no focused element in the target app — the input may have landed nowhere. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
-                    .to_string(),
-            ),
+        match timeout(Duration::from_millis(1500), probe_focused_element(pid)).await {
+            Ok(Ok(probe)) => Some(focus_probe_feedback(&probe, expects_editable)),
             Ok(Err(error)) => Some(format!(
                 "Focused-element feedback unavailable ({}).",
                 first_line(&format!("{error:#}"))
             )),
-            Err(_) => Some("Focused-element feedback unavailable (AT-SPI probe timed out).".to_string()),
+            Err(_) => {
+                Some("Focused-element feedback unavailable (AT-SPI probe timed out).".to_string())
+            }
         }
     }
 
@@ -2975,17 +3626,64 @@ impl ComputerUseLinux {
         notes
     }
 
+    #[cfg(test)]
     fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
+        self.cache_snapshot(nodes, None);
+    }
+
+    fn cache_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>) {
         if let Ok(mut cached) = self.last_nodes.lock() {
             cached.clear();
             cached.extend_from_slice(nodes);
         }
+        if let Ok(mut pid) = self.last_snapshot_pid.lock() {
+            *pid = target_pid;
+        }
     }
 
     fn clear_cached_nodes(&self) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
+        self.cache_snapshot(&[], None);
+    }
+
+    /// Reject an element-targeted action whose cached node belongs to a
+    /// different app than the action's target. A snapshot taken for a pid is
+    /// judged by that pid; an untargeted snapshot mixes apps, so its node is
+    /// judged by the pid that owns it on the accessibility bus. When neither is
+    /// known the action proceeds, since a mismatch cannot be shown.
+    async fn check_node_target(
+        &self,
+        node: &AccessibilityNode,
+        target_pid: Option<u32>,
+    ) -> std::result::Result<(), String> {
+        let Some(target_pid) = target_pid else {
+            return Ok(());
+        };
+        let snapshot_pid = self.last_snapshot_pid.lock().ok().and_then(|pid| *pid);
+        let owner_pid = match snapshot_pid {
+            Some(pid) => Some(pid),
+            None => object_ref_owner_pid(&node.object_ref).await.ok().flatten(),
+        };
+        match owner_pid {
+            Some(owner_pid) if owner_pid != target_pid => Err(node_target_mismatch_message(
+                node.index, owner_pid, target_pid,
+            )),
+            _ => Ok(()),
         }
+    }
+
+    /// The cached node an element-targeted click or scroll would act on, when
+    /// the call names one. Resolution errors are left to the tool's own path.
+    fn cached_node_for(
+        &self,
+        element_index: Option<u32>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> Option<AccessibilityNode> {
+        if element_index.is_none() && selector.is_empty() {
+            return None;
+        }
+        self.resolve_cached_node(element_index, selector, purpose)
+            .ok()
     }
 
     fn resolve_optional_target_point(
@@ -3023,6 +3721,21 @@ impl ComputerUseLinux {
             ElementResolvePurpose::Click,
         )?;
 
+        // Toolkit extents are not necessarily in the pointer backend's space
+        // (GTK3 X11 HiDPI, GTK4 zero-origin bounds). Ordinary activation does
+        // not need a guessed scale when the target exposes its native action.
+        if is_plain_left_click(params.button.as_deref(), params.click_count) {
+            if let Some(action) =
+                primary_action(&node.actions).filter(|action| click_equivalent_action(action))
+            {
+                return Ok(ClickTarget::PrimaryAction {
+                    object_ref: node.object_ref.clone(),
+                    action_name: Some(action.name.clone()),
+                    action_index: action.index,
+                });
+            }
+        }
+
         if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
             return Ok(ClickTarget::Coordinates(x, y));
         }
@@ -3034,17 +3747,10 @@ impl ComputerUseLinux {
             ));
         }
 
-        let Some(action) = primary_action(node.actions.as_slice()) else {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                node.index
-            ));
-        };
-        Ok(ClickTarget::PrimaryAction {
-            object_ref: node.object_ref.clone(),
-            action_name: Some(action.name.clone()),
-            action_index: action.index,
-        })
+        Err(format!(
+            "No clickable bounds or click-equivalent AT-SPI action for element_index {}. Use perform_action explicitly for other actions.",
+            node.index
+        ))
     }
 
     fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
@@ -3380,6 +4086,13 @@ fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
     matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
 }
 
+fn click_equivalent_action(action: &AccessibilityAction) -> bool {
+    matches!(
+        action.name.to_ascii_lowercase().as_str(),
+        "click" | "press" | "toggle"
+    )
+}
+
 fn requested_or_primary_action(action: Option<&str>) -> &str {
     match action.map(str::trim).filter(|value| !value.is_empty()) {
         Some(action) => action,
@@ -3406,6 +4119,34 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
         bounds.x.checked_add(bounds.width / 2)?,
         bounds.y.checked_add(bounds.height / 2)?,
     ))
+}
+
+/// Context-cost warning for an AT-SPI snapshot that no app target narrowed.
+/// Silent when the tree failed (the failure message already explains) or when
+/// any filter or pid match scoped the roots. When the caller did pass a target
+/// and it still matched no AT-SPI root, telling them to pass a target would
+/// only replay the same desktop-wide snapshot, so that case points at the
+/// app's accessibility support instead.
+fn unscoped_accessibility_tree_warning(
+    tree_scoped: bool,
+    tree_ok: bool,
+    target_requested: bool,
+) -> Option<&'static str> {
+    if !tree_ok || tree_scoped {
+        return None;
+    }
+    Some(if target_requested {
+        "WARNING: the requested target matched no AT-SPI application root, so the accessibility tree covers the whole desktop and can flood context. The target app may expose no accessibility tree (Electron apps need --force-renderer-accessibility); check list_apps for its AT-SPI name and pass that as app_name_or_bundle_identifier, or lower max_nodes to bound the cost."
+    } else {
+        "WARNING: no app target scoped the accessibility tree, so it covers the whole desktop and can flood context. Pass app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title) to limit it."
+    })
+}
+
+/// Note appended when raw traversal hit max_nodes; the tree is incomplete.
+fn truncated_accessibility_tree_note(truncated: bool) -> Option<&'static str> {
+    truncated.then_some(
+        "The node, depth, or read budget stopped traversal with unread elements left. To recover missing elements, scope to a narrower app or window target and raise max_nodes or max_depth (hard caps 2000 and 64); lowering max_nodes would drop more.",
+    )
 }
 
 fn compact_accessibility_tree(nodes: Vec<AccessibilityNode>) -> Vec<AccessibilityNode> {
@@ -3613,7 +4354,7 @@ fn native_x11_xdotool_pointer_session(
     wayland_display: Option<&str>,
 ) -> bool {
     session_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("x11"))
-        && !wayland_display.is_some_and(|value| !value.trim().is_empty())
+        && wayland_display.is_none_or(|value| value.trim().is_empty())
 }
 
 fn prefer_xdotool_pointer(
@@ -4003,6 +4744,33 @@ fn with_focus_context(mut output: ActionOutput, focus: Option<WindowFocusResult>
     output
 }
 
+/// Post-input focus feedback. Only a complete search that finds nothing is a
+/// warning; a search that hit a limit, or an app without an AT-SPI tree, cannot
+/// tell whether the input landed, so it says that instead.
+fn focus_probe_feedback(probe: &FocusProbe, expects_editable: bool) -> String {
+    match probe {
+        FocusProbe::Found(element) => describe_focused_element(element, expects_editable),
+        FocusProbe::NoneFocused => "WARNING: AT-SPI reports no focused element in the target app; the input may have landed nowhere.".to_string(),
+        FocusProbe::Incomplete => "Focused-element feedback unavailable: the focused element was not reached within the AT-SPI search limits, so the input could not be verified. Its absence here does not mean the input was lost.".to_string(),
+        FocusProbe::NoAccessibleApp => "Focused-element feedback unavailable: the target app exposes no AT-SPI tree, so the input could not be verified. Electron apps need --force-renderer-accessibility.".to_string(),
+    }
+}
+
+fn node_target_mismatch_message(element_index: u32, owner_pid: u32, target_pid: u32) -> String {
+    format!(
+        "element_index {element_index} comes from the latest get_app_state snapshot of pid {owner_pid}, not the target pid {target_pid}. Call get_app_state for the target app and use an index from that result."
+    )
+}
+
+fn focus_target_pid(focus: Option<&WindowFocusResult>) -> Option<u32> {
+    let focus = focus?;
+    focus
+        .focused_window
+        .as_ref()
+        .and_then(|window| window.pid)
+        .or(focus.requested_window.pid)
+}
+
 fn describe_focused_element(element: &FocusedElementSummary, expects_editable: bool) -> String {
     let name = element
         .name
@@ -4033,6 +4801,15 @@ fn with_notes(mut output: ActionOutput, notes: impl IntoIterator<Item = String>)
         output.message = format!("{} {note}", output.message);
     }
     output
+}
+
+fn abs_pointer_clamp_note(landing: crate::abs_pointer::PointerLanding) -> Option<String> {
+    (landing.requested != landing.emitted).then(|| {
+        format!(
+            "Requested coordinate {},{} was clamped to {},{} by the uinput absolute pointer.",
+            landing.requested.0, landing.requested.1, landing.emitted.0, landing.emitted.1
+        )
+    })
 }
 
 fn focus_satisfies_target(focus: &WindowFocusResult, target: &WindowTarget) -> bool {
@@ -4115,6 +4892,54 @@ fn xdotool_pointer_button_code(button: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Gap between XTEST wheel-button clicks, in milliseconds.
+///
+/// xdotool's own default is 100ms. One page is five clicks and `pages` is
+/// not capped, so that default blows the flat input timeout past about 20
+/// pages. 12ms is the same pacing as `xdotool type`.
+const XDOTOOL_SCROLL_CLICK_DELAY_MS: u64 = 12;
+
+/// X11 wheel buttons: 4 up, 5 down, 6 left, 7 right. `repeat` is the notch
+/// count, the same number ydotool would pass to `mousemove --wheel`.
+fn xdotool_pointer_scroll_args(
+    point: Option<(i32, i32)>,
+    repeat: u32,
+    direction: ScrollDirection,
+) -> Vec<String> {
+    let button = match direction {
+        ScrollDirection::Up => "4",
+        ScrollDirection::Down => "5",
+        ScrollDirection::Left => "6",
+        ScrollDirection::Right => "7",
+    };
+    let mut args = Vec::new();
+    if let Some((x, y)) = point {
+        args.extend([
+            "mousemove".to_string(),
+            "--".to_string(),
+            x.to_string(),
+            y.to_string(),
+        ]);
+    }
+    args.extend([
+        "click".to_string(),
+        "--delay".to_string(),
+        XDOTOOL_SCROLL_CLICK_DELAY_MS.to_string(),
+        "--repeat".to_string(),
+        repeat.max(1).to_string(),
+        button.to_string(),
+    ]);
+    args
+}
+
+/// `xdotool click --repeat` sleeps `--delay` after every click, including
+/// the last, so the command timeout has to cover that gap.
+fn xdotool_scroll_timeout(repeat: u32, delay_ms: u64) -> Duration {
+    INPUT_COMMAND_TIMEOUT.saturating_add(Duration::from_millis(
+        u64::from(repeat.max(1)).saturating_mul(delay_ms),
+    ))
+}
+
 #[derive(Debug)]
 struct PointerCommandResult {
     outputs: Vec<Output>,
@@ -4131,6 +4956,28 @@ where
     Fut: Future<Output = std::result::Result<Vec<Output>, String>>,
 {
     match run_xdotool(program, args).await {
+        XdotoolAttempt::Unavailable => fallback().await.map(|outputs| PointerCommandResult {
+            outputs,
+            backend: KeyboardCommandBackend::Ydotool,
+        }),
+        XdotoolAttempt::Finished(result) => result.map(|output| PointerCommandResult {
+            outputs: vec![output],
+            backend: KeyboardCommandBackend::Xdotool,
+        }),
+    }
+}
+
+async fn run_xdotool_pointer_or_fallback_with_timeout<F, Fut>(
+    program: &Path,
+    args: &[String],
+    command_timeout: Duration,
+    fallback: F,
+) -> std::result::Result<PointerCommandResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = std::result::Result<Vec<Output>, String>>,
+{
+    match run_xdotool_with_timeout(program, args, command_timeout).await {
         XdotoolAttempt::Unavailable => fallback().await.map(|outputs| PointerCommandResult {
             outputs,
             backend: KeyboardCommandBackend::Ydotool,
@@ -4278,7 +5125,9 @@ fn ydotool_type_timeout(text: &str) -> Duration {
 }
 
 const EVDEV_KEY_LEFTCTRL: i32 = 29;
+const EVDEV_KEY_LEFTSHIFT: i32 = 42;
 const EVDEV_KEY_V: i32 = 47;
+const EVDEV_KEY_INSERT: i32 = 110;
 const KDE_CLIPBOARD_RESTORE_MIN_DELAY_MS: u64 = 1_500;
 const KDE_CLIPBOARD_RESTORE_MAX_DELAY_MS: u64 = 5_000;
 const KDE_CLIPBOARD_RESTORE_CHARS_PER_SECOND: u64 = 250;
@@ -4321,6 +5170,7 @@ impl KdeClipboardPasteError {
 async fn run_kde_clipboard_paste_text(
     session: &PortalKeyboardSession,
     text: &str,
+    paste_shortcut: KdeClipboardPasteShortcut,
 ) -> std::result::Result<String, KdeClipboardPasteError> {
     let previous = kde_clipboard_contents()
         .await
@@ -4329,7 +5179,8 @@ async fn run_kde_clipboard_paste_text(
         .await
         .map_err(KdeClipboardPasteError::before_text_input)?;
 
-    let paste_result = press_keycode_chord(session, &[EVDEV_KEY_LEFTCTRL], EVDEV_KEY_V)
+    let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
+    let paste_result = press_keycode_chord(session, modifiers, keycode)
         .await
         .map_err(|error| format!("{error:#}"));
 
@@ -4345,6 +5196,96 @@ async fn run_kde_clipboard_paste_text(
         (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::after_portal_input(
             format!("{error}; previous KDE clipboard contents could not be restored: {restore_error}"),
         )),
+    }
+}
+
+/// Paste chord for KDE clipboard text input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KdeClipboardPasteShortcut {
+    /// Ctrl+V, for ordinary widgets.
+    Standard,
+    /// Ctrl+Shift+V, for most terminal emulators.
+    CtrlShiftV,
+    /// Shift+Insert, for the xterm and rxvt families.
+    ShiftInsert,
+}
+
+async fn kde_clipboard_paste_shortcut(
+    target: &WindowTarget,
+    focus: Option<&WindowFocusResult>,
+) -> KdeClipboardPasteShortcut {
+    let current = match focus {
+        Some(_) => None,
+        None => focused_window().await.ok().flatten(),
+    };
+    let window = focus
+        .map(|focus| {
+            focus
+                .focused_window
+                .as_ref()
+                .unwrap_or(&focus.requested_window)
+        })
+        .or(current.as_ref());
+    let terminal = kde_clipboard_terminal_shortcut(target, window);
+    if terminal.is_none() {
+        return KdeClipboardPasteShortcut::Standard;
+    }
+    // A terminal window can hold focus on a non-terminal widget (a search
+    // field, a tab rename box) that pastes with plain Ctrl+V. Only an answer
+    // from the terminal's own AT-SPI app may override the chord: without a pid,
+    // or when the terminal exposes no AT-SPI root, keep the terminal chord.
+    let Some(pid) = window.and_then(|window| window.pid) else {
+        return kde_clipboard_shortcut_for_focus(terminal, None);
+    };
+    let focused_element = timeout(
+        Duration::from_millis(1_500),
+        focused_element_summary_in_app(pid),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
+    kde_clipboard_shortcut_for_focus(terminal, focused_element.as_ref())
+}
+
+/// The terminal chord for the resolved window, or for an explicit terminal
+/// selector when no window resolved. A resolved window always wins over a
+/// possibly stale selector.
+fn kde_clipboard_terminal_shortcut(
+    target: &WindowTarget,
+    window: Option<&WindowInfo>,
+) -> Option<TerminalPasteShortcut> {
+    match window {
+        Some(window) => terminal_paste_shortcut(window),
+        None => target
+            .has_terminal_target()
+            .then_some(TerminalPasteShortcut::CtrlShiftV),
+    }
+}
+
+fn kde_clipboard_shortcut_for_focus(
+    terminal: Option<TerminalPasteShortcut>,
+    focused_element: Option<&FocusedElementSummary>,
+) -> KdeClipboardPasteShortcut {
+    // No AT-SPI answer (xterm exposes none) keeps the terminal chord; a
+    // concrete non-terminal focused element switches back to Ctrl+V.
+    if focused_element.is_some_and(|element| !element.is_terminal) {
+        return KdeClipboardPasteShortcut::Standard;
+    }
+    match terminal {
+        Some(TerminalPasteShortcut::CtrlShiftV) => KdeClipboardPasteShortcut::CtrlShiftV,
+        Some(TerminalPasteShortcut::ShiftInsert) => KdeClipboardPasteShortcut::ShiftInsert,
+        None => KdeClipboardPasteShortcut::Standard,
+    }
+}
+
+fn kde_clipboard_paste_chord(shortcut: KdeClipboardPasteShortcut) -> (&'static [i32], i32) {
+    match shortcut {
+        KdeClipboardPasteShortcut::Standard => (&[EVDEV_KEY_LEFTCTRL], EVDEV_KEY_V),
+        KdeClipboardPasteShortcut::CtrlShiftV => {
+            (&[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT], EVDEV_KEY_V)
+        }
+        KdeClipboardPasteShortcut::ShiftInsert => (&[EVDEV_KEY_LEFTSHIFT], EVDEV_KEY_INSERT),
     }
 }
 
@@ -4428,6 +5369,7 @@ fn ydotool_output_error(output: Output) -> String {
 /// live layout, which is what X11 clients actually expect. See issue #58.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardCommandBackend {
+    Wtype,
     Xdotool,
     Ydotool,
 }
@@ -4443,6 +5385,14 @@ enum XdotoolAttempt {
 }
 
 async fn run_xdotool(program: &Path, args: &[String]) -> XdotoolAttempt {
+    run_xdotool_with_timeout(program, args, INPUT_COMMAND_TIMEOUT).await
+}
+
+async fn run_xdotool_with_timeout(
+    program: &Path,
+    args: &[String],
+    command_timeout: Duration,
+) -> XdotoolAttempt {
     let mut command = TokioCommand::new(program);
     command.args(args);
     command.stdout(Stdio::piped());
@@ -4450,9 +5400,11 @@ async fn run_xdotool(program: &Path, args: &[String]) -> XdotoolAttempt {
     command.kill_on_drop(true);
     command.process_group(0);
 
-    match command.spawn() {
+    // A busy-file spawn error is transient, not "xdotool is unavailable"; do
+    // not let it route input to the ydotool fallback.
+    match crate::command_runner::spawn_retrying_busy(&mut command).await {
         Ok(child) => XdotoolAttempt::Finished(
-            match crate::command_runner::output_child(child, "run xdotool", INPUT_COMMAND_TIMEOUT)
+            match crate::command_runner::output_child(child, "run xdotool", command_timeout)
                 .await
                 .map_err(|error| format!("{error:#}"))
             {
@@ -4474,7 +5426,20 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = std::result::Result<Output, String>>,
 {
-    match run_xdotool(program, args).await {
+    run_xdotool_or_fallback_with_timeout(program, args, INPUT_COMMAND_TIMEOUT, fallback).await
+}
+
+async fn run_xdotool_or_fallback_with_timeout<F, Fut>(
+    program: &Path,
+    args: &[String],
+    command_timeout: Duration,
+    fallback: F,
+) -> std::result::Result<KeyboardCommandResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = std::result::Result<Output, String>>,
+{
+    match run_xdotool_with_timeout(program, args, command_timeout).await {
         XdotoolAttempt::Unavailable => fallback().await.map(|output| KeyboardCommandResult {
             output,
             backend: KeyboardCommandBackend::Ydotool,
@@ -4486,6 +5451,48 @@ where
     }
 }
 
+async fn run_wtype_type_text_or_fallback<F, Fut>(
+    program: &Path,
+    text: &str,
+    fallback: F,
+) -> std::result::Result<KeyboardCommandResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = std::result::Result<Output, String>>,
+{
+    let available = if program.components().count() > 1 {
+        std::fs::metadata(program)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+    } else {
+        program.to_str().is_some_and(which_in_path)
+    };
+    if !available {
+        return fallback().await.map(|output| KeyboardCommandResult {
+            output,
+            backend: KeyboardCommandBackend::Ydotool,
+        });
+    }
+
+    let mut command = TokioCommand::new(program);
+    command.arg("-");
+    let output = crate::command_runner::output_with_stdin(
+        command,
+        "run wtype",
+        ydotool_type_timeout(text),
+        text.as_bytes().to_vec(),
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+    if !output.status.success() {
+        return Err(command_output_error("wtype", output));
+    }
+    Ok(KeyboardCommandResult {
+        output,
+        backend: KeyboardCommandBackend::Wtype,
+    })
+}
+
 /// True when `xdotool` can drive this session: an X11 session with `DISPLAY`
 /// set and the binary present. `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1`
 /// opts out; `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
@@ -4493,15 +5500,50 @@ fn xdotool_available() -> bool {
     which_in_path("xdotool")
 }
 
-fn xdotool_type_args(text: &str) -> Vec<String> {
+fn wtype_available() -> bool {
+    which_in_path("wtype")
+}
+
+fn prefer_wtype_keyboard(
+    force_ydotool: bool,
+    is_wayland: bool,
+    compatible_desktop: bool,
+    available: bool,
+) -> bool {
+    !force_ydotool && is_wayland && compatible_desktop && available
+}
+
+/// Default per-character delay for `xdotool type`, in milliseconds (xdotool's
+/// own default). `--delay 0` lets XTEST key events race each other on some X
+/// servers (Cinnamon on Mint 22, issue #147): every character arrives, but in
+/// a random order. A small delay keeps them ordered.
+/// `COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS` overrides it.
+const XDOTOOL_TYPE_DELAY_MS: u64 = 12;
+const XDOTOOL_TYPE_DELAY_ENV: &str = "COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS";
+
+fn xdotool_type_delay_ms() -> u64 {
+    env::var(XDOTOOL_TYPE_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(XDOTOOL_TYPE_DELAY_MS)
+}
+
+fn xdotool_type_args_with_delay(text: &str, delay_ms: u64) -> Vec<String> {
     vec![
         "type".to_string(),
         "--clearmodifiers".to_string(),
         "--delay".to_string(),
-        "0".to_string(),
+        delay_ms.to_string(),
         "--".to_string(),
         text.to_string(),
     ]
+}
+
+/// `xdotool type` spends about `delay_ms` per character, so long inputs need
+/// more than the flat input timeout.
+fn xdotool_type_timeout(text: &str, delay_ms: u64) -> Duration {
+    let chars = text.chars().count() as u64;
+    INPUT_COMMAND_TIMEOUT.saturating_add(Duration::from_millis(chars.saturating_mul(delay_ms)))
 }
 
 fn which_in_path(binary: &str) -> bool {
@@ -4714,6 +5756,76 @@ fn key_chord(key: &str) -> Option<(Vec<u16>, u16)> {
     Some((modifiers, keycode))
 }
 
+/// Portal form of [`key_chord`]. Modifiers and named keys go out as keysyms
+/// so the compositor resolves them against the active keymap: with Caps Lock
+/// and Control swapped, `Ctrl` presses whichever key produces `Control_L`
+/// (issue #191). Letters and digits stay physical keycodes: mutter drops a
+/// keysym missing from the current layout group, so `Ctrl+A` as a keysym
+/// would vanish under a non-Latin layout, while the US keycode is what GTK and
+/// Qt match shortcuts against there.
+fn portal_key_chord(key: &str) -> Option<(Vec<PortalKey>, PortalKey)> {
+    let parts = key
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let (key_part, modifier_parts) = parts.split_last()?;
+    let (_, keycode) = key_chord(key)?;
+    let mut modifiers = Vec::new();
+    for part in modifier_parts {
+        modifiers.push(PortalKey::Keysym(modifier_keysym(part)?));
+    }
+    let key = modifier_keysym(key_part)
+        .filter(|_| modifier_parts.is_empty())
+        .or_else(|| named_keysym(key_part))
+        .map_or(PortalKey::Keycode(i32::from(keycode)), PortalKey::Keysym);
+    Some((modifiers, key))
+}
+
+fn modifier_keysym(key: &str) -> Option<i32> {
+    let keysym = match normalize_key(key).as_str() {
+        "ctrl" | "control" => xkey::Control_L,
+        "alt" | "option" => xkey::Alt_L,
+        "shift" => xkey::Shift_L,
+        "meta" | "super" | "cmd" | "command" => xkey::Super_L,
+        _ => return None,
+    };
+    Some(keysym as i32)
+}
+
+fn named_keysym(key: &str) -> Option<i32> {
+    let keysym = match normalize_key(key).as_str() {
+        "enter" | "return" => xkey::Return,
+        "escape" | "esc" => xkey::Escape,
+        "tab" => xkey::Tab,
+        "backspace" => xkey::BackSpace,
+        "delete" | "del" => xkey::Delete,
+        "space" => xkey::space,
+        "home" => xkey::Home,
+        "end" => xkey::End,
+        "pageup" | "page_up" => xkey::Page_Up,
+        "pagedown" | "page_down" => xkey::Page_Down,
+        "arrowleft" | "left" => xkey::Left,
+        "arrowright" | "right" => xkey::Right,
+        "arrowup" | "up" => xkey::Up,
+        "arrowdown" | "down" => xkey::Down,
+        "f1" => xkey::F1,
+        "f2" => xkey::F2,
+        "f3" => xkey::F3,
+        "f4" => xkey::F4,
+        "f5" => xkey::F5,
+        "f6" => xkey::F6,
+        "f7" => xkey::F7,
+        "f8" => xkey::F8,
+        "f9" => xkey::F9,
+        "f10" => xkey::F10,
+        "f11" => xkey::F11,
+        "f12" => xkey::F12,
+        _ => return None,
+    };
+    Some(keysym as i32)
+}
+
 fn key_sequence(key: &str) -> Option<Vec<String>> {
     let (modifiers, keycode) = key_chord(key)?;
     let mut events = Vec::new();
@@ -4894,6 +6006,57 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn completion_tool_is_explicitly_opt_in_and_has_side_effect_annotations() {
+        let server = ComputerUseLinux::default();
+        assert!(!server
+            .router_with_completion(false)
+            .list_all()
+            .iter()
+            .any(|t| t.name == "complete_interaction"));
+        let tools = server.router_with_completion(true).list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "complete_interaction")
+            .unwrap();
+        let value = serde_json::to_value(tool).unwrap();
+        assert_eq!(value["annotations"]["readOnlyHint"], false);
+        assert_eq!(value["annotations"]["destructiveHint"], false);
+        assert_eq!(value["annotations"]["idempotentHint"], false);
+        assert_eq!(value["annotations"]["openWorldHint"], true);
+    }
+
+    #[tokio::test]
+    async fn completion_notification_handles_missing_and_failed_backends() {
+        for path in ["/nonexistent/computer-use-notify", "/bin/false"] {
+            let result =
+                send_completion_notification(Path::new(path), Duration::from_secs(2)).await;
+            assert!(result.ok);
+            assert_eq!(result.cue, "skipped");
+        }
+        let result =
+            send_completion_notification(Path::new("/bin/true"), Duration::from_secs(2)).await;
+        assert_eq!(result.cue, "notification");
+    }
+
+    #[tokio::test]
+    async fn completion_notification_timeout_is_bounded() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-notify-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("notify");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        let output = send_completion_notification(&program, Duration::from_millis(30)).await;
+        assert_eq!(output.cue, "skipped");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn exported_tool_schemas_omit_unsigned_integer_formats() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
         let value = serde_json::to_value(tools).unwrap();
@@ -5050,6 +6213,87 @@ mod tests {
         );
     }
 
+    fn sample_app_state_output(screenshot: Option<&ScreenshotCapture>) -> GetAppStateOutput {
+        GetAppStateOutput {
+            app_name_or_bundle_identifier: None,
+            window_context: None,
+            window_error: None,
+            window_permissions_hint: None,
+            backend: "linux-atspi".to_string(),
+            screenshot: screenshot.map(ScreenshotSummary::from),
+            screenshot_error: None,
+            accessibility_tree: Vec::new(),
+            accessibility_tree_raw_count: 0,
+            tree_scoped: true,
+            accessibility_tree_truncated: false,
+            accessibility_error: None,
+            readiness: crate::diagnostics::ReadinessReport {
+                can_register_mcp_tools: true,
+                can_build_accessibility_tree: true,
+                can_query_windows: true,
+                can_focus_apps: true,
+                can_focus_windows: true,
+                can_send_development_input: true,
+                can_capture_screenshots: true,
+                recommended_next_step: String::new(),
+                blockers: Vec::new(),
+            },
+            diagnostics: None,
+            message: "ok".to_string(),
+        }
+    }
+
+    #[test]
+    fn app_state_result_emits_screenshot_as_image_block_not_inline_base64() {
+        // Issue #145: the base64 payload must ride a structured image block so
+        // hosts count it as vision tokens instead of a 100KB text blob.
+        let raw = RawScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            bytes: solid_png(64, 32),
+            source: "test".to_string(),
+            width: 64,
+            height: 32,
+        };
+        let capture =
+            prepare_app_state_screenshot(raw, None, false, ScreenshotPayloadOptions::default())
+                .unwrap();
+        let payload = data_url_payload(&capture.data_url);
+        let output = sample_app_state_output(Some(&capture));
+
+        let result = app_state_result(output, Some(capture)).unwrap();
+
+        assert_eq!(result.content.len(), 2);
+        let image = result.content[0]
+            .as_image()
+            .expect("first block is an image");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.data, payload);
+        let text = &result.content[1]
+            .as_text()
+            .expect("second block is text")
+            .text;
+        assert!(
+            !text.contains(&payload),
+            "base64 leaked into the text block"
+        );
+        assert!(!text.contains("data_url"));
+        let structured = result.structured_content.expect("structured content");
+        assert_eq!(structured["screenshot"]["width"], 64);
+        assert_eq!(structured["screenshot"]["mime_type"], "image/png");
+        assert!(structured["screenshot"].get("data_url").is_none());
+    }
+
+    #[test]
+    fn app_state_result_without_screenshot_is_text_only() {
+        let result = app_state_result(sample_app_state_output(None), None).unwrap();
+        assert_eq!(result.content.len(), 1);
+        assert!(result.content[0].as_text().is_some());
+        assert_eq!(
+            result.structured_content.unwrap()["screenshot"],
+            serde_json::Value::Null
+        );
+    }
+
     #[test]
     fn gnome_window_crop_scales_logical_bounds_to_capture_pixels() {
         let bounds = WindowBounds {
@@ -5189,6 +6433,15 @@ mod tests {
     }
 
     #[test]
+    fn wayland_prefers_wtype_unless_ydotool_is_forced() {
+        assert!(prefer_wtype_keyboard(false, true, true, true));
+        assert!(!prefer_wtype_keyboard(true, true, true, true));
+        assert!(!prefer_wtype_keyboard(false, false, true, true));
+        assert!(!prefer_wtype_keyboard(false, true, false, true));
+        assert!(!prefer_wtype_keyboard(false, true, true, false));
+    }
+
+    #[test]
     fn window_crop_happens_before_screenshot_payload_resize() {
         let (cropped, width, height) = crop_png(&solid_png(400, 200), 50, 20, 200, 100).unwrap();
         let capture = prepare_screenshot_payload(
@@ -5259,6 +6512,22 @@ mod tests {
     }
 
     #[test]
+    fn relative_click_origin_is_screenshot_crop_not_raw_surface_buffer() {
+        // GNOME Wayland CSD probe: frame [760,406,400,300], buffer
+        // [746,394,428,329]. The screenshot's green target is at [850,543].
+        // Crop-local [90,137] and desktop [850,543] must denote the same point;
+        // substituting the buffer/shadow origin would miss by [14,12].
+        let mut params = ClickParams {
+            x: Some(90),
+            y: Some(137),
+            relative: Some(true),
+            ..Default::default()
+        };
+        apply_window_relative_click_coordinates(&mut params, (760, 406, 400, 300)).unwrap();
+        assert_eq!((params.x, params.y), (Some(850), Some(543)));
+    }
+
+    #[test]
     fn relative_click_coordinates_require_xy() {
         let mut params = ClickParams {
             x: Some(7),
@@ -5289,6 +6558,27 @@ mod tests {
             assert!(error.contains("inside target-window bounds"));
             assert_eq!((params.x, params.y), (Some(x), Some(y)));
         }
+    }
+
+    #[test]
+    fn absolute_pointer_note_reports_the_emitted_coordinate() {
+        assert_eq!(
+            abs_pointer_clamp_note(crate::abs_pointer::PointerLanding {
+                requested: (1920, 1080),
+                emitted: (1919, 1079),
+            }),
+            Some(
+                "Requested coordinate 1920,1080 was clamped to 1919,1079 by the uinput absolute pointer."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            abs_pointer_clamp_note(crate::abs_pointer::PointerLanding {
+                requested: (640, 480),
+                emitted: (640, 480),
+            }),
+            None
+        );
     }
 
     #[test]
@@ -5534,6 +6824,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kde_clipboard_maps_each_paste_shortcut_to_its_chord() {
+        assert_eq!(
+            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::Standard),
+            (&[EVDEV_KEY_LEFTCTRL][..], EVDEV_KEY_V)
+        );
+        assert_eq!(
+            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::CtrlShiftV),
+            (&[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT][..], EVDEV_KEY_V)
+        );
+        assert_eq!(
+            kde_clipboard_paste_chord(KdeClipboardPasteShortcut::ShiftInsert),
+            (&[EVDEV_KEY_LEFTSHIFT][..], EVDEV_KEY_INSERT)
+        );
+    }
+
+    fn focused(role: &str, is_terminal: bool) -> FocusedElementSummary {
+        FocusedElementSummary {
+            role: role.to_string(),
+            name: None,
+            editable: false,
+            states: vec!["focused".to_string()],
+            is_terminal,
+        }
+    }
+
+    #[test]
+    fn kde_clipboard_focus_fallback_uses_the_role_enum_not_the_name() {
+        let ctrl_shift_v = Some(TerminalPasteShortcut::CtrlShiftV);
+        let shift_insert = Some(TerminalPasteShortcut::ShiftInsert);
+
+        // No AT-SPI answer (xterm exposes none) keeps the terminal chord.
+        assert_eq!(
+            kde_clipboard_shortcut_for_focus(shift_insert, None),
+            KdeClipboardPasteShortcut::ShiftInsert
+        );
+        // A terminal widget keeps it, whatever its localized role name.
+        assert_eq!(
+            kde_clipboard_shortcut_for_focus(ctrl_shift_v, Some(&focused("терминал", true))),
+            KdeClipboardPasteShortcut::CtrlShiftV
+        );
+        // A focused search field inside the terminal window pastes with Ctrl+V.
+        assert_eq!(
+            kde_clipboard_shortcut_for_focus(ctrl_shift_v, Some(&focused("text", false))),
+            KdeClipboardPasteShortcut::Standard
+        );
+        assert_eq!(
+            kde_clipboard_shortcut_for_focus(None, None),
+            KdeClipboardPasteShortcut::Standard
+        );
+    }
+
+    #[test]
+    fn kde_clipboard_routes_xterm_family_to_shift_insert() {
+        for wm_class in ["xterm", "UXTerm", "urxvt", "rxvt-unicode", "koi8rxterm"] {
+            let window = window_info(1, Some("user@host"), None, Some(wm_class), Some(100));
+            assert_eq!(
+                kde_clipboard_terminal_shortcut(&WindowTarget::default(), Some(&window)),
+                Some(TerminalPasteShortcut::ShiftInsert),
+                "{wm_class} should paste with Shift+Insert"
+            );
+        }
+    }
+
+    #[test]
+    fn kde_clipboard_routes_explicit_tty_targets_to_terminal_paste() {
+        let target = WindowTarget {
+            tty: Some("/dev/pts/11".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            kde_clipboard_terminal_shortcut(&target, None),
+            Some(TerminalPasteShortcut::CtrlShiftV)
+        );
+    }
+
+    #[test]
+    fn kde_clipboard_prefers_resolved_window_over_stale_terminal_selector() {
+        let target = WindowTarget {
+            tty: Some("/dev/pts/11".to_string()),
+            ..Default::default()
+        };
+        let window = window_info(
+            1,
+            Some("Browser"),
+            Some("firefox"),
+            Some("firefox"),
+            Some(100),
+        );
+
+        assert_eq!(
+            kde_clipboard_terminal_shortcut(&target, Some(&window)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn kde_clipboard_async_routing_prefers_focus_over_stale_terminal_selector() {
+        let target = WindowTarget {
+            tty: Some("/dev/pts/11".to_string()),
+            ..Default::default()
+        };
+        let window = window_info(
+            1,
+            Some("Browser"),
+            Some("firefox"),
+            Some("firefox"),
+            Some(100),
+        );
+        let focus = WindowFocusResult {
+            requested_window: window.clone(),
+            focused_window: Some(window),
+            exact_window_focused: true,
+            app_focused: true,
+            backend: KWIN_BACKEND.to_string(),
+            note: "test".to_string(),
+        };
+
+        assert_eq!(
+            kde_clipboard_paste_shortcut(&target, Some(&focus)).await,
+            KdeClipboardPasteShortcut::Standard
+        );
+    }
+
+    #[test]
+    fn kde_clipboard_routes_konsole_identity_to_terminal_paste() {
+        let window = window_info(
+            1,
+            Some("unflappable-donkey"),
+            Some("org.kde.konsole"),
+            Some("konsole"),
+            Some(100),
+        );
+
+        assert_eq!(
+            kde_clipboard_terminal_shortcut(&WindowTarget::default(), Some(&window)),
+            Some(TerminalPasteShortcut::CtrlShiftV)
+        );
+    }
+
+    #[test]
+    fn kde_clipboard_does_not_classify_terminal_words_in_browser_titles() {
+        let window = window_info(
+            1,
+            Some("xterm documentation"),
+            Some("firefox"),
+            Some("firefox"),
+            Some(100),
+        );
+
+        assert_eq!(
+            kde_clipboard_terminal_shortcut(&WindowTarget::default(), Some(&window)),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn kde_clipboard_dbus_operation_times_out_when_pending() {
         let error = kde_clipboard_dbus_operation_with_timeout(
@@ -5683,6 +7130,155 @@ mod tests {
             }
             ClickTarget::Coordinates(_, _) => {
                 panic!("expected AT-SPI primary-action fallback")
+            }
+        }
+    }
+
+    #[test]
+    fn element_activation_ignores_hidpi_and_zero_origin_bounds() {
+        for (x, y) in [(75, 144), (0, 0)] {
+            let backend = ComputerUseLinux::default();
+            backend.cache_nodes(&[node_with_actions(
+                7,
+                Some(Bounds {
+                    x,
+                    y,
+                    width: 320,
+                    height: 120,
+                }),
+                vec![AccessibilityAction {
+                    index: 0,
+                    name: "click".into(),
+                    description: String::new(),
+                    keybinding: String::new(),
+                }],
+            )]);
+            assert!(matches!(
+                backend
+                    .resolve_click_target(&ClickParams {
+                        element_index: Some(7),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ClickTarget::PrimaryAction {
+                    action_index: 0,
+                    ..
+                }
+            ));
+            // Explicit coordinates and gestures retain pointer semantics.
+            for params in [
+                ClickParams {
+                    x: Some(470),
+                    y: Some(408),
+                    element_index: Some(7),
+                    ..Default::default()
+                },
+                ClickParams {
+                    button: Some("right".into()),
+                    element_index: Some(7),
+                    ..Default::default()
+                },
+                ClickParams {
+                    click_count: Some(2),
+                    element_index: Some(7),
+                    ..Default::default()
+                },
+            ] {
+                assert!(matches!(
+                    backend.resolve_click_target(&params).unwrap(),
+                    ClickTarget::Coordinates(_, _)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn element_click_does_not_replace_pointer_with_non_activation_action() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 20,
+                height: 20,
+            }),
+            vec![AccessibilityAction {
+                index: 0,
+                name: "show-menu".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            }],
+        )]);
+        assert!(matches!(
+            backend
+                .resolve_click_target(&ClickParams {
+                    element_index: Some(7),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ClickTarget::Coordinates(20, 30)
+        ));
+    }
+
+    #[test]
+    fn entry_submit_and_slider_jump_are_not_pointer_clicks() {
+        for (role, action_name) in [
+            ("entry", "activate"),
+            ("spin button", "activate"),
+            ("slider", "jump"),
+        ] {
+            let backend = ComputerUseLinux::default();
+            let mut target = node_with_actions(
+                7,
+                Some(Bounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 40,
+                }),
+                vec![AccessibilityAction {
+                    index: 0,
+                    name: action_name.into(),
+                    description: String::new(),
+                    keybinding: String::new(),
+                }],
+            );
+            target.role = role.into();
+            backend.cache_nodes(&[target]);
+            assert!(matches!(
+                backend
+                    .resolve_click_target(&ClickParams {
+                        element_index: Some(7),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ClickTarget::Coordinates(60, 40)
+            ));
+            let mut node = backend.last_nodes.lock().unwrap()[0].clone();
+            for bounds in [
+                None,
+                Some(Bounds {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                    width: 1,
+                    height: 1,
+                }),
+                Some(Bounds {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                }),
+            ] {
+                node.bounds = bounds;
+                backend.cache_nodes(&[node.clone()]);
+                assert!(backend
+                    .resolve_click_target(&ClickParams {
+                        element_index: Some(7),
+                        ..Default::default()
+                    })
+                    .is_err());
             }
         }
     }
@@ -5876,6 +7472,78 @@ mod tests {
     }
 
     #[test]
+    fn xdotool_scroll_uses_wheel_buttons_instead_of_a_valuator_event() {
+        assert_eq!(
+            xdotool_pointer_scroll_args(Some((1550, 930)), 5, ScrollDirection::Up),
+            vec![
+                "mousemove".to_string(),
+                "--".to_string(),
+                "1550".to_string(),
+                "930".to_string(),
+                "click".to_string(),
+                "--delay".to_string(),
+                "12".to_string(),
+                "--repeat".to_string(),
+                "5".to_string(),
+                "4".to_string(),
+            ]
+        );
+        assert_eq!(
+            xdotool_pointer_scroll_args(Some((-20, 15)), 1, ScrollDirection::Down),
+            vec![
+                "mousemove".to_string(),
+                "--".to_string(),
+                "-20".to_string(),
+                "15".to_string(),
+                "click".to_string(),
+                "--delay".to_string(),
+                "12".to_string(),
+                "--repeat".to_string(),
+                "1".to_string(),
+                "5".to_string(),
+            ]
+        );
+        assert_eq!(
+            xdotool_pointer_scroll_args(None, 3, ScrollDirection::Left),
+            vec![
+                "click".to_string(),
+                "--delay".to_string(),
+                "12".to_string(),
+                "--repeat".to_string(),
+                "3".to_string(),
+                "6".to_string(),
+            ]
+        );
+        assert_eq!(
+            xdotool_pointer_scroll_args(None, 0, ScrollDirection::Right),
+            vec![
+                "click".to_string(),
+                "--delay".to_string(),
+                "12".to_string(),
+                "--repeat".to_string(),
+                "1".to_string(),
+                "7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_scroll_timeout_covers_the_gap_after_every_click() {
+        assert_eq!(
+            xdotool_scroll_timeout(1, 12),
+            INPUT_COMMAND_TIMEOUT + Duration::from_millis(12)
+        );
+        assert_eq!(
+            xdotool_scroll_timeout(5, 100),
+            INPUT_COMMAND_TIMEOUT + Duration::from_millis(500)
+        );
+        assert_eq!(
+            xdotool_scroll_timeout(0, 12),
+            INPUT_COMMAND_TIMEOUT + Duration::from_millis(12)
+        );
+    }
+
+    #[test]
     fn wheel_mousemove_uses_coordinate_separator_for_negative_values() {
         assert_eq!(
             wheel_mousemove_args(0, -3),
@@ -5911,6 +7579,91 @@ mod tests {
         // A bare modifier is a chord with no held modifiers.
         assert_eq!(key_chord("Super"), Some((vec![], 125)));
         assert_eq!(key_chord("NotAKey"), None);
+    }
+
+    #[test]
+    fn portal_key_chord_sends_modifiers_and_named_keys_as_keysyms() {
+        use PortalKey::{Keycode, Keysym};
+        // Modifiers resolve through the live keymap (#191); letters stay
+        // physical so non-Latin layout groups still see Ctrl+A.
+        assert_eq!(
+            portal_key_chord("Ctrl+A"),
+            Some((vec![Keysym(xkey::Control_L as i32)], Keycode(30)))
+        );
+        assert_eq!(
+            portal_key_chord("ctrl+shift+t"),
+            Some((
+                vec![Keysym(xkey::Control_L as i32), Keysym(xkey::Shift_L as i32)],
+                Keycode(20)
+            ))
+        );
+        assert_eq!(
+            portal_key_chord("Alt+F4"),
+            Some((vec![Keysym(xkey::Alt_L as i32)], Keysym(xkey::F4 as i32)))
+        );
+        assert_eq!(
+            portal_key_chord("Meta+Return"),
+            Some((
+                vec![Keysym(xkey::Super_L as i32)],
+                Keysym(xkey::Return as i32)
+            ))
+        );
+        assert_eq!(
+            portal_key_chord("Super"),
+            Some((vec![], Keysym(xkey::Super_L as i32)))
+        );
+        assert_eq!(
+            portal_key_chord("page-down"),
+            Some((vec![], Keysym(xkey::Page_Down as i32)))
+        );
+        assert_eq!(
+            portal_key_chord("Ctrl+1"),
+            Some((vec![Keysym(xkey::Control_L as i32)], Keycode(2)))
+        );
+        assert_eq!(portal_key_chord("Ctrl+NotAKey"), None);
+        assert_eq!(portal_key_chord("Hyper+A"), None);
+    }
+
+    #[test]
+    fn portal_key_chord_accepts_exactly_the_evdev_grammar() {
+        for key in [
+            "enter",
+            "Escape",
+            "tab",
+            "backspace",
+            "del",
+            "space",
+            "home",
+            "end",
+            "pageup",
+            "left",
+            "right",
+            "up",
+            "down",
+            "f1",
+            "f12",
+            "a",
+            "z",
+            "0",
+            "9",
+            "ctrl",
+            "alt",
+            "shift",
+            "cmd",
+            "Ctrl+Alt+Delete",
+            "Shift+Tab",
+            "ctrl+shift",
+            "?",
+            "F13",
+            "Ctrl+",
+            "",
+        ] {
+            assert_eq!(
+                portal_key_chord(key).is_some(),
+                key_chord(key).is_some(),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -5977,15 +7730,32 @@ mod tests {
     }
 
     #[test]
-    fn xdotool_type_disables_per_character_delay_for_long_input() {
+    fn xdotool_type_keeps_a_per_character_delay_so_xtest_events_stay_ordered() {
+        // Issue #147: `--delay 0` delivers characters out of order on some X
+        // servers. The default must stay non-zero.
+        const { assert!(XDOTOOL_TYPE_DELAY_MS > 0) };
         let text = "x".repeat(10_000);
-        let args = xdotool_type_args(&text);
+        let args = xdotool_type_args_with_delay(&text, XDOTOOL_TYPE_DELAY_MS);
 
         assert_eq!(
             &args[..5],
-            ["type", "--clearmodifiers", "--delay", "0", "--"]
+            ["type", "--clearmodifiers", "--delay", "12", "--"]
         );
+        assert_eq!(args[3], XDOTOOL_TYPE_DELAY_MS.to_string());
         assert_eq!(args[5], text);
+    }
+
+    #[test]
+    fn xdotool_type_timeout_grows_with_text_length() {
+        assert_eq!(xdotool_type_timeout("", 12), INPUT_COMMAND_TIMEOUT);
+        assert_eq!(
+            xdotool_type_timeout(&"x".repeat(1_000), 12),
+            INPUT_COMMAND_TIMEOUT + Duration::from_secs(12)
+        );
+        assert_eq!(
+            xdotool_type_timeout(&"x".repeat(1_000), 0),
+            INPUT_COMMAND_TIMEOUT
+        );
     }
 
     #[tokio::test]
@@ -6032,7 +7802,7 @@ mod tests {
     async fn unavailable_xdotool_uses_ydotool_fallback() {
         let result = run_xdotool_or_fallback(
             Path::new("/definitely/missing/xdotool"),
-            &xdotool_type_args("text"),
+            &xdotool_type_args_with_delay("text", XDOTOOL_TYPE_DELAY_MS),
             || async {
                 TokioCommand::new("sh")
                     .args(["-c", "exit 0"])
@@ -6046,6 +7816,86 @@ mod tests {
 
         assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
         assert!(result.output.status.success());
+    }
+
+    #[tokio::test]
+    async fn wtype_receives_unicode_text_through_stdin() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-wtype-unicode-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("create command test directory");
+        let wtype = dir.join("wtype");
+        let captured = dir.join("captured");
+        std::fs::write(
+            &wtype,
+            format!("#!/bin/sh\ncat > '{}'\n", captured.display()),
+        )
+        .expect("write fake wtype");
+        std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake wtype executable");
+        let text = "Zwölf Yaks aßen Öl über München";
+
+        let result = run_wtype_type_text_or_fallback(&wtype, text, || async {
+            panic!("available wtype must not fall back")
+        })
+        .await
+        .expect("wtype should succeed");
+
+        assert_eq!(result.backend, KeyboardCommandBackend::Wtype);
+        assert_eq!(std::fs::read_to_string(&captured).unwrap(), text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unavailable_wtype_uses_ydotool_fallback() {
+        let result = run_wtype_type_text_or_fallback(
+            Path::new("/definitely/missing/wtype"),
+            "text",
+            || async {
+                TokioCommand::new("sh")
+                    .args(["-c", "exit 0"])
+                    .output()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+        .expect("missing wtype should use fallback");
+
+        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+    }
+
+    #[tokio::test]
+    async fn launched_wtype_failure_does_not_replay_through_ydotool() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-wtype-fallback-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("create command test directory");
+        let wtype = dir.join("wtype");
+        let fallback_marker = dir.join("ydotool-ran");
+        std::fs::write(&wtype, "#!/bin/sh\nexit 9\n").expect("write fake wtype");
+        std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake wtype executable");
+
+        let result = run_wtype_type_text_or_fallback(&wtype, "text", || async {
+            std::fs::write(&fallback_marker, "ran").unwrap();
+            TokioCommand::new("true")
+                .output()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            !fallback_marker.exists(),
+            "ydotool replayed input after wtype started"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -6071,7 +7921,7 @@ mod tests {
 
         let task = tokio::spawn(async move { run_xdotool(&xdotool, &[]).await });
         let mut pid = None;
-        for _ in 0..50 {
+        for _ in 0..200 {
             if let Ok(value) = std::fs::read_to_string(&pid_path) {
                 pid = value.parse::<u32>().ok();
                 if pid.is_some() {
@@ -6410,7 +8260,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_coordinates() {
+    fn semantic_click_selector_prefers_native_activation() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -6433,7 +8283,13 @@ mod tests {
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
+        assert!(matches!(
+            target,
+            ClickTarget::PrimaryAction {
+                action_index: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6443,6 +8299,7 @@ mod tests {
             name: Some("Message".to_string()),
             editable: true,
             states: vec!["focused".to_string()],
+            is_terminal: false,
         };
         let described = describe_focused_element(&element, true);
         assert!(described.contains("editable"));
@@ -6456,6 +8313,7 @@ mod tests {
             name: Some("OK".to_string()),
             editable: false,
             states: vec!["focused".to_string()],
+            is_terminal: false,
         };
         let described = describe_focused_element(&element, true);
         assert!(described.contains("WARNING"));
@@ -6469,6 +8327,7 @@ mod tests {
             name: None,
             editable: false,
             states: vec![],
+            is_terminal: false,
         };
         let described = describe_focused_element(&element, false);
         assert!(!described.contains("WARNING"));
@@ -6553,5 +8412,245 @@ mod tests {
         assert!(
             apply_window_relative_scroll_coordinates(&mut params, (100, 200, 800, 600)).is_err()
         );
+    }
+
+    #[test]
+    fn shell_execution_requires_exact_operator_opt_in() {
+        assert!(shell_execution_enabled_value(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+            assert!(!shell_execution_enabled_value(value));
+        }
+    }
+
+    #[test]
+    fn shell_environment_policy_excludes_ambient_credentials() {
+        for allowed in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "XDG_RUNTIME_DIR",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            assert!(inherited_shell_environment_allowed(allowed));
+        }
+        for secret in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "SSH_AUTH_SOCK",
+            "LD_PRELOAD",
+        ] {
+            assert!(!inherited_shell_environment_allowed(secret));
+        }
+    }
+
+    #[test]
+    fn shell_environment_skips_non_utf8_entries() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let variables = [
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from_vec(vec![0xff]), OsString::from("ignored")),
+            (OsString::from("LANG"), OsString::from_vec(vec![0xff])),
+            (OsString::from("GITHUB_TOKEN"), OsString::from("secret")),
+        ];
+
+        assert_eq!(
+            inherited_shell_environment(variables),
+            vec![("PATH".to_string(), "/usr/bin".to_string())]
+        );
+    }
+
+    #[test]
+    fn shell_environment_names_follow_exec_rules() {
+        for valid in ["A", "_PRIVATE", "NAME_2"] {
+            assert!(valid_environment_name(valid));
+        }
+        for invalid in ["", "2FAST", "BAD-NAME", "A=B", "naïve"] {
+            assert!(!valid_environment_name(invalid));
+        }
+    }
+
+    #[test]
+    fn shell_output_is_bounded_before_mcp_serialization() {
+        let oversized = vec![b'x'; SHELL_RESPONSE_STREAM_BYTES + 17];
+        let (visible, truncated) = bounded_shell_stream(&oversized);
+        assert!(truncated);
+        assert_eq!(visible.len(), SHELL_RESPONSE_STREAM_BYTES);
+
+        let (visible, truncated) = bounded_shell_stream(b"ok");
+        assert!(!truncated);
+        assert_eq!(visible, "ok");
+    }
+
+    #[test]
+    fn shell_audit_digest_is_stable_and_does_not_echo_command_text() {
+        let digest = shell_command_sha256("printf secret");
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+        assert!(!digest.contains("secret"));
+        assert_eq!(digest, shell_command_sha256("printf secret"));
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tree_note_tests {
+    use super::{truncated_accessibility_tree_note, unscoped_accessibility_tree_warning};
+
+    #[test]
+    fn unscoped_warning_only_when_tree_succeeded_without_a_scope() {
+        let warning = unscoped_accessibility_tree_warning(false, true, false).unwrap();
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("no app target scoped"));
+        assert!(warning.contains("app_name_or_bundle_identifier"));
+        assert!(warning.contains("window_id, pid, app_id, wm_class, title"));
+
+        for target_requested in [false, true] {
+            assert!(unscoped_accessibility_tree_warning(true, true, target_requested).is_none());
+            assert!(unscoped_accessibility_tree_warning(false, false, target_requested).is_none());
+            assert!(unscoped_accessibility_tree_warning(true, false, target_requested).is_none());
+        }
+    }
+
+    /// A caller that already passed a target must not be told to pass a target;
+    /// that advice would replay the same desktop-wide snapshot.
+    #[test]
+    fn unscoped_warning_with_a_target_points_at_accessibility_support() {
+        let warning = unscoped_accessibility_tree_warning(false, true, true).unwrap();
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("matched no AT-SPI application root"));
+        assert!(warning.contains("force-renderer-accessibility"));
+        assert!(warning.contains("list_apps"));
+        assert!(!warning.contains("Pass app_name_or_bundle_identifier or a window target"));
+    }
+
+    #[test]
+    fn truncated_note_only_when_the_node_cap_was_hit() {
+        let note = truncated_accessibility_tree_note(true).unwrap();
+        assert!(note.contains("raise max_nodes or max_depth"));
+        assert!(
+            !note.contains("smaller max_nodes"),
+            "shrinking the cap belongs to the unscoped warning, not the truncation note"
+        );
+        assert!(truncated_accessibility_tree_note(false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod focus_probe_feedback_tests {
+    use super::{focus_probe_feedback, FocusProbe, FocusedElementSummary};
+
+    #[test]
+    fn only_a_complete_empty_search_warns() {
+        let none = focus_probe_feedback(&FocusProbe::NoneFocused, true);
+        assert!(none.starts_with("WARNING:"), "{none}");
+
+        for probe in [FocusProbe::Incomplete, FocusProbe::NoAccessibleApp] {
+            let text = focus_probe_feedback(&probe, true);
+            assert!(
+                !text.contains("WARNING"),
+                "{probe:?} must not claim lost input: {text}"
+            );
+            assert!(text.contains("could not be verified"), "{text}");
+        }
+        assert!(focus_probe_feedback(&FocusProbe::Incomplete, true).contains("search limits"));
+        assert!(focus_probe_feedback(&FocusProbe::NoAccessibleApp, true)
+            .contains("--force-renderer-accessibility"));
+    }
+
+    #[test]
+    fn found_element_is_described() {
+        let element = FocusedElementSummary {
+            role: "text".to_string(),
+            name: None,
+            editable: true,
+            states: vec!["focused".to_string()],
+            is_terminal: false,
+        };
+        let text = focus_probe_feedback(&FocusProbe::Found(element), true);
+        assert!(text.contains("text"), "{text}");
+        assert!(!text.starts_with("WARNING"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod node_target_scope_tests {
+    use super::*;
+
+    fn cached_node(index: u32, object_ref: &str) -> AccessibilityNode {
+        AccessibilityNode {
+            index,
+            parent_index: None,
+            depth: 1,
+            object_ref: object_ref.to_string(),
+            role: "push button".to_string(),
+            name: Some("Hit me".to_string()),
+            description: None,
+            child_count: 0,
+            bounds: None,
+            states: vec!["enabled".to_string()],
+            actions: Vec::new(),
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn index_from_another_apps_snapshot_is_rejected() {
+        let backend = ComputerUseLinux::default();
+        let node = cached_node(2, ":1.9/org/a11y/atspi/accessible/42");
+        backend.cache_snapshot(std::slice::from_ref(&node), Some(2_690_687));
+
+        let error = backend
+            .check_node_target(&node, Some(2_690_664))
+            .await
+            .unwrap_err();
+        assert!(error.contains("pid 2690687"), "{error}");
+        assert!(error.contains("target pid 2690664"), "{error}");
+        assert!(
+            error.contains("Call get_app_state for the target app"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_target_or_no_target_is_allowed() {
+        let backend = ComputerUseLinux::default();
+        let node = cached_node(2, ":1.9/org/a11y/atspi/accessible/42");
+        backend.cache_snapshot(std::slice::from_ref(&node), Some(2_690_664));
+
+        assert!(backend
+            .check_node_target(&node, Some(2_690_664))
+            .await
+            .is_ok());
+        assert!(backend.check_node_target(&node, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unscoped_snapshot_with_unknown_owner_is_allowed() {
+        // No snapshot pid, and the owner lookup cannot resolve this ref here,
+        // so a mismatch cannot be shown and the action proceeds.
+        let backend = ComputerUseLinux::default();
+        let node = cached_node(2, ":1.9999/org/a11y/atspi/accessible/42");
+        backend.cache_snapshot(std::slice::from_ref(&node), None);
+
+        assert!(backend.check_node_target(&node, Some(1)).await.is_ok());
+    }
+
+    #[test]
+    fn a_new_snapshot_replaces_the_recorded_pid() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_snapshot(&[], Some(10));
+        backend.cache_snapshot(&[], None);
+        assert_eq!(*backend.last_snapshot_pid.lock().unwrap(), None);
+        backend.cache_snapshot(&[], Some(11));
+        backend.clear_cached_nodes();
+        assert_eq!(*backend.last_snapshot_pid.lock().unwrap(), None);
     }
 }
