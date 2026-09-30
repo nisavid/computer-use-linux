@@ -14,6 +14,7 @@ mod remote_desktop;
 mod screenshot_impl;
 mod server;
 mod terminal;
+mod verified_typing;
 mod windowing;
 mod windows;
 mod x11_display;

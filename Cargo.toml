@@ -49,7 +49,7 @@ wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # Pure-Rust X11 client (no libxcb). Native X11 sessions only: absolute window
 # origins for the EWMH backend (wmctrl -lG counts the frame offset twice, #157).
-x11rb = "0.14"
+x11rb = { version = "0.14", features = ["xkb", "xinput"] }
 xkeysym = "0.2.1"
 zbus = "5.14.0"
 
