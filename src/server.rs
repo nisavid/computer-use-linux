@@ -1757,8 +1757,10 @@ impl ComputerUseLinux {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let cancellation = context.ct.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
         let mut input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        if context.ct.is_cancelled() {
+        if cancellation.is_cancelled() {
             return Json(action_result_with_focus(
                 "type_text",
                 Err("Text input cancelled before dispatch.".to_string()),
@@ -1802,7 +1804,7 @@ impl ComputerUseLinux {
                         kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
                     let clipboard_guard = Arc::clone(&self.kde_clipboard_lock).lock_owned().await;
                     let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel::<()>();
-                    let cancellation = context.ct.clone();
+                    let cancellation = cancellation.clone();
                     let owned_session = session.clone();
                     let text = params.text.clone();
                     // The owned task retains both locks through restoration.
@@ -1873,29 +1875,66 @@ impl ComputerUseLinux {
         if self.should_prefer_portal_keyboard_backend().await {
             if let Ok(keysyms) = keysyms_for_text(&params.text) {
                 match self.ensure_portal_keyboard_session().await {
-                    Ok(Some(session)) => match type_text_with_keysyms(&session, &keysyms).await {
-                        Ok(()) => {
-                            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                            return Json(with_notes(
-                                successful_action_with_focus(
-                                    "type_text",
-                                    "Action sent through the remote desktop portal.",
-                                    received,
-                                    focus,
-                                ),
-                                notes,
-                            ));
-                        }
-                        Err(error) => {
-                            self.clear_portal_keyboard_session(&session);
+                    Ok(Some(session)) => {
+                        if cancellation.is_cancelled() {
                             return Json(action_result_with_focus(
                                 "type_text",
-                                Err(format!("{error:#}")),
+                                Err("Text input cancelled before dispatch.".to_string()),
                                 received,
                                 focus,
                             ));
                         }
-                    },
+                        let portal_focus = match self.focus_target_for_input(&window_target).await {
+                            Ok(focus) => focus,
+                            Err(message) => {
+                                return Json(action_result_with_focus(
+                                    "type_text",
+                                    Err(message),
+                                    received,
+                                    focus,
+                                ));
+                            }
+                        };
+                        let owned_session = session.clone();
+                        let cancelled = cancellation.clone();
+                        let (guard, result) =
+                            run_cancellation_safe_input(input_guard, async move {
+                                if cancelled.is_cancelled() {
+                                    return Err("Text input cancelled before dispatch.".to_string());
+                                }
+                                let result = type_text_with_keysyms(&owned_session, &keysyms)
+                                    .await
+                                    .map_err(|error| format!("{error:#}"));
+                                owned_session.wait_for_input_cleanup().await;
+                                result
+                            })
+                            .await;
+                        let _input_guard = guard;
+                        match result {
+                            Ok(()) => {
+                                let notes =
+                                    self.input_landing_notes(portal_focus.as_ref(), true).await;
+                                return Json(with_notes(
+                                    successful_action_with_focus(
+                                        "type_text",
+                                        "Action sent through the remote desktop portal.",
+                                        received,
+                                        portal_focus,
+                                    ),
+                                    notes,
+                                ));
+                            }
+                            Err(error) => {
+                                self.clear_portal_keyboard_session(&session);
+                                return Json(action_result_with_focus(
+                                    "type_text",
+                                    Err(error),
+                                    received,
+                                    portal_focus,
+                                ));
+                            }
+                        }
+                    }
                     Ok(None) => {}
                     Err(_) => {}
                 }
