@@ -1,5 +1,5 @@
 use crate::diagnostics::hydrate_session_bus_env;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use atspi::{
     proxy::{
         accessible::{AccessibleProxy, ObjectRefExt},
@@ -110,6 +110,7 @@ const DEFAULT_SNAPSHOT_MAX_DEPTH: u32 = 32;
 const HARD_SNAPSHOT_MAX_DEPTH: u32 = 64;
 const CHILD_READ_CONCURRENCY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const OBJECT_OWNER_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DISCOVERY_ROOTS: usize = 256;
 const ROOT_MATCH_CHILD_LIMIT: usize = 8;
 const MAX_DISCOVERY_CHILD_READS: usize = MAX_DISCOVERY_ROOTS * ROOT_MATCH_CHILD_LIMIT;
@@ -341,6 +342,12 @@ async fn snapshot_tree_inner(
         &mut remaining_filter_reads,
     )
     .await;
+    if target_pid.is_some() && selected_roots.pid != target_pid {
+        bail!("no AT-SPI application root matches the requested process id and application filter");
+    }
+    if app_name_needle(app_name_or_bundle_identifier).is_some() && selected_roots.roots.is_empty() {
+        bail!("no AT-SPI application root matches the requested application filter");
+    }
     let scoped = selected_roots.scoped;
     let root_pid = selected_roots.pid;
     let mut nodes = Vec::new();
@@ -671,7 +678,7 @@ struct SelectedRoots {
 }
 
 /// Normalized app-name filter, or `None` when the caller passed nothing usable.
-/// A `None` needle with no pid match means the snapshot covers the whole desktop.
+/// With no filter or pid request, the snapshot covers the whole desktop.
 fn app_name_needle(app_name_or_bundle_identifier: Option<&str>) -> Option<String> {
     app_name_or_bundle_identifier
         .map(str::trim)
@@ -688,12 +695,11 @@ async fn select_roots(
 ) -> SelectedRoots {
     let needle = app_name_needle(app_name_or_bundle_identifier);
     let dbus = DBusProxy::new(conn.connection()).await.ok();
-    let mut remaining = roots;
+    let remaining = roots;
 
     if let Some(target_pid) = target_pid {
         let mut pid_and_filter_matches = Vec::new();
         let mut pid_matches = Vec::new();
-        let mut non_pid_matches = Vec::new();
 
         for object_ref in remaining {
             if object_ref_pid(dbus.as_ref(), &object_ref).await == Some(target_pid) {
@@ -706,8 +712,6 @@ async fn select_roots(
                 } else {
                     pid_matches.push(object_ref);
                 }
-            } else {
-                non_pid_matches.push(object_ref);
             }
         }
 
@@ -718,7 +722,7 @@ async fn select_roots(
                 pid: Some(target_pid),
             };
         }
-        if !pid_matches.is_empty() {
+        if needle.is_none() && !pid_matches.is_empty() {
             return SelectedRoots {
                 roots: pid_matches,
                 scoped: true,
@@ -726,7 +730,11 @@ async fn select_roots(
             };
         }
 
-        remaining = non_pid_matches;
+        return SelectedRoots {
+            roots: Vec::new(),
+            scoped: false,
+            pid: None,
+        };
     }
 
     let Some(needle) = needle.as_deref() else {
@@ -858,9 +866,13 @@ async fn bounds(proxy: &AccessibleProxy<'_>) -> Option<Bounds> {
 /// accessibility bus. `None` when the owner is gone or the bus cannot say.
 pub(crate) async fn object_ref_owner_pid(object_ref_id: &str) -> Result<Option<u32>> {
     let object_ref = object_ref_from_id(object_ref_id)?;
-    let conn = connect().await?;
-    let dbus = DBusProxy::new(conn.connection()).await.ok();
-    Ok(object_ref_pid(dbus.as_ref(), &object_ref).await)
+    timeout(OBJECT_OWNER_TIMEOUT, async {
+        let conn = connect().await?;
+        let dbus = DBusProxy::new(conn.connection()).await.ok();
+        Ok(object_ref_pid(dbus.as_ref(), &object_ref).await)
+    })
+    .await
+    .context("AT-SPI object owner lookup exceeded its 2-second deadline")?
 }
 
 async fn object_ref_pid(dbus: Option<&DBusProxy<'_>>, object_ref: &ObjectRefOwned) -> Option<u32> {

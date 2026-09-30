@@ -69,10 +69,7 @@ const SHELL_RESPONSE_STREAM_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
-    last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
-    /// Pid the cached snapshot was taken for, when get_app_state had a target.
-    /// Element indices are only meaningful against that app (#167).
-    last_snapshot_pid: Arc<Mutex<Option<u32>>>,
+    last_snapshot: Arc<Mutex<CachedAccessibilityState>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
     portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
@@ -83,6 +80,22 @@ pub struct ComputerUseLinux {
     /// Cached physical desktop size from the most recent full-frame capture;
     /// used for off-screen warnings and portal logical-coordinate mapping.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
+}
+
+#[derive(Default)]
+struct CachedAccessibilityState {
+    nodes: Vec<AccessibilityNode>,
+    scope: CachedAccessibilityScope,
+}
+
+#[derive(Clone, Default)]
+enum CachedAccessibilityScope {
+    #[default]
+    Unscoped,
+    Scoped {
+        pid: Option<u32>,
+    },
+    Unresolved,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -361,23 +374,32 @@ impl ComputerUseLinux {
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
-        // Whether the caller asked for any scope at all. `tree_scoped` can still
-        // come back false when a target matched no AT-SPI root, and that case
-        // needs different advice than "pass a target".
+        // Requested scope remains binding even when its target cannot resolve.
         let accessibility_target_requested = screenshot_target_requested
             || params
                 .app_name_or_bundle_identifier
                 .as_deref()
                 .is_some_and(|name| !name.trim().is_empty());
-        let app_filter = self
+        let (app_filter, accessibility_scope_error) = match self
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
-            .await;
+            .await
+        {
+            Ok(filter) => (filter, None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
         let (screenshot, screenshot_error) = if include_screenshot {
             let result: Result<ScreenshotCapture> = async {
+                if screenshot_target_requested && window_context.is_none() {
+                    anyhow::bail!(
+                        "the requested window could not be resolved; refusing to capture unrelated desktop pixels"
+                    );
+                }
+                if let Some(window) = window_context.as_ref() {
+                    ensure_readonly_screenshot_target_is_visible(window)?;
+                }
                 let raw = capture_screenshot_raw().await?;
                 self.cache_desktop_size(raw.width, raw.height);
                 if let Some(window) = window_context.as_ref() {
-                    ensure_readonly_screenshot_target_is_visible(window)?;
                     let crop = self.window_crop_rect_for_capture(window, &raw).await?;
                     prepare_app_state_screenshot(
                         raw,
@@ -406,8 +428,13 @@ impl ComputerUseLinux {
         let mut tree_root_pid = None;
         let mut accessibility_tree_truncated = false;
         let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
-            if diagnostics.readiness.can_build_accessibility_tree {
-                let target_pid = window_context.as_ref().and_then(|window| window.pid);
+            if let Some(error) = accessibility_scope_error {
+                (Vec::new(), 0, Some(error))
+            } else if diagnostics.readiness.can_build_accessibility_tree {
+                let target_pid = window_context
+                    .as_ref()
+                    .and_then(|window| window.pid)
+                    .or(params.pid);
                 match snapshot_accessibility_tree(
                     app_filter.as_deref(),
                     target_pid,
@@ -435,15 +462,19 @@ impl ComputerUseLinux {
                     ),
                 )
             };
-        if accessibility_error.is_none() {
-            // Record a pid only when the tree's roots were matched by it. A pid
-            // with no AT-SPI root falls back to every app, or to an app-name
-            // match that can be another app entirely; recording the pid then
-            // would let that app's index pass the target check instead of
-            // taking the per-node owner lookup.
-            self.cache_snapshot(&accessibility_tree, tree_root_pid);
-        } else {
-            self.clear_cached_nodes();
+        {
+            // Element actions and snapshot replacement share a lock so an
+            // owner check cannot authorize a node against a replaced scope.
+            let _input_guard = self.input_operation_lock.lock().await;
+            if accessibility_error.is_none() {
+                self.cache_snapshot(
+                    &accessibility_tree,
+                    tree_root_pid,
+                    accessibility_target_requested,
+                );
+            } else {
+                self.clear_cached_nodes(accessibility_target_requested);
+            }
         }
         let mut message = if let Some(error) = &accessibility_error {
             format!("MCP registration is working, but AT-SPI tree extraction failed: {error}")
@@ -475,11 +506,9 @@ impl ComputerUseLinux {
         } else if let Some(error) = &window_error {
             message.push_str(&format!(" Window target resolution failed: {error}"));
         }
-        if let Some(warning) = unscoped_accessibility_tree_warning(
-            tree_scoped,
-            accessibility_error.is_none(),
-            accessibility_target_requested,
-        ) {
+        if let Some(warning) =
+            unscoped_accessibility_tree_warning(tree_scoped, accessibility_error.is_none())
+        {
             message.push(' ');
             message.push_str(warning);
         }
@@ -731,6 +760,18 @@ impl ComputerUseLinux {
                 }
             };
             target_pid = focus_target_pid(focus.as_ref()).or(target_pid);
+            if target_pid.is_none()
+                && params.x.zip(params.y).is_none()
+                && (params.element_index.is_some() || !params.selector().is_empty())
+            {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: "The requested window has no known process id; refusing to click an accessibility element.".to_string(),
+                    received,
+                });
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -1059,6 +1100,7 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<SetValueParams>,
     ) -> Json<ActionOutput> {
+        let _input_guard = self.input_operation_lock.lock().await;
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
             params.element_index,
@@ -1078,6 +1120,15 @@ impl ComputerUseLinux {
             }
         };
 
+        if let Err(message) = self.check_object_ref_target(&object_ref, None).await {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "set_value".to_string(),
+                message,
+                received,
+            });
+        }
         match set_element_value(&object_ref, &params.value).await {
             Ok(ValueSetInvocation::Numeric { value }) => Json(ActionOutput {
                 ok: true,
@@ -1145,6 +1196,18 @@ impl ComputerUseLinux {
                 }
             };
             target_pid = focus_target_pid(focus.as_ref()).or(target_pid);
+            if target_pid.is_none()
+                && params.x.zip(params.y).is_none()
+                && params.element_index.is_some()
+            {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "scroll".to_string(),
+                    message: "The requested window has no known process id; refusing to scroll an accessibility element.".to_string(),
+                    received,
+                });
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
@@ -1230,7 +1293,7 @@ impl ComputerUseLinux {
                     .and_then(|(x, y)| coordinate_map.portal_point(x, y));
             }
         }
-        if params.x.is_none() && params.y.is_none() {
+        if params.x.zip(params.y).is_none() {
             if let Some(node) = self.cached_node_for(
                 params.element_index,
                 &ElementSelector::default(),
@@ -3326,25 +3389,37 @@ impl ComputerUseLinux {
         &self,
         params: &GetAppStateParams,
         window_context: Option<&WindowInfo>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
+        let mut non_pid_target = params.window_target();
+        non_pid_target.pid = None;
+        if non_pid_target.has_target() && window_context.is_none() {
+            anyhow::bail!(
+                "the requested window could not be resolved; refusing to return unrelated accessibility roots"
+            );
+        }
+        if window_context.is_some_and(|window| window.pid.is_none()) {
+            anyhow::bail!(
+                "the requested window has no known process id; refusing to return unrelated accessibility roots"
+            );
+        }
         if let Some(explicit) = trimmed_nonempty(params.app_name_or_bundle_identifier.as_deref()) {
-            return Some(explicit.to_string());
+            return Ok(Some(explicit.to_string()));
         }
 
         let target_pid = window_context.and_then(|window| window.pid).or(params.pid);
         let candidates = accessibility_filter_candidates(window_context);
 
         if let Some(target_pid) = target_pid {
-            if let Ok(apps) = list_accessible_apps(200).await {
+            if let Ok(Ok(apps)) = timeout(Duration::from_secs(2), list_accessible_apps(200)).await {
                 if let Some(object_ref) =
                     select_accessibility_object_ref(&apps, target_pid, &candidates)
                 {
-                    return Some(object_ref);
+                    return Ok(Some(object_ref));
                 }
             }
         }
 
-        candidates.into_iter().next()
+        Ok(candidates.into_iter().next())
     }
 
     async fn focus_target_for_input(
@@ -3628,47 +3703,89 @@ impl ComputerUseLinux {
 
     #[cfg(test)]
     fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
-        self.cache_snapshot(nodes, None);
+        self.cache_snapshot(nodes, None, false);
     }
 
-    fn cache_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-            cached.extend_from_slice(nodes);
+    fn cache_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>, scoped: bool) {
+        if let Ok(mut cached) = self.last_snapshot.lock() {
+            *cached = CachedAccessibilityState {
+                nodes: nodes.to_vec(),
+                scope: if scoped {
+                    CachedAccessibilityScope::Scoped { pid: target_pid }
+                } else {
+                    CachedAccessibilityScope::Unscoped
+                },
+            };
         }
-        if let Ok(mut pid) = self.last_snapshot_pid.lock() {
-            *pid = target_pid;
+    }
+
+    fn clear_cached_nodes(&self, scope_failed: bool) {
+        if let Ok(mut cached) = self.last_snapshot.lock() {
+            *cached = CachedAccessibilityState {
+                nodes: Vec::new(),
+                scope: if scope_failed {
+                    CachedAccessibilityScope::Unresolved
+                } else {
+                    CachedAccessibilityScope::Unscoped
+                },
+            };
         }
     }
 
-    fn clear_cached_nodes(&self) {
-        self.cache_snapshot(&[], None);
-    }
-
-    /// Reject an element-targeted action whose cached node belongs to a
-    /// different app than the action's target. A snapshot taken for a pid is
-    /// judged by that pid; an untargeted snapshot mixes apps, so its node is
-    /// judged by the pid that owns it on the accessibility bus. When neither is
-    /// known the action proceeds, since a mismatch cannot be shown.
+    /// Verify the current bus owner against the cached scope and action target.
     async fn check_node_target(
         &self,
         node: &AccessibilityNode,
         target_pid: Option<u32>,
     ) -> std::result::Result<(), String> {
-        let Some(target_pid) = target_pid else {
-            return Ok(());
+        self.check_object_ref_target(&node.object_ref, target_pid)
+            .await
+    }
+
+    async fn check_object_ref_target(
+        &self,
+        object_ref: &str,
+        target_pid: Option<u32>,
+    ) -> std::result::Result<(), String> {
+        let (scope, node) = {
+            let cached = self.last_snapshot.lock().map_err(|_| {
+                "Could not read the latest accessibility scope. Call get_app_state and retry."
+                    .to_string()
+            })?;
+            (
+                cached.scope.clone(),
+                cached
+                    .nodes
+                    .iter()
+                    .find(|node| node.object_ref == object_ref)
+                    .cloned(),
+            )
         };
-        let snapshot_pid = self.last_snapshot_pid.lock().ok().and_then(|pid| *pid);
-        let owner_pid = match snapshot_pid {
-            Some(pid) => Some(pid),
-            None => object_ref_owner_pid(&node.object_ref).await.ok().flatten(),
+        let snapshot_pid = match scope {
+            CachedAccessibilityScope::Unresolved => return Err(
+                "The latest requested accessibility scope failed. Call get_app_state for the target app before acting.".to_string()
+            ),
+            CachedAccessibilityScope::Scoped { pid } => {
+                if node.is_none() {
+                    return Err("The element is outside the latest requested accessibility scope. Call get_app_state for the target app before acting.".to_string());
+                }
+                pid
+            }
+            CachedAccessibilityScope::Unscoped => None,
         };
-        match owner_pid {
-            Some(owner_pid) if owner_pid != target_pid => Err(node_target_mismatch_message(
-                node.index, owner_pid, target_pid,
-            )),
-            _ => Ok(()),
+        let owner_pid = object_ref_owner_pid(object_ref)
+            .await
+            .map_err(|error| format!("Could not verify the accessibility element's current owner: {error:#}. Refusing to act."))?
+            .ok_or_else(|| "Could not verify the accessibility element's current owner. Refusing to act; call get_app_state and retry.".to_string())?;
+        for required_pid in [snapshot_pid, target_pid].into_iter().flatten() {
+            if owner_pid != required_pid {
+                return Err(match node.as_ref() {
+                    Some(node) => node_target_mismatch_message(node.index, owner_pid, required_pid),
+                    None => format!("The accessibility element belongs to pid {owner_pid}, not target pid {required_pid}. Call get_app_state for the target app before acting."),
+                });
+            }
         }
+        Ok(())
     }
 
     /// The cached node an element-targeted click or scroll would act on, when
@@ -3754,8 +3871,11 @@ impl ComputerUseLinux {
     }
 
     fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
-        let cached = self.last_nodes.lock().ok()?;
-        let node = cached.iter().find(|node| node.index == element_index)?;
+        let cached = self.last_snapshot.lock().ok()?;
+        let node = cached
+            .nodes
+            .iter()
+            .find(|node| node.index == element_index)?;
         bounds_center(node.bounds.as_ref()?)
     }
 
@@ -3783,12 +3903,12 @@ impl ComputerUseLinux {
         selector: &ElementSelector<'_>,
         purpose: ElementResolvePurpose,
     ) -> std::result::Result<AccessibilityNode, String> {
-        let cached = self.last_nodes.lock().map_err(|_| {
+        let cached = self.last_snapshot.lock().map_err(|_| {
             "Could not read cached accessibility nodes. Call get_app_state and retry.".to_string()
         })?;
 
         if let Some(element_index) = element_index {
-            return cached
+            return cached.nodes
                 .iter()
                 .find(|node| node.index == element_index)
                 .cloned()
@@ -3806,7 +3926,7 @@ impl ComputerUseLinux {
             );
         }
 
-        resolve_semantic_node(cached.as_slice(), selector, purpose)
+        resolve_semantic_node(cached.nodes.as_slice(), selector, purpose)
     }
 
     async fn perform_element_action(
@@ -3814,6 +3934,7 @@ impl ComputerUseLinux {
         params: &ActionParams,
         requested_action: Option<&str>,
     ) -> Json<ActionOutput> {
+        let _input_guard = self.input_operation_lock.lock().await;
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
             params.element_index,
@@ -3833,6 +3954,15 @@ impl ComputerUseLinux {
             }
         };
 
+        if let Err(message) = self.check_object_ref_target(&object_ref, None).await {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "perform_action".to_string(),
+                message,
+                received,
+            });
+        }
         match invoke_accessibility_action(&object_ref, requested_action).await {
             Ok(invocation) => Json(ActionOutput {
                 ok: invocation.ok,
@@ -4121,25 +4251,14 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
     ))
 }
 
-/// Context-cost warning for an AT-SPI snapshot that no app target narrowed.
-/// Silent when the tree failed (the failure message already explains) or when
-/// any filter or pid match scoped the roots. When the caller did pass a target
-/// and it still matched no AT-SPI root, telling them to pass a target would
-/// only replay the same desktop-wide snapshot, so that case points at the
-/// app's accessibility support instead.
-fn unscoped_accessibility_tree_warning(
-    tree_scoped: bool,
-    tree_ok: bool,
-    target_requested: bool,
-) -> Option<&'static str> {
+/// Context-cost warning for a successful, deliberately unscoped observation.
+fn unscoped_accessibility_tree_warning(tree_scoped: bool, tree_ok: bool) -> Option<&'static str> {
     if !tree_ok || tree_scoped {
         return None;
     }
-    Some(if target_requested {
-        "WARNING: the requested target matched no AT-SPI application root, so the accessibility tree covers the whole desktop and can flood context. The target app may expose no accessibility tree (Electron apps need --force-renderer-accessibility); check list_apps for its AT-SPI name and pass that as app_name_or_bundle_identifier, or lower max_nodes to bound the cost."
-    } else {
+    Some(
         "WARNING: no app target scoped the accessibility tree, so it covers the whole desktop and can flood context. Pass app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title) to limit it."
-    })
+    )
 }
 
 /// Note appended when raw traversal hit max_nodes; the tree is incomplete.
@@ -7255,7 +7374,7 @@ mod tests {
                     .unwrap(),
                 ClickTarget::Coordinates(60, 40)
             ));
-            let mut node = backend.last_nodes.lock().unwrap()[0].clone();
+            let mut node = backend.last_snapshot.lock().unwrap().nodes[0].clone();
             for bounds in [
                 None,
                 Some(Bounds {
@@ -8504,29 +8623,15 @@ mod accessibility_tree_note_tests {
 
     #[test]
     fn unscoped_warning_only_when_tree_succeeded_without_a_scope() {
-        let warning = unscoped_accessibility_tree_warning(false, true, false).unwrap();
+        let warning = unscoped_accessibility_tree_warning(false, true).unwrap();
         assert!(warning.starts_with("WARNING:"));
         assert!(warning.contains("no app target scoped"));
         assert!(warning.contains("app_name_or_bundle_identifier"));
         assert!(warning.contains("window_id, pid, app_id, wm_class, title"));
 
-        for target_requested in [false, true] {
-            assert!(unscoped_accessibility_tree_warning(true, true, target_requested).is_none());
-            assert!(unscoped_accessibility_tree_warning(false, false, target_requested).is_none());
-            assert!(unscoped_accessibility_tree_warning(true, false, target_requested).is_none());
-        }
-    }
-
-    /// A caller that already passed a target must not be told to pass a target;
-    /// that advice would replay the same desktop-wide snapshot.
-    #[test]
-    fn unscoped_warning_with_a_target_points_at_accessibility_support() {
-        let warning = unscoped_accessibility_tree_warning(false, true, true).unwrap();
-        assert!(warning.starts_with("WARNING:"));
-        assert!(warning.contains("matched no AT-SPI application root"));
-        assert!(warning.contains("force-renderer-accessibility"));
-        assert!(warning.contains("list_apps"));
-        assert!(!warning.contains("Pass app_name_or_bundle_identifier or a window target"));
+        assert!(unscoped_accessibility_tree_warning(true, true).is_none());
+        assert!(unscoped_accessibility_tree_warning(false, false).is_none());
+        assert!(unscoped_accessibility_tree_warning(true, false).is_none());
     }
 
     #[test]
@@ -8575,82 +8680,5 @@ mod focus_probe_feedback_tests {
         let text = focus_probe_feedback(&FocusProbe::Found(element), true);
         assert!(text.contains("text"), "{text}");
         assert!(!text.starts_with("WARNING"), "{text}");
-    }
-}
-
-#[cfg(test)]
-mod node_target_scope_tests {
-    use super::*;
-
-    fn cached_node(index: u32, object_ref: &str) -> AccessibilityNode {
-        AccessibilityNode {
-            index,
-            parent_index: None,
-            depth: 1,
-            object_ref: object_ref.to_string(),
-            role: "push button".to_string(),
-            name: Some("Hit me".to_string()),
-            description: None,
-            child_count: 0,
-            bounds: None,
-            states: vec!["enabled".to_string()],
-            actions: Vec::new(),
-            value: None,
-            text: None,
-            supports_editable_text: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn index_from_another_apps_snapshot_is_rejected() {
-        let backend = ComputerUseLinux::default();
-        let node = cached_node(2, ":1.9/org/a11y/atspi/accessible/42");
-        backend.cache_snapshot(std::slice::from_ref(&node), Some(2_690_687));
-
-        let error = backend
-            .check_node_target(&node, Some(2_690_664))
-            .await
-            .unwrap_err();
-        assert!(error.contains("pid 2690687"), "{error}");
-        assert!(error.contains("target pid 2690664"), "{error}");
-        assert!(
-            error.contains("Call get_app_state for the target app"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_target_or_no_target_is_allowed() {
-        let backend = ComputerUseLinux::default();
-        let node = cached_node(2, ":1.9/org/a11y/atspi/accessible/42");
-        backend.cache_snapshot(std::slice::from_ref(&node), Some(2_690_664));
-
-        assert!(backend
-            .check_node_target(&node, Some(2_690_664))
-            .await
-            .is_ok());
-        assert!(backend.check_node_target(&node, None).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn unscoped_snapshot_with_unknown_owner_is_allowed() {
-        // No snapshot pid, and the owner lookup cannot resolve this ref here,
-        // so a mismatch cannot be shown and the action proceeds.
-        let backend = ComputerUseLinux::default();
-        let node = cached_node(2, ":1.9999/org/a11y/atspi/accessible/42");
-        backend.cache_snapshot(std::slice::from_ref(&node), None);
-
-        assert!(backend.check_node_target(&node, Some(1)).await.is_ok());
-    }
-
-    #[test]
-    fn a_new_snapshot_replaces_the_recorded_pid() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_snapshot(&[], Some(10));
-        backend.cache_snapshot(&[], None);
-        assert_eq!(*backend.last_snapshot_pid.lock().unwrap(), None);
-        backend.cache_snapshot(&[], Some(11));
-        backend.clear_cached_nodes();
-        assert_eq!(*backend.last_snapshot_pid.lock().unwrap(), None);
     }
 }
