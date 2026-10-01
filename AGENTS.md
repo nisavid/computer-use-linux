@@ -1,7 +1,5 @@
 # AGENTS.md
 
-`CLAUDE.md` links here so agent harnesses share one instruction source.
-
 ## Project
 
 `computer-use-linux` is a Rust MCP server and CLI for observing and controlling

@@ -14,7 +14,7 @@ infrastructure:
 
 - fork additions to upstream's `.agnix.toml`
 - `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`
-- `AGENTS.md` and its `CLAUDE.md` compatibility link
+- `AGENTS.md`
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
 - a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
