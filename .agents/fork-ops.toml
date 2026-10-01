@@ -59,7 +59,7 @@ owner_remote = "upstream"
 tracking_ref = "refs/remotes/upstream/main"
 update_policy = "fetch-only"
 sync_eligible = false
-evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main"]
+evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main", "./.agents/upstream-drift.sh"]
 notes = "This track supports inspection and does not authorize autonomous synchronization. If the ancestry check exits 1, record the divergence before proceeding."
 
 [[local_surfaces]]
@@ -74,6 +74,13 @@ path = ".agents/bootstrap-fork-ops.sh"
 domain = "identity"
 portability_hint = "fork-specific"
 notes = "Provision and verify the read-only upstream remote after a fresh clone."
+
+[[local_surfaces]]
+kind = "script"
+path = ".agents/upstream-drift.sh"
+domain = "upstream-drift"
+portability_hint = "fork-specific"
+notes = "Read-only report of how far fork main trails upstream main and the latest stable upstream release."
 
 [[local_surfaces]]
 kind = "agent_instruction"
