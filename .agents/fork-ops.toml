@@ -111,13 +111,6 @@ portability_hints = ["shared-with-fork-policy", "repo-ops-candidate"]
 repo_ops_candidate_scope = "Operating Policy only"
 
 [[local_surfaces]]
-kind = "agent_instruction"
-path = "CLAUDE.md"
-domain = "workflow"
-portability_hint = "shared-with-fork-policy"
-notes = "Compatibility link to AGENTS.md."
-
-[[local_surfaces]]
 kind = "doc"
 path = "docs/agents/fork-stewardship.md"
 domain = "authority"
