@@ -60,7 +60,7 @@ tracking_ref = "refs/remotes/upstream/main"
 update_policy = "fetch-only"
 sync_eligible = false
 evidence_checks = ["./.agents/bootstrap-fork-ops.sh", "git rev-parse upstream/main", "git merge-base --is-ancestor upstream/main origin/main", "./.agents/upstream-drift.sh"]
-notes = "This track supports inspection and does not authorize autonomous synchronization. If the ancestry check exits 1, record the divergence before proceeding."
+notes = "This track supports inspection and does not authorize autonomous synchronization. If the ancestry check exits 1, record the divergence before proceeding. The scheduled upstream-drift workflow runs the drift report weekly and keeps the drift tracking issue current."
 
 [[local_surfaces]]
 kind = "config"
@@ -81,6 +81,13 @@ path = ".agents/upstream-drift.sh"
 domain = "upstream-drift"
 portability_hint = "fork-specific"
 notes = "Read-only report of how far fork main trails upstream main and the latest stable upstream release."
+
+[[local_surfaces]]
+kind = "other"
+path = ".github/workflows/upstream-drift.yml"
+domain = "upstream-drift"
+portability_hint = "fork-specific"
+notes = "Weekly drift report that keeps one marker-identified tracking issue current; see docs/agents/issue-tracker.md."
 
 [[local_surfaces]]
 kind = "agent_instruction"

@@ -1,0 +1,102 @@
+name: upstream drift
+
+# Fork-local. Weekly, measure how far nisavid/computer-use-linux main trails
+# agent-sh/computer-use-linux and keep one tracking issue in step with it. The
+# contract lives in docs/agents/fork-stewardship.md (Drift signal) and
+# docs/agents/issue-tracker.md (Checked-in automation).
+
+on:
+  schedule:
+    - cron: '17 13 * * 1'
+  workflow_dispatch:
+    inputs:
+      stale_days:
+        description: Days an upstream commit may stay unsynced before the fork counts as drifted
+        default: '14'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: report upstream drift
+    if: github.repository == 'nisavid/computer-use-linux'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      MARKER: '<!-- upstream-drift-tracker -->'
+      NOTIFY: ${{ github.repository_owner }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: ./.agents/bootstrap-fork-ops.sh
+      - id: drift
+        env:
+          STALE_DAYS: ${{ inputs.stale_days || '14' }}
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          ./.agents/upstream-drift.sh \
+            --stale-days "$STALE_DAYS" \
+            --report "$RUNNER_TEMP/drift.md" | tee -a "$GITHUB_OUTPUT"
+      - name: update tracking issue
+        env:
+          STATUS: ${{ steps.drift.outputs.status }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          RELEASE_TAG: ${{ steps.drift.outputs.release_tag }}
+          STALE_DAYS: ${{ steps.drift.outputs.stale_days }}
+        run: |
+          set -euo pipefail
+
+          issue="$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null)
+                      | select((.body // "") | contains(env.MARKER)) | .number' |
+            sed -n 1p)"
+
+          # shellcheck disable=SC2016 # Backticks are Markdown code spans.
+          write_body() {
+            {
+              printf '%s\n<!-- upstream-drift:release=%s -->\n\n' "$MARKER" "$RELEASE_TAG"
+              printf 'The scheduled upstream drift check compared fork `main` with `agent-sh/computer-use-linux`.\n\n'
+              cat "$RUNNER_TEMP/drift.md"
+              printf '\n`drifted` means the fork lacks the latest stable upstream release, or an upstream commit has been missing for more than %s days. ' "$STALE_DAYS"
+              printf 'This issue closes itself when the fork is no longer drifted.\n\n'
+              printf 'A broad sync still needs explicit direction; see `docs/agents/fork-stewardship.md`.\n\n'
+              printf 'Last checked %s by %s.\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$RUN_URL"
+              if [[ "${1:-}" == notify ]]; then
+                printf '\ncc @%s\n' "$NOTIFY"
+              fi
+            } >"$RUNNER_TEMP/body.md"
+          }
+
+          title="Upstream drift: fork main is $BEHIND commits behind agent-sh/computer-use-linux (latest $RELEASE_TAG)"
+
+          if [[ "$STATUS" == drifted ]]; then
+            if [[ -z "$issue" ]]; then
+              write_body notify
+              gh issue create --repo "$REPO" --title "$title" \
+                --label needs-triage --body-file "$RUNNER_TEMP/body.md"
+              exit 0
+            fi
+            recorded="$(gh issue view "$issue" --repo "$REPO" --json body --jq .body |
+              sed -n 's/^<!-- upstream-drift:release=\(.*\) -->$/\1/p' | sed -n 1p)"
+            write_body
+            gh issue edit "$issue" --repo "$REPO" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            if [[ "$recorded" != "$RELEASE_TAG" ]]; then
+              gh issue comment "$issue" --repo "$REPO" --body \
+                "Upstream released $RELEASE_TAG, which fork \`main\` does not contain. cc @$NOTIFY"
+            fi
+          elif [[ -n "$issue" ]]; then
+            write_body
+            gh issue edit "$issue" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md"
+            gh issue close "$issue" --repo "$REPO" --reason completed \
+              --comment "Fork \`main\` is no longer drifted (status \`$STATUS\`, $BEHIND upstream commits missing). $RUN_URL"
+          fi
