@@ -6,9 +6,15 @@ portal reply, or kernel acknowledgement does not establish application input.
 
 ## Operate a target
 
+Read this reference in a separate, completed tool call before operating the
+desktop. Discover arguments through tool schemas or documentation. For a task
+about one application, explicitly target that application in every
+`get_app_state` call, including calls made while diagnosing tool usage.
+
 1. Resolve the intended window with `list_windows` or `focused_window`, and
    obtain a fresh `get_app_state` for its PID or window selector. Use
    `include_screenshot: false` when the accessibility tree is sufficient.
+   Read this scoped state before activating the window or sending input.
    `app_name_or_bundle_identifier` limits the accessibility tree; a window
    selector supplies the screenshot target.
 2. Require the requested scope to resolve. An empty tree or scope error is a
@@ -18,6 +24,13 @@ portal reply, or kernel acknowledgement does not establish application input.
 3. Use `type_text` for text and `press_key` for a deliberate key or chord.
    Keep terminal targets explicit: terminal paste bindings can differ from
    ordinary editable widgets in the same window.
+   Keep observation within the requested scope. Input and window actions use
+   available metadata or dimensions from an earlier explicit capture for
+   geometry; optional landing feedback does not request a screenshot. Unknown
+   dimensions can omit a warning or stop required coordinate conversion. Prefer
+   semantic input when it is available; obtain separate authorization before a
+   screenshot that the task has not requested. Remote-control input consent is
+   separate from screenshot consent.
 4. Read the resulting value through AT-SPI or the application's own interface.
    Compare it with the requested text, including punctuation, Unicode, and
    newlines. A focused editable role alone does not verify insertion.
@@ -47,6 +60,11 @@ fixtures. The repository's `scripts/accessibility_scope_test.py` and
 `scripts/paste_backend_test.py` observe separate application counters, text,
 clipboard state, and held-key cleanup. Their constructed services establish
 protocol behavior, not a compositor or kernel-device qualification.
+For non-screenshot input, observe the screenshot portal and capture-command
+boundaries as well: a denied or failed screenshot request still exceeds that
+operation's observation scope. Require zero incidental capture requests with
+cold geometry and unavailable monitor queries, and keep an explicit screenshot
+control to verify that requested capture still works.
 
 For compositor tests, use a hidden nested session with its own display, bus,
 configuration, runtime directory, and fixture applications. Verify that every

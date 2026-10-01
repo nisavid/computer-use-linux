@@ -659,9 +659,9 @@ impl ComputerUseLinux {
         ]))
     }
 
-    /// Lazily create the uinput absolute pointer, sizing its ABS range to the
-    /// logical desktop (the portal screenshot dimensions). Returns `false` if it
-    /// can't be created or is disabled via `CU_DISABLE_ABS_POINTER`.
+    /// Lazily create the uinput absolute pointer using known physical capture
+    /// dimensions. Unknown dimensions, unavailable devices, and
+    /// `CU_DISABLE_ABS_POINTER` retain the other input backends.
     async fn ensure_abs_pointer(&self) -> bool {
         if env_flag_enabled("CU_DISABLE_ABS_POINTER") {
             return false;
@@ -674,12 +674,11 @@ impl ComputerUseLinux {
         {
             return true;
         }
-        let Ok(cap) = capture_screenshot_raw().await else {
+        let Some((_, _, width, height)) = self.capture_space_rect() else {
             return false;
         };
-        self.cache_desktop_size(cap.width, cap.height);
         match tokio::task::spawn_blocking(move || {
-            crate::abs_pointer::AbsPointer::create(cap.width as i32, cap.height as i32)
+            crate::abs_pointer::AbsPointer::create(width, height)
         })
         .await
         {
@@ -1514,7 +1513,6 @@ impl ComputerUseLinux {
             }
         }
         if let Some(session) = self.cached_portal_pointer_session() {
-            let _ = self.capture_space_rect().await;
             let Some((start_x, start_y)) =
                 self.logical_portal_point(&session, params.start_x, params.start_y)
             else {
@@ -1543,7 +1541,6 @@ impl ComputerUseLinux {
                 }
             }
         } else if self.should_prefer_portal_pointer_backend().await {
-            let _ = self.capture_space_rect().await;
             match self.ensure_portal_pointer_session().await {
                 Ok(Some(session)) => {
                     let Some((start_x, start_y)) =
@@ -3408,7 +3405,7 @@ impl ComputerUseLinux {
                 portal_rect: None,
             });
         }
-        let (_, _, width, height) = self.capture_space_rect().await.ok_or_else(|| {
+        let (_, _, width, height) = self.capture_space_rect().ok_or_else(|| {
             "Could not determine screenshot dimensions for window-relative coordinates.".to_string()
         })?;
         self.window_coordinate_map_for_dimensions(window, width as u32, height as u32)
@@ -3615,19 +3612,13 @@ impl ComputerUseLinux {
         })
     }
 
-    /// Physical capture-space desktop rectangle (union of monitors as captured
-    /// by the screenshot pipeline), for checks against click coordinates.
-    /// Best-effort; None disables the check.
-    async fn capture_space_rect(&self) -> Option<(i32, i32, i32, i32)> {
-        let cached = self.desktop_size.lock().ok().and_then(|guard| *guard);
-        if let Some((w, h)) = cached {
-            return Some((0, 0, w as i32, h as i32));
-        }
-        // One-time prime: a full-frame capture reveals the desktop size when
-        // no prior capture is available.
-        let raw = capture_screenshot_raw().await.ok()?;
-        self.cache_desktop_size(raw.width, raw.height);
-        (raw.width > 0 && raw.height > 0).then_some((0, 0, raw.width as i32, raw.height as i32))
+    /// Physical desktop rectangle from an explicitly requested full-frame
+    /// capture. Geometry checks never request pixels; unknown dimensions omit
+    /// optional feedback or stop callers that require coordinate conversion.
+    fn capture_space_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let (width, height) = self.desktop_size.lock().ok().and_then(|guard| *guard)?;
+        let (width, height) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+        (width > 0 && height > 0).then_some((0, 0, width, height))
     }
 
     /// Warn when a targeted window pokes outside every monitor: clicks and
@@ -3647,7 +3638,7 @@ impl ComputerUseLinux {
         // union, so it can only under-warn, never false-positive.
         let rects = match self.logical_monitor_rects().await {
             Some(rects) => rects,
-            None => vec![self.capture_space_rect().await?],
+            None => vec![self.capture_space_rect()?],
         };
         let (w, h) = (bounds.width as i64, bounds.height as i64);
         let window_area = w * h;
@@ -3677,7 +3668,7 @@ impl ComputerUseLinux {
     /// against the capture rect — the extension's logical layout is a
     /// different space on scaled displays and would false-positive.
     async fn off_screen_note_for_point(&self, x: i32, y: i32) -> Option<String> {
-        let (mx, my, mw, mh) = self.capture_space_rect().await?;
+        let (mx, my, mw, mh) = self.capture_space_rect()?;
         let visible = x >= mx && y >= my && x < mx.saturating_add(mw) && y < my.saturating_add(mh);
         if visible {
             return None;

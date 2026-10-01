@@ -79,6 +79,8 @@ def child_env(root: Path, *, bus_address: str = "", backend_path: str = "") -> d
         "YDOTOOL_SOCKET": str(root / "runtime" / "no-ydotool.sock"),
         "PASTE_FIXTURE_SCENARIO": os.environ.get("PASTE_FIXTURE_SCENARIO", "paste"),
     }
+    if env["PASTE_FIXTURE_SCENARIO"] == "targeted-no-screenshot":
+        env["COMPUTER_USE_LINUX_SCREENSHOT_BACKEND"] = "portal"
     if bus_address:
         env["DBUS_SESSION_BUS_ADDRESS"] = bus_address
     if backend_path:
@@ -253,8 +255,13 @@ class FixtureState:
         self.held: set[str] = set()
         self.trace: list[dict[str, Any]] = []
         self.sessions: set[str] = set()
-        self.focused_window = OTHER_WINDOW
+        self.focused_window = (
+            OTHER_WINDOW
+            if os.environ.get("PASTE_FIXTURE_SCENARIO") in ("wtype-after-portal-denial", "targeted-no-screenshot")
+            else TARGET_WINDOW
+        )
         self.other_field = OTHER_FIELD
+        self.other_selection = [0, len(OTHER_FIELD)]
         self.save()
 
     def save(self) -> None:
@@ -294,11 +301,19 @@ class FixtureState:
         return "keycode:42" in self.held or "keysym:65505" in self.held
 
     def _replace_selection_from_clipboard(self) -> None:
-        start, end = self.selection
-        self.field = self.field[:start] + self.clipboard + self.field[end:]
-        caret = start + len(self.clipboard)
-        self.selection = [caret, caret]
-        self.trace.append({"event": "semantic_paste", "text": self.clipboard})
+        if self.focused_window == TARGET_WINDOW:
+            start, end = self.selection
+            self.field = self.field[:start] + self.clipboard + self.field[end:]
+            caret = start + len(self.clipboard)
+            self.selection = [caret, caret]
+        elif self.focused_window == OTHER_WINDOW:
+            start, end = self.other_selection
+            self.other_field = self.other_field[:start] + self.clipboard + self.other_field[end:]
+            caret = start + len(self.clipboard)
+            self.other_selection = [caret, caret]
+        else:
+            raise AssertionError("paste has no constructed focused field")
+        self.trace.append({"event": "semantic_paste", "text": self.clipboard, "window_id": self.focused_window})
         if os.environ.get("PASTE_FIXTURE_SCENARIO") == "clipboard-changed":
             self.clipboard = USER_CLIPBOARD
             self.trace.append({"event": "external_clipboard_change", "value": USER_CLIPBOARD})
@@ -310,7 +325,7 @@ class FixtureState:
             self.held.add(identity)
         else:
             self.held.discard(identity)
-        event = {"event": "key", "route": route, "code": int(code), "state": int(state), "held": sorted(self.held)}
+        event = {"event": "key", "route": route, "code": int(code), "state": int(state), "held": sorted(self.held), "window_id": self.focused_window}
         if route == "keycode":
             event["layout_symbol"] = {29: "Control_L", 42: "Shift_L", 47: "k"}.get(int(code), "other")
         self.trace.append(event)
@@ -416,6 +431,14 @@ class _PortalObject(dbus.service.Object):
     def _validate_session(self, session: str) -> None:
         if str(session) not in self.sessions:
             raise dbus.exceptions.DBusException(f"unknown fixture session {session}")
+
+    @dbus.service.method("org.freedesktop.portal.Screenshot", in_signature="sa{sv}", out_signature="o", sender_keyword="sender")
+    def Screenshot(self, parent_window: str, options: dict[str, Any], sender: str) -> dbus.ObjectPath:
+        request = self._response(sender, options)
+        self.state.trace.append({"event": "Screenshot", "parent_window": str(parent_window)})
+        self.state.save()
+        self._schedule_response(request, dbus.Dictionary({}, signature="sv"), response_code=1)
+        return dbus.ObjectPath(request)
 
     @dbus.service.method(REMOTE_IFACE, in_signature="a{sv}", out_signature="o", sender_keyword="sender")
     def CreateSession(self, options: dict[str, Any], sender: str) -> dbus.ObjectPath:
@@ -596,7 +619,7 @@ def backend_main(state_path: Path, ready_path: Path) -> int:
         _PortalObject(names[PORTAL_SERVICE], state, retained)
     _KlipperObject(names[KLIPPER_SERVICE], state)
     _FixtureControlObject(names[CONTROL_SERVICE], state)
-    if os.environ.get("PASTE_FIXTURE_SCENARIO") == "wtype-after-portal-denial":
+    if os.environ.get("PASTE_FIXTURE_SCENARIO") in ("wtype-after-portal-denial", "targeted-no-screenshot"):
         names[WINDOW_SERVICE] = dbus.service.BusName(WINDOW_SERVICE, bus=bus, do_not_queue=True)
         _WindowControlObject(names[WINDOW_SERVICE], state)
     loop = GLib.MainLoop()
@@ -622,7 +645,7 @@ def inspect_backend(env: dict[str, str]) -> dict[str, Any]:
         "held_keys": [str(key) for key in iface.GetHeldKeys()],
         "trace": trace,
     }
-    if os.environ.get("PASTE_FIXTURE_SCENARIO") == "wtype-after-portal-denial":
+    if os.environ.get("PASTE_FIXTURE_SCENARIO") in ("wtype-after-portal-denial", "targeted-no-screenshot"):
         snapshot.update(json.loads(str(iface.GetWindowState())))
     return snapshot
 
@@ -754,7 +777,7 @@ def call_mcp(binary: Path, env: dict[str, str], root: Path) -> dict[str, Any]:
             return {"rpc_error": response["error"]}
         return response.get("result", {})
     arguments: dict[str, Any] = {"text": TEST_TEXT}
-    if env["PASTE_FIXTURE_SCENARIO"] == "wtype-after-portal-denial":
+    if env["PASTE_FIXTURE_SCENARIO"] in ("wtype-after-portal-denial", "targeted-no-screenshot"):
         arguments["window_id"] = TARGET_WINDOW
     return client.rpc(2, "tools/call", {"name": "type_text", "arguments": arguments})
 
@@ -821,6 +844,8 @@ def run(binary: Path, evidence_path: Path | None) -> int:
     }
     scenario = clean["PASTE_FIXTURE_SCENARIO"]
     report["scenario"] = scenario
+    if scenario == "targeted-no-screenshot":
+        report["expected"].update({"focused_window": TARGET_WINDOW, "other_field": OTHER_FIELD})
     raw_receiver = None
     if scenario == "wtype-after-portal-denial":
         install_recording_wtype_shim(root)
@@ -909,6 +934,15 @@ def run(binary: Path, evidence_path: Path | None) -> int:
             actual = observed.get(name)
             if actual != expected:
                 failures.append({"field": name, "expected": expected, "observed": actual})
+        if scenario == "targeted-no-screenshot":
+            inputs = [event for event in observed["trace"] if event["event"] in ("key", "semantic_paste")]
+            if not inputs or any(event["window_id"] != TARGET_WINDOW for event in inputs):
+                failures.append({"field": "input recipient", "expected": TARGET_WINDOW, "observed": inputs})
+            requests = [event for event in observed["trace"] if event["event"] == "Screenshot"]
+            if requests:
+                failures.append({"field": "incidental screenshot requests", "expected": [], "observed": requests})
+            if result.get("structuredContent", {}).get("ok") is not True:
+                failures.append({"field": "MCP targeted typing ok", "expected": True, "observed": result})
         if scenario in ("cancel-prepared", "write-error", "portal-error", "release-delayed"):
             if scenario in ("cancel-prepared", "write-error") and any(event["event"] == "key" for event in observed["trace"]):
                 failures.append({"field": "keyboard dispatch", "expected": "none after cancellation", "observed": "key events"})
@@ -1007,7 +1041,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="path to computer-use-linux MCP binary")
     parser.add_argument("--save-evidence", type=Path, help="optional path for synthetic-only JSON result")
-    parser.add_argument("--scenario", choices=("paste", "cancel-prepared", "cancel-dispatched", "clipboard-changed", "write-error", "portal-error", "release-delayed", "gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe", "wtype-after-portal-denial"), default="paste")
+    parser.add_argument("--scenario", choices=("paste", "cancel-prepared", "cancel-dispatched", "clipboard-changed", "write-error", "portal-error", "release-delayed", "gnome-portal-with-raw", "gnome-forced-raw", "gnome-cancel-start", "gnome-no-literal-backend", "gnome-cancel-raw-probe", "wtype-after-portal-denial", "targeted-no-screenshot"), default="paste")
     parser.add_argument("--backend", nargs=2, metavar=("STATE", "READY"), help=argparse.SUPPRESS)
     parser.add_argument("--inspect", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
