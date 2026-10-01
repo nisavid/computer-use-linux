@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Fork-local: catch stable-toolchain rot on main between pushes.
+  schedule:
+    - cron: '41 13 * * 1'
 
 permissions:
   contents: read

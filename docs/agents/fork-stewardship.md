@@ -17,6 +17,7 @@ infrastructure:
 - `AGENTS.md` and its `CLAUDE.md` compatibility link
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
+- a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
 
 Update the baseline and this inventory when an accepted upstream sync or a
 fork-local product change alters either statement.
@@ -94,6 +95,11 @@ To check drift from a checkout, refresh both refs and run the report:
 git fetch origin main
 ./.agents/upstream-drift.sh
 ```
+
+`.github/workflows/ci.yml` also runs weekly on `main`, so a stable-toolchain
+change such as a new Clippy lint fails a scheduled run instead of the next
+unrelated pull request. GitHub sends scheduled-run failure notifications to the
+user who last changed the workflow's cron line.
 
 GitHub disables scheduled workflows in a public repository after 60 days
 without repository activity. After a quiet period, check
