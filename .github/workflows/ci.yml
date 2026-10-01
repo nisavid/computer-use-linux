@@ -104,6 +104,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo build --locked
       - run: scripts/mcp_safety_check.py --binary target/debug/computer-use-linux
+      - run: scripts/check_plugins.sh --binary target/debug/computer-use-linux
 
   agent-config:
     name: agnix
@@ -141,7 +142,7 @@ jobs:
           COMPUTER_USE_LINUX_LOCAL_COSMIC_HELPER="$PWD/target/debug/computer-use-linux-cosmic" \
             npm install --prefix "$prefix" -g .
           "$prefix/bin/computer-use-linux" --help
-      - run: npm pack --dry-run
+      - run: npm run pack:check
 
   zod-schema:
     name: zod MCP schema
@@ -160,6 +161,35 @@ jobs:
       - name: Validate tools/list against the MCP SDK zod schema
         run: node scripts/zod-check/check.mjs --command target/debug/computer-use-linux
 
+  pi-extension:
+    name: native Pi extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo build --locked
+      - run: npm ci --prefix pi --ignore-scripts --no-audit --no-fund
+      - run: npm run build:check --prefix pi
+      - run: npm run typecheck --prefix pi
+      - run: COMPUTER_USE_LINUX_TEST_BINARY="$PWD/target/debug/computer-use-linux" npm test --prefix pi
+      - run: python3 scripts/generate_pi_tool_catalog.py --binary target/debug/computer-use-linux --check
+      - name: Smoke the installed Pi package
+        run: |
+          prefix="$RUNNER_TEMP/pi-package"
+          package="$(npm pack --pack-destination "$RUNNER_TEMP" --silent)"
+          COMPUTER_USE_LINUX_LOCAL_BINARY="$PWD/target/debug/computer-use-linux" \
+          COMPUTER_USE_LINUX_LOCAL_COSMIC_HELPER="$PWD/target/debug/computer-use-linux-cosmic" \
+            npm install --prefix "$prefix" "$RUNNER_TEMP/$package" --no-audit --no-fund
+          test -x "$prefix/node_modules/@agent-sh/computer-use-linux/npm/bin/computer-use-linux-linux-x64"
+          COMPUTER_USE_LINUX_EXTENSION_PATH="$prefix/node_modules/@agent-sh/computer-use-linux/pi/extension/index.ts" \
+          COMPUTER_USE_LINUX_USE_PACKAGED_BINARY=1 \
+            npm test --prefix pi -- pi-integration.test.ts
+
   release-binary:
     name: release artifact (${{ matrix.target }})
     needs:
@@ -173,6 +203,7 @@ jobs:
       - mcp-safety
       - agent-config
       - npm-wrapper
+      - pi-extension
       - zod-schema
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -311,6 +342,19 @@ jobs:
           name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
           test "v$version" = "$GITHUB_REF_NAME"
+          # The registry can lag the publish job. Wait for the version to be
+          # visible, at most 10 tries 15s apart, then install once.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then
+              echo "${name}@${version} is not visible on npm after 10 tries" >&2
+              exit 1
+            fi
+            echo "waiting for ${name}@${version} on npm (try ${attempt}/10)"
+            sleep 15
+          done
           npm install --prefix "$RUNNER_TEMP/published" -g "${name}@${version}"
       - name: Install MCP SDK for the zod check
         run: npm ci --prefix scripts/zod-check --ignore-scripts --no-audit --no-fund

@@ -264,6 +264,7 @@ detect_distro() {
         *KDE*|*Plasma*)  log_warn "compositor: KDE (${desktop}) — untested, AT-SPI step will be skipped" ;;
         *sway*)          log_warn "compositor: sway — untested" ;;
         *Hyprland*)      log_warn "compositor: hyprland — untested" ;;
+        *niri*|*Niri*)   log_warn "compositor: niri — window targeting via niri IPC, rest untested" ;;
         *)               log_warn "compositor: ${desktop} — untested" ;;
     esac
 }
@@ -452,8 +453,49 @@ show_manual_ydotoold_guidance() {
         return 0
     fi
     log_info "configure your per-user supervisor to run:"
-    log_info "  ${ydotoold_path} --socket-path=${runtime_dir}/.ydotool_socket --socket-own=${UID}:${user_gid}"
+    log_info "  ${ydotoold_path} --socket-path=${runtime_dir}/.ydotool_socket --socket-own=${UID}:${user_gid} --socket-perm=0600"
     log_info "do not run ydotoold as root or expose its socket to other users"
+}
+
+stop_unsafe_ydotoold() {
+    if systemctl --user disable --now ydotoold.service; then
+        log_info "stopped and disabled ydotoold.service"
+    else
+        log_warn "could not stop and disable ydotoold.service; run: systemctl --user disable --now ydotoold.service"
+    fi
+}
+
+validate_ydotoold_socket_security() {
+    local sock="$1" owner="$2" mode="$3"
+    if [[ "${owner}" == "${UID}" && "${mode}" == "600" ]]; then
+        log_ok "ydotoold socket ready (${sock}, mode ${mode})"
+        return 0
+    fi
+
+    log_fail "refusing unsafe ydotoold socket ${sock}: owner=${owner} mode=${mode} (expected ${UID}/600)"
+    stop_unsafe_ydotoold
+    return 1
+}
+
+verify_ydotoold_socket() {
+    local sock="$1"
+    if [[ -L "${sock}" ]]; then
+        log_fail "refusing symlink at ydotoold socket path ${sock}"
+        stop_unsafe_ydotoold
+        return 1
+    fi
+
+    if [[ -S "${sock}" ]]; then
+        local owner mode
+        if ! owner="$(stat -c '%u' -- "${sock}")" || ! mode="$(stat -c '%a' -- "${sock}")"; then
+            log_fail "could not inspect ydotoold socket security at ${sock}"
+            stop_unsafe_ydotoold
+            return 1
+        fi
+        validate_ydotoold_socket_security "${sock}" "${owner}" "${mode}"
+    else
+        log_warn "socket ${sock} did not appear within ~3s — check the unit"
+    fi
 }
 
 setup_ydotoold() {
@@ -496,7 +538,8 @@ Documentation=man:ydotool(1) man:ydotoold(8)
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-own=%U:%U
+UMask=0077
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-own=%U:%U --socket-perm=0600
 Restart=on-failure
 
 [Install]
@@ -516,18 +559,7 @@ EOF
     local tries=0
     while [[ ! -S "${sock}" && ${tries} -lt 10 ]]; do sleep 0.3; ((tries++)); done
 
-    if [[ -S "${sock}" ]]; then
-        local owner mode
-        owner="$(stat -c '%u' "${sock}")"
-        mode="$(stat -c '%a' "${sock}")"
-        if [[ "${owner}" == "${UID}" && "${mode}" == "600" ]]; then
-            log_ok "ydotoold socket ready (${sock}, mode ${mode})"
-        else
-            log_warn "socket exists but owner=${owner} mode=${mode} (expected ${UID}/600)"
-        fi
-    else
-        log_warn "socket ${sock} did not appear within ~3s — check the unit"
-    fi
+    verify_ydotoold_socket "${sock}"
 }
 
 # -----------------------------------------------------------------------------

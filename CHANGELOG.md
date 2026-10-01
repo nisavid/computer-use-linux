@@ -7,6 +7,320 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-10-01
+
+### Security
+- COSMIC targeted input trusts compositor-reported focus rather than an
+  activation cache, and no longer writes focus state into a shared temporary
+  file. GNOME extension calls verify the unique owner of `org.gnome.Shell`. (#215)
+- Portal responses are bound to the expected sender and request path.
+  Screenshot files reject symlinks and non-regular files and enforce byte and
+  decoded-pixel limits before processing. (#215)
+- Automatic ydotool discovery accepts only private, same-user sockets and
+  no longer falls back to shared `/tmp` sockets. The installer creates a
+  mode-0600 daemon socket; `YDOTOOL_SOCKET` remains an explicit override. (#215)
+- Scroll amounts must be finite and within -100 to 100 before input locks
+  are taken. Pi executable and PATH overrides must use absolute paths. (#215)
+
+### Fixed
+- MCP safety checks recognize npm launcher error output without weakening
+  the failure assertions. (#214)
+
+## [0.7.9] - 2026-10-01
+
+### Fixed
+- Screenshot execution failures return MCP tool results with `isError: true`
+  and the original error message. Window targeting, capture, crop, and resize
+  failures no longer surface as JSON-RPC internal errors that some clients
+  mistake for broken connections. (#210)
+- KWin temporary plugin sequences use the current atomic update API so
+  builds with warnings denied pass on Rust 1.99. (#211)
+
+## [0.7.8] - 2026-10-01
+
+### Added
+- Official Claude Code and Codex plugin. The repo is a marketplace for both
+  hosts: `claude plugin marketplace add agent-sh/computer-use-linux` or
+  `codex plugin marketplace add agent-sh/computer-use-linux`. The plugin ships
+  the skill and a launcher that downloads the release binaries pinned to the
+  plugin version, verifies their sha256, and caches them per version. The
+  Codex manifest forwards the desktop session variables that Codex strips
+  from MCP server environments. `COMPUTER_USE_LINUX_BIN` runs a local build. (#202)
+
+### Fixed
+- Native X11 queries now enforce one deadline in the transport itself.
+  Connect, handshake, and every reply share a 2-second bound, so a stalled
+  X server closes the query connection instead of leaving a blocked worker
+  running after a timeout. The `doctor` X11 check no longer spawns a
+  detached thread. Unix sockets, literal IP addresses, and `localhost` need
+  no resolver; a remote hostname in `DISPLAY` resolves through
+  `getent ahosts` under the same bound, and a missing or failing lookup
+  reports the X11 route as unavailable. Fix by Gary Lysenko (ilysenko),
+  from ilysenko/codex-desktop-linux#1532. (#203)
+- Accessibility snapshots stay stable during input. The cached nodes and
+  the pid that owns them are now one snapshot, and `get_app_state`
+  publishes a new one only after in-flight input finishes. An index that
+  passed the owner check can no longer resolve to another app's node
+  mid-action. `perform_action` and `set_value` now take the input lock that
+  `click` and `scroll` already held. Fix by Gary Lysenko (ilysenko), from
+  ilysenko/codex-desktop-linux#1532. (#203)
+- PTY metadata alone no longer makes a window a paste-capable terminal. The
+  paste chord comes only from a known terminal app id or WM_CLASS, so an
+  IDE with an integrated terminal keeps the standard paste shortcut. PTY
+  enrichment now also recognizes Ghostty, GNOME Terminal, and KGX by app
+  id or WM_CLASS, not only by title, which keeps enrichment working for
+  X11 windows with a custom class and a plain title. This replaces the
+  earlier rule that defaulted an enriched window with no known identity to
+  Ctrl+Shift+V. Fix by Gary Lysenko (ilysenko), from
+  ilysenko/codex-desktop-linux#1532. (#203)
+- The bounded process runner no longer sleeps after every chunk while a
+  command is still producing output. Each drain stays capped and the
+  deadline is still checked every pass, so continuous output cannot starve
+  stderr or bypass the output limit. Fix by Gary Lysenko (ilysenko), from
+  ilysenko/codex-desktop-linux#1532. (#203)
+||||||| parent of 1954063 (feat: official Claude Code and Codex plugin)
+
+## [0.7.7] - 2026-09-30
+
+### Added
+- Window listing and exact focus on niri through `niri msg`, with direct
+  JSON IPC as a fallback when the CLI is unavailable. Socket discovery
+  matches the current Wayland display and refuses ambiguous sessions.
+  Focus is verified with a fresh window query before targeted input.
+  Window bounds account for output scaling and window offsets. Missing
+  positions stay null; unknown or mixed scaling omits bounds. (#192)
+
+## [0.7.6] - 2026-09-29
+
+### Fixed
+- Wayland `press_key` on the remote-desktop portal now sends modifiers and
+  named keys (Enter, arrows, F-keys and the rest) as keysyms, so the
+  compositor resolves them against the active keymap. With Caps Lock and
+  Control swapped, `Ctrl+A` used to press the physical Control position,
+  which toggled Caps Lock and typed `A`. It now selects all. Letters and
+  digits stay physical keycodes: mutter drops a keysym missing from the
+  current layout group, so a keysym `a` would vanish under a Hebrew or
+  Cyrillic layout, and GTK and Qt match shortcuts on those layouts by the
+  US keycode. KDE Plasma keeps keycodes for now. (#191)
+
+## [0.7.5] - 2026-09-28
+
+### Added
+- Opt-in persistence for the Wayland remote-desktop portal. Set
+  `COMPUTER_USE_LINUX_PERSIST_REMOTE_DESKTOP=1` to send `persist_mode=2`
+  on `RemoteDesktop.SelectDevices` and reuse the single-use `restore_token`
+  returned by `Start`. Nothing persistence-related is sent on
+  `ScreenCast.SelectSources` (that call rejects it for a remote-desktop
+  session). Pointer and keyboard sessions store separate tokens, mode
+  `0600`, under `$XDG_STATE_HOME/computer-use-linux/` or
+  `~/.local/state/computer-use-linux/`. The first grant still shows the
+  dialog. Later processes restore until the desktop revokes the grant, or
+  until the token cannot be restored, which falls back to a prompt.
+  Interface version 2 is required. Unset, behavior is unchanged. (#185)
+
+### Fixed
+- X11 `scroll` no longer follows ydotool's absolute move with a single wheel
+  event. That move warps the pointer through (0, 0). GTK 3 resets its XI2
+  scroll valuators when the pointer re-enters the window, so the one wheel
+  event only re-baselines them and the window does not move, while the tool
+  still returns success. Native X11 now sends the same notch count as XTEST
+  wheel buttons through xdotool (4 up, 5 down, 6 left, 7 right), which have
+  no scroll valuators. Wayland portal scroll is unchanged. (#184)
+
+## [0.7.4] - 2026-09-27
+
+### Fixed
+- The #167 index check no longer trusts a pid the snapshot did not match.
+  When `get_app_state` named a pid with no accessibility root plus an app
+  name, the tree came from the app-name match but was recorded under the
+  requested pid. An index from that tree then passed a click aimed at the
+  requested pid and was refused for the app that owns it. The snapshot now
+  records a pid only when its roots were selected by that pid; otherwise each
+  node is checked against its owner on the accessibility bus.
+
+## [0.7.3] - 2026-09-26
+
+### Fixed
+- `click` and `scroll` by `element_index` or selector now refuse an index from
+  another app's snapshot. `get_app_state` records the pid it snapshotted;
+  when the action's target resolves to a different pid, the call fails and
+  asks for a `get_app_state` of the target, instead of acting on the other
+  app's node and reporting `ok: true`. An untargeted snapshot mixes apps, so
+  its node is checked against the pid that owns it on the accessibility bus.
+  (#167)
+- Portal pointer input on scaled GNOME Wayland (for example 125 %) now lands
+  where it is aimed. mutter maps a stream point to `monitor.x + stream_x /
+  scale` when its layout mode is logical, which is the GNOME 50 default, so
+  logical coordinates arrived at 1/scale of the target and still reported
+  success. The pointer path reads the layout mode from
+  `org.gnome.Mutter.DisplayConfig` and sends each stream's point multiplied
+  by its monitor scale. Click, scroll, and drag share the path. Unscaled
+  monitors, physical layout mode, and other compositors are unchanged. (#169)
+- The Pi extension falls back to `computer-use-linux` on `PATH` when neither
+  `COMPUTER_USE_LINUX_BIN` nor the downloaded package binary is available.
+  Temporary extensions (`pi -e npm:@agent-sh/computer-use-linux`) are staged
+  without that binary and warned "binary not found" even with a global
+  install. The PATH lookup was dropped in the native-tools rewrite. (#170)
+- `type_text` and `press_key` no longer warn "no focused element" when the
+  focus probe merely ran out of budget. The 400-node search now reports when a
+  node, depth, or read limit stopped it, and the feedback says the input could
+  not be verified instead. With a target pid, the probe searches only that
+  app; when no AT-SPI app belongs to it (xterm, Electron without
+  `--force-renderer-accessibility`), feedback says so instead of warning or
+  reporting another app's focused widget. (#168)
+- KDE Plasma clipboard paste into xterm, uxterm, rxvt, urxvt, and koi8rxterm
+  now sends Shift+Insert. Those terminals have no Ctrl+Shift+V binding by
+  default, so the paste was dropped; Klipper sets the selection as well as
+  the clipboard, so Shift+Insert pastes the new text. When AT-SPI reports a
+  focused element that is not a terminal (a search field in a terminal
+  window), paste falls back to Ctrl+V. The check reads the AT-SPI role enum,
+  not the localized role name. Behavior ported from
+  ilysenko/codex-desktop-linux#1413.
+- Helper spawns (ydotool, wtype, xdotool, gnome-screenshot, and every command
+  run through the supervised runner) retry a transient `ETXTBSY` ("Text file
+  busy") for up to 75 ms. The error appears when a helper binary is being
+  replaced, and it made xdotool fall back to ydotool as if it were missing.
+  It also made tests that write and exec fake helper scripts fail under the
+  parallel suite, which failed the first v0.7.2 tag run.
+
+## [0.7.2] - 2026-09-26
+
+### Added
+- Native X11 screenshot route: one `GetImage` on the root window over the
+  X11 connection, used only on a native X11 session (never XWayland) and
+  tried after GNOME Shell and the portal, before `gnome-screenshot`.
+  Pixels are device pixels, the space xdotool input and X11 window origins
+  use. MATE/X11 had no working route: xdg-desktop-portal-gtk has no
+  Screenshot, and gnome-screenshot 41 blacks out 3/4 of the frame at
+  window-scaling-factor 2. `doctor` reports the route as
+  `platform.x11_display` and `capabilities.screenshot` entry `x11`;
+  `COMPUTER_USE_LINUX_SCREENSHOT_BACKEND=x11` pins it. (#155)
+
+### Fixed
+- `doctor` no longer reports the XDG Screenshot, ScreenCast, or InputCapture
+  portal as available when the portal does not export that interface.
+  `busctl introspect` exits 0 with only a header line for a missing interface,
+  so each entry now requires its methods (Screenshot: `Screenshot`). Readiness
+  gains `can_capture_screenshots` and a blocker when no screenshot route is
+  detected; this is detection, not a test capture. (#156)
+- X11/EWMH window origins now come from the X server
+  (`TranslateCoordinates` to the root window) instead of `wmctrl -lG`, which
+  counts the client's offset inside its frame twice. Window-targeted
+  screenshots cropped the wrong area, relative clicks were offset by the same
+  amount, off-screen warnings misfired on maximized windows, and
+  `move_window` reported a mismatch after a correct move. Bounds are the
+  client area; `move_window` now verifies the frame origin it requested. When
+  the X server cannot be asked, the origin is reported unknown instead of the
+  shifted wmctrl value. (#157)
+
+## [0.7.1] - 2026-09-19
+
+### Changed
+- `get_app_state` now returns its screenshot as a structured `image` content
+  block (the same shape as the `screenshot` tool) followed by the JSON report
+  as text and `structuredContent`. The JSON `screenshot` field keeps the
+  metadata (dimensions, scale, format, bytes) but no longer embeds the base64
+  `data_url`, which hosts were counting as ~30K text tokens per call. Callers
+  that read `screenshot.data_url` from the JSON should read the image block
+  instead. (#145)
+
+### Fixed
+- `type_text` on X11 no longer delivers characters out of order. The xdotool
+  backend passed `--delay 0`, which lets XTEST key events race each other on
+  some X servers (seen on Cinnamon / Mint 22). It now uses xdotool's 12ms
+  per-character default and scales the command timeout with text length.
+  `COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS` overrides the delay. (#147)
+- The unscoped-tree warning from `get_app_state` no longer tells a caller that
+  already passed a `pid` or window target to pass a target. When the target
+  matched no AT-SPI application root, the warning now points at the app's
+  missing accessibility support, `list_apps`, and a lower `max_nodes` instead.
+
+## [0.7.0] - 2026-09-16
+
+### Added
+- `get_app_state` reports `tree_scoped` and `accessibility_tree_truncated`,
+  warns in `message` when no app target narrowed the AT-SPI tree to one app,
+  and documents every scoping parameter in its schema, the server
+  instructions, the skill, and the Pi guide. Unscoped calls used to return the
+  whole desktop tree silently and could exhaust a small context window.
+
+### Fixed
+- Skill Install section now separates Pi native install from PATH CLI/MCP
+  install, so `pi install` is not described as sufficient for shell `doctor`
+  and `setup`.
+
+## [0.6.0] - 2026-09-15
+
+### Added
+- GTK4 delivered-event coordinate probe and an opt-in GTK3/MCP semantic-click
+  regression that verifies actual button activation at scales 1 and 2.
+- Explicit foreground `guard-accessibility` command with a passive AT-SPI
+  listener and verified GNOME toolkit-accessibility reassertion. Ctrl-C or
+  SIGTERM stops the guard without disabling other accessibility clients or
+  restoring an old saved setting. Never started automatically by MCP or setup.
+- Optional `complete_interaction` MCP notification, enabled by
+  `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE=1`, with bounded notification execution
+  and graceful handling of unavailable desktop notification services.
+
+### Fixed
+- KDE Plasma terminal paste uses terminal shortcuts, including uxterm detection.
+- Setup verifies saved GNOME accessibility settings instead of reporting an
+  unverified write as success.
+- Plain left element/selector clicks prefer recognized native AT-SPI activation
+  actions over toolkit bounds, avoiding GTK3 HiDPI and GTK4 zero-origin pointer
+  conversion when a matching action is available. Explicit coordinates, right
+  clicks, and multi-clicks preserve pointer semantics.
+- Clarified that relative click/scroll coordinates use the clipped window
+  screenshot crop origin before preview resizing, not raw surface or widget
+  coordinates, and require a window target.
+
+## [0.5.0] - 2026-08-31
+
+### Added
+- The Pi package now exposes native `computer_use_linux_*` tools without a
+  separate MCP adapter. One small loader stays active initially, then uses
+  Pi's additive dynamic-tool loading to expose selected tools with their exact
+  generated MCP schemas only when desktop control is needed.
+- Pi keeps one lazily started, session-scoped computer-use-linux process,
+  forwards cancellation, serializes desktop actions, preserves image results,
+  bounds text output, and rejects binary/schema version drift.
+
+### Changed
+- Pi installation is now one command (`pi install
+  npm:@agent-sh/computer-use-linux`) and no longer writes
+  `~/.pi/agent/mcp.json`. Existing adapter-based entries are detected and
+  reported for non-destructive manual cleanup.
+
+## [0.4.10] - 2026-08-29
+
+### Added
+- An explicitly opt-in `run_shell` MCP tool supports bounded same-user shell
+  execution for trusted remote MCP deployments. The tool is absent unless
+  `COMPUTER_USE_LINUX_ENABLE_SHELL=1`, clears ambient credentials, requires
+  visible environment additions, enforces timeout/output limits and process-
+  group cleanup, and emits command-digest audit records.
+
+### Fixed
+- Wayland literal text now uses `wtype` on compatible compositors when portal
+  keyboard input is unavailable, preserving Unicode before the ydotool
+  fallback. Known-incompatible GNOME, KDE/Plasma, and COSMIC sessions do not
+  advertise or select wtype, and a launched failure never replays the text.
+- Absolute uinput pointer axes now end at the final logical desktop pixel, so
+  edge coordinates are advertised and clamped consistently.
+- Capability maps now advertise AT-SPI only when its bus is reachable and a
+  toolkit accessibility status is actually enabled.
+- Buttons outside the absolute uinput device's left, middle, and right set now
+  fall through to a backend that can synthesize them instead of becoming left clicks.
+- Temporary KWin script callbacks now accept one matching response from the
+  current `org.kde.KWin` bus owner, reject spoofed or replayed responses, and
+  time out the complete script transaction before cleaning up owned temporary
+  state without disturbing a colliding callback registration.
+- KWin window listings now classify Plasma 6 native Wayland and Xwayland
+  clients when the legacy client flags are unavailable.
+- GNOME extension setup now reports when changed files require an already-active
+  Shell extension to reload before its newly installed DBus methods are served,
+  and requires that reload when the previous extension state cannot be read.
+
 ## [0.4.9] - 2026-08-12
 
 ### Fixed
@@ -437,7 +751,21 @@ pages; also bumps the MCP server's advertised version string to match.
 - Validated against GNOME 50.1 on Wayland (Ubuntu 25.10).
 - KDE / Sway / Hyprland untested — see README support matrix.
 
-[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.9...HEAD
+[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.10...HEAD
+[0.7.10]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.9...v0.7.10
+[0.7.9]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.8...v0.7.9
+[0.7.8]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/agent-sh/computer-use-linux/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/agent-sh/computer-use-linux/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.10...v0.5.0
+[0.4.10]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.6...v0.4.7
