@@ -90,6 +90,13 @@ portability_hint = "fork-specific"
 notes = "Weekly drift report that keeps one marker-identified tracking issue current; see docs/agents/issue-tracker.md."
 
 [[local_surfaces]]
+kind = "other"
+path = ".github/workflows/ci.yml"
+domain = "validation"
+portability_hint = "fork-specific"
+notes = "Upstream-owned. The fork carries only a weekly schedule trigger that catches stable-toolchain rot on main."
+
+[[local_surfaces]]
 kind = "agent_instruction"
 path = "AGENTS.md"
 domains = ["authority", "workflow"]
