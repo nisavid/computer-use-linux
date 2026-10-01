@@ -9,12 +9,14 @@
 `663930fef8d1bee64b7b8f833b68cff3196059e3`.
 
 At that baseline, the fork has no product, package, binary, or runtime behavior
-divergence. Its carried changes are agent-maintenance infrastructure:
+divergence. Its carried changes are agent-maintenance and drift-monitoring
+infrastructure:
 
 - fork additions to upstream's `.agnix.toml`
 - `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`
 - `AGENTS.md` and its `CLAUDE.md` compatibility link
 - `docs/agents/`
+- `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
 
 Update the baseline and this inventory when an accepted upstream sync or a
 fork-local product change alters either statement.
@@ -74,6 +76,29 @@ The Fork Ops `upstream-main` track is for current upstream inspection. It is not
 an autonomous sync authorization. A broad sync still requires explicit task
 direction, an updated divergence assessment, and normal review and publication
 gates.
+
+## Drift signal
+
+`.github/workflows/upstream-drift.yml` runs weekly and on manual dispatch. It
+bootstraps the upstream remote, runs `.agents/upstream-drift.sh`, and keeps one
+tracking issue current; `docs/agents/issue-tracker.md` defines that issue's
+contract. The fork is `drifted` when fork `main` lacks the latest stable
+upstream release, or when an upstream `main` commit has been missing for more
+than 14 days. A drifted fork needs a sync decision under the rules above, not an
+autonomous sync.
+
+To check drift from a checkout, refresh both refs and run the report:
+
+```sh
+./.agents/bootstrap-fork-ops.sh
+git fetch origin main
+./.agents/upstream-drift.sh
+```
+
+GitHub disables scheduled workflows in a public repository after 60 days
+without repository activity. After a quiet period, check
+`gh workflow list --repo nisavid/computer-use-linux --all` and re-enable a
+disabled workflow with `gh workflow enable --repo nisavid/computer-use-linux`.
 
 ## Releases and publication
 

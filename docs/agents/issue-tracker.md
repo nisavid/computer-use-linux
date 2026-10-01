@@ -40,6 +40,23 @@ workflow contract.
 
 **PRs as a request surface: no.**
 
+## Checked-in automation
+
+`.github/workflows/upstream-drift.yml` owns at most one open issue, identified by
+the `<!-- upstream-drift-tracker -->` marker in its body:
+
+- When the fork becomes drifted, it opens the issue with `needs-triage` and
+  mentions the repository owner.
+- While the fork stays drifted, it rewrites the title and body on each run. It
+  comments, mentioning the owner, only when a new stable upstream release
+  appears.
+- When the fork is no longer drifted, it closes the issue as completed. A later
+  drift opens a new issue.
+- It never changes labels after creation, assigns, or links issues.
+
+Triage the drift issue like any other; removing `needs-triage` does not stop the
+updates. Do not edit its marker lines or open a second drift issue by hand.
+
 ## Skill operations
 
 When a skill says to publish to the issue tracker, create an issue in
