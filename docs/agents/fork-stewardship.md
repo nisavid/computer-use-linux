@@ -4,8 +4,8 @@
 
 `nisavid/computer-use-linux` is a maintained fork of
 `agent-sh/computer-use-linux`. The synchronized baseline is upstream `main` at
-`23127f24431f73340799b60856154891fc9b1127` (release v0.7.10), merged on
-2026-10-01. The onboarding baseline was
+`23127f24431f73340799b60856154891fc9b1127` (release v0.7.10), merged in
+`efedb9c107a49100c8d69eeffb9610dee1181d7a`. The onboarding baseline was
 `663930fef8d1bee64b7b8f833b68cff3196059e3`.
 
 At that baseline, the fork has no product, package, binary, or runtime behavior
@@ -79,9 +79,10 @@ gates.
 
 The fork has no independent release channel. Do not create or push version
 tags, publish fork GitHub releases, or publish to crates.io or npm without
-explicit direction. Keep the versions that `scripts/check_plugins.sh` checks
-equal: `Cargo.toml`, `package.json`, the plugin launcher, both plugin
-manifests, and `.claude-plugin/marketplace.json`. Treat a release tag,
+explicit direction. Keep every release version equal to `Cargo.toml`'s: CI's
+npm wrapper job checks `package.json`, and `scripts/check_plugins.sh` checks
+the plugin launcher, both plugin manifests, and
+`.claude-plugin/marketplace.json`. Treat a release tag,
 binaries, checksums, and package artifacts as one reviewed release unit.
 
 ## Generated and runtime boundaries
