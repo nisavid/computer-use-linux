@@ -14,9 +14,7 @@ on:
         description: Days an upstream commit may stay unsynced before the fork counts as drifted
         default: '14'
 
-permissions:
-  contents: read
-  issues: write
+permissions: {}
 
 concurrency:
   group: upstream-drift
@@ -27,6 +25,9 @@ jobs:
     name: report upstream drift
     if: github.repository == 'nisavid/computer-use-linux'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the fork
+      issues: write # create, edit, comment on, and close the drift issue
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -34,7 +35,7 @@ jobs:
       NOTIFY: ${{ github.repository_owner }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -43,6 +44,7 @@ jobs:
         env:
           STALE_DAYS: ${{ inputs.stale_days || '14' }}
         run: |
+          set -euo pipefail
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           ./.agents/upstream-drift.sh \
             --stale-days "$STALE_DAYS" \
@@ -56,8 +58,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          case "$STATUS" in
+            current | trailing | drifted) ;;
+            *) echo "unexpected drift status: '$STATUS'" >&2; exit 1 ;;
+          esac
+
           issue="$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
             --jq '.[] | select(.pull_request == null)
+                      | select(.user.login == "github-actions[bot]")
                       | select((.body // "") | contains(env.MARKER)) | .number' |
             sed -n 1p)"
 

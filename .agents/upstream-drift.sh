@@ -87,16 +87,22 @@ main() {
   git fetch --quiet --no-tags upstream "refs/tags/$release_tag" ||
     die "could not fetch upstream tag $release_tag"
   release_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
-  git merge-base --is-ancestor "$release_sha" "$fork_sha" || release_contained=false
+  local ancestry_status=0
+  git merge-base --is-ancestor "$release_sha" "$fork_sha" || ancestry_status=$?
+  case "$ancestry_status" in
+    0) ;;
+    1) release_contained=false ;;
+    *) die "could not compare $release_tag with $fork_ref (git exit $ancestry_status)" ;;
+  esac
 
   local fork_release
   fork_release="$(git describe --tags --abbrev=0 "$fork_sha" 2>/dev/null || printf 'none')"
 
   local status
-  if ((behind == 0)); then
-    status=current
-  elif [[ "$release_contained" == false ]] || ((oldest_missing_age_days > stale_days)); then
+  if [[ "$release_contained" == false ]] || ((oldest_missing_age_days > stale_days)); then
     status=drifted
+  elif ((behind == 0)); then
+    status=current
   else
     status=trailing
   fi

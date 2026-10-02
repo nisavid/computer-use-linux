@@ -42,8 +42,9 @@ workflow contract.
 
 ## Checked-in automation
 
-`.github/workflows/upstream-drift.yml` owns at most one open issue, identified by
-the `<!-- upstream-drift-tracker -->` marker in its body:
+`.github/workflows/upstream-drift.yml` owns at most one open issue: one that
+`github-actions[bot]` opened with the `<!-- upstream-drift-tracker -->` marker in
+its body. The workflow behaves as follows:
 
 - When the fork becomes drifted, it opens the issue with `needs-triage` and
   mentions the repository owner.
