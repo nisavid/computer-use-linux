@@ -177,6 +177,7 @@ test_non_systemd_host_gets_manual_guidance() (
     assert_contains "${output}" "systemd --user is unavailable" || return 1
     assert_contains "${output}" "configure your per-user supervisor to run" || return 1
     assert_contains "${output}" "ydotoold --socket-path=/run/user/test/.ydotool_socket" || return 1
+    assert_contains "${output}" "--socket-perm=0600" || return 1
     assert_contains "${output}" "do not run ydotoold as root" || return 1
 )
 
@@ -196,6 +197,75 @@ test_non_systemd_host_requires_uinput_access() (
     output="$(setup_ydotoold)" || return 1
     assert_contains "${output}" "exists but is not user-accessible" || return 1
     assert_not_contains "${output}" "configure your per-user supervisor to run" || return 1
+)
+
+test_systemd_ydotoold_unit_forces_private_socket() (
+    local scratch uinput unit_content systemctl_calls
+    scratch="$(mktemp -d)"
+    uinput="${scratch}/uinput"
+    export HOME="${scratch}/home"
+    export XDG_RUNTIME_DIR="${scratch}/runtime"
+    export COMPUTER_USE_LINUX_UINPUT_DEVICE="${uinput}"
+    mkdir -p "${HOME}" "${XDG_RUNTIME_DIR}"
+    : >"${uinput}"
+
+    # shellcheck source=../install.sh
+    source "${INSTALLER}"
+    trap 'rm -rf -- "${scratch}"' EXIT
+    systemd_user_manager_available() { return 0; }
+    ydotoold() { :; }
+    systemctl() { printf '%s ' "$@" >>"${scratch}/systemctl.calls"; printf '\n' >>"${scratch}/systemctl.calls"; }
+    verify_ydotoold_socket() { :; }
+
+    setup_ydotoold >/dev/null || return 1
+    unit_content="$(<"${HOME}/.config/systemd/user/ydotoold.service")"
+    systemctl_calls="$(<"${scratch}/systemctl.calls")"
+    assert_contains "${unit_content}" "UMask=0077" || return 1
+    assert_contains "${unit_content}" "--socket-perm=0600" || return 1
+    assert_contains "${systemctl_calls}" "daemon-reload" || return 1
+    assert_contains "${systemctl_calls}" "enable --now ydotoold.service" || return 1
+)
+
+test_ydotoold_rejects_unsafe_socket_metadata() (
+    local scratch owner mode owner_and_mode output status systemctl_calls
+    scratch="$(mktemp -d)"
+
+    # shellcheck source=../install.sh
+    source "${INSTALLER}"
+    trap 'rm -rf -- "${scratch}"' EXIT
+    systemctl() { printf '%s ' "$@" >>"${scratch}/systemctl.calls"; printf '\n' >>"${scratch}/systemctl.calls"; }
+
+    for owner_and_mode in "${UID} 660" "$((UID + 1)) 600"; do
+        IFS=' ' read -r owner mode <<<"${owner_and_mode}"
+        : >"${scratch}/systemctl.calls"
+        status=0
+        output="$(validate_ydotoold_socket_security "/run/user/${UID}/.ydotool_socket" "${owner}" "${mode}")" || status=$?
+        systemctl_calls="$(<"${scratch}/systemctl.calls")"
+
+        assert_eq "${status}" "1" || return 1
+        assert_contains "${output}" "refusing unsafe ydotoold socket" || return 1
+        assert_contains "${systemctl_calls}" "disable --now ydotoold.service" || return 1
+    done
+)
+
+test_ydotoold_rejects_symlink_socket_path() (
+    local scratch output status systemctl_calls
+    scratch="$(mktemp -d)"
+    : >"${scratch}/target"
+    ln -s "${scratch}/target" "${scratch}/socket"
+
+    # shellcheck source=../install.sh
+    source "${INSTALLER}"
+    trap 'rm -rf -- "${scratch}"' EXIT
+    systemctl() { printf '%s ' "$@" >>"${scratch}/systemctl.calls"; printf '\n' >>"${scratch}/systemctl.calls"; }
+
+    status=0
+    output="$(verify_ydotoold_socket "${scratch}/socket")" || status=$?
+    systemctl_calls="$(<"${scratch}/systemctl.calls")"
+
+    assert_eq "${status}" "1" || return 1
+    assert_contains "${output}" "refusing symlink at ydotoold socket path" || return 1
+    assert_contains "${systemctl_calls}" "disable --now ydotoold.service" || return 1
 )
 
 test_doctor_accepts_platform_capability_blockers() (
@@ -272,6 +342,9 @@ run_test "startx system dependencies include xdotool" test_startx_system_deps_in
 run_test "Wayland system dependencies exclude xdotool" test_wayland_system_deps_exclude_xdotool
 run_test "non-systemd host gets manual ydotoold guidance" test_non_systemd_host_gets_manual_guidance
 run_test "non-systemd host requires uinput access" test_non_systemd_host_requires_uinput_access
+run_test "systemd ydotoold unit forces a private socket" test_systemd_ydotoold_unit_forces_private_socket
+run_test "ydotoold rejects unsafe socket metadata" test_ydotoold_rejects_unsafe_socket_metadata
+run_test "ydotoold rejects a symlink socket path" test_ydotoold_rejects_symlink_socket_path
 run_test "doctor accepts platform capability blockers" test_doctor_accepts_platform_capability_blockers
 run_test "doctor rejects missing install prerequisites" test_doctor_rejects_missing_install_prerequisite
 run_test "doctor raw fallback accepts platform capability blockers" test_doctor_raw_fallback_accepts_platform_capability_blockers

@@ -1,4 +1,5 @@
 mod abs_pointer;
+mod accessibility_guard;
 #[path = "atspi_tree.rs"]
 mod atspi_tree_impl;
 mod cli;
@@ -15,12 +16,15 @@ mod server;
 mod terminal;
 mod windowing;
 mod windows;
+mod x11_display;
 mod ydotool;
 
 pub mod atspi_tree {
     pub(crate) use crate::atspi_tree_impl::{
-        focused_element_summary, list_accessible_apps, perform_action, set_element_value,
-        snapshot_limits, AccessibleAppSummary, FocusedElementSummary, ValueSetInvocation,
+        focused_element_summary_in_app, list_accessible_apps, object_ref_owner_pid, perform_action,
+        perform_named_action, probe_focused_element, set_element_value,
+        snapshot_accessibility_tree, snapshot_limits, AccessibleAppSummary, FocusProbe,
+        FocusedElementSummary, ValueSetInvocation,
     };
     pub use crate::atspi_tree_impl::{
         snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibilityText,
@@ -34,7 +38,9 @@ pub mod diagnostics {
         DoctorReport, InputReport, PlatformReport, PortalReport, PreferredBackends,
         ReadinessReport, WindowingReport,
     };
-    pub(crate) use crate::diagnostics_impl::{setup_accessibility_report, SetupReport};
+    pub(crate) use crate::diagnostics_impl::{
+        setup_accessibility_report, wtype_compatible_wayland_desktop, SetupReport,
+    };
 }
 
 pub mod screenshot {

@@ -1,6 +1,6 @@
 use crate::windowing::registry::{
     self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
-    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, X11_BACKEND,
+    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, NIRI_BACKEND, X11_BACKEND,
 };
 use crate::ydotool;
 use schemars::JsonSchema;
@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
     fs::OpenOptions,
-    os::unix::{fs::MetadataExt, net::UnixDatagram},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -51,6 +51,12 @@ const REMOTE_DESKTOP_POINTER_METHODS: &[&str] = &[
     "NotifyPointerAxisDiscrete",
 ];
 const SCREENCAST_POINTER_METHODS: &[&str] = &["SelectSources"];
+// Methods each standalone portal entry must export before doctor reports it.
+// `busctl introspect` exits 0 and prints only its header for an interface the
+// portal does not export, so exit status alone proves nothing (issue #156).
+const SCREENSHOT_PORTAL_METHODS: &[&str] = &["Screenshot"];
+const SCREENCAST_PORTAL_METHODS: &[&str] = &["CreateSession", "SelectSources", "Start"];
+const INPUT_CAPTURE_PORTAL_METHODS: &[&str] = &["GetZones", "Enable", "ConnectToEIS"];
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DoctorReport {
@@ -103,6 +109,9 @@ pub struct PlatformReport {
     pub xdg_runtime_dir: Option<String>,
     pub gnome_shell_version: Check,
     pub gnome_screenshot: Check,
+    /// Native X11 display for the root-window screenshot route. Fails on
+    /// Wayland sessions, including XWayland, by design.
+    pub x11_display: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -131,6 +140,7 @@ pub struct WindowingReport {
     pub cosmic_helper: Check,
     pub kwin: Check,
     pub hyprland: Check,
+    pub niri: Check,
     pub backends: BTreeMap<String, Check>,
     pub can_list_windows: bool,
     pub can_focus_apps: bool,
@@ -147,6 +157,8 @@ pub struct InputReport {
     /// X11 XTEST keyboard backend. Preferred over ydotool on X11 sessions,
     /// where raw evdev scancodes are re-mapped by the active XKB layout.
     pub xdotool: Check,
+    /// Wayland virtual-keyboard backend for layout-safe Unicode literal text.
+    pub wtype: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -157,6 +169,10 @@ pub struct ReadinessReport {
     pub can_focus_apps: bool,
     pub can_focus_windows: bool,
     pub can_send_development_input: bool,
+    /// A screenshot route was detected (GNOME Shell, an XDG Screenshot portal
+    /// that exports its Screenshot method, or the gnome-screenshot fallback).
+    /// Detection only: no test capture is taken.
+    pub can_capture_screenshots: bool,
     pub recommended_next_step: String,
     pub blockers: Vec<String>,
 }
@@ -207,6 +223,7 @@ pub fn doctor_report() -> DoctorReport {
         &accessibility,
         &windowing,
         &input,
+        !screenshot_backends(&platform, &portals).is_empty(),
     );
 
     let capabilities = capability_map_with_portal_keyboard(
@@ -279,6 +296,13 @@ fn capability_map_with_portal_keyboard(
     if should_advertise_xdotool(platform, input, force_ydotool, force_xdotool) {
         input_backends.push("xdotool".to_string());
     }
+    if platform_is_wayland(platform)
+        && wtype_compatible_wayland_desktop(platform.xdg_current_desktop.as_deref())
+        && input.wtype.ok
+        && !force_ydotool
+    {
+        input_backends.push("wtype".to_string());
+    }
     if portal_available && portal_forced_for_all_input {
         input_backends.push("portal".to_string());
     }
@@ -289,17 +313,7 @@ fn capability_map_with_portal_keyboard(
         input_backends.push("portal".to_string());
     }
 
-    let mut screenshot_backends = Vec::new();
-    if platform.gnome_shell_version.ok {
-        screenshot_backends.push("gnome_shell".to_string());
-    }
-    if portals.screenshot.ok {
-        screenshot_backends.push("portal".to_string());
-    }
-    // Subprocess fallback for background/systemd contexts the DBus paths reject.
-    if platform.gnome_screenshot.ok {
-        screenshot_backends.push("gnome_screenshot".to_string());
-    }
+    let screenshot_backends = screenshot_backends(platform, portals);
 
     let mut window_backends = Vec::new();
     let x11_available = windowing
@@ -327,9 +341,12 @@ fn capability_map_with_portal_keyboard(
     if windowing.hyprland.ok {
         window_backends.push("hyprland".to_string());
     }
-    // i3 and the generic X11/EWMH backend have no dedicated WindowingReport
-    // field; read them from the probe map (tried last) so the capability list
-    // matches the backends the registry will actually use.
+    if windowing.niri.ok {
+        window_backends.push(NIRI_BACKEND.to_string());
+    }
+    // i3 and the generic X11/EWMH backend have no dedicated
+    // WindowingReport field; read them from the probe map so the capability
+    // list matches the registry order.
     if windowing
         .backends
         .get(I3_BACKEND)
@@ -342,7 +359,7 @@ fn capability_map_with_portal_keyboard(
     }
 
     let mut accessibility_backends = Vec::new();
-    if accessibility.at_spi_enabled.ok || accessibility.toolkit_accessibility.ok {
+    if can_build_accessibility_tree(accessibility) {
         accessibility_backends.push("at_spi".to_string());
     }
 
@@ -463,9 +480,9 @@ fn desktop_env_hydration_updates(
         && current_env
             .get("DISPLAY")
             .is_some_and(|value| !value.trim().is_empty())
-        && !current_env
+        && current_env
             .get("WAYLAND_DISPLAY")
-            .is_some_and(|value| !value.trim().is_empty());
+            .is_none_or(|value| value.trim().is_empty());
 
     DESKTOP_ENV_KEYS
         .iter()
@@ -586,42 +603,18 @@ pub fn setup_accessibility_report() -> SetupReport {
     hydrate_session_bus_env();
 
     let before = doctor_report();
-    let accessibility_command = if can_build_accessibility_tree(&before.accessibility) {
-        Check::ok("AT-SPI accessibility is already enabled")
-    } else {
-        let atspi_status = command_check_with_session_bus(
-            "busctl",
-            &[
-                "--user",
-                "set-property",
-                "org.a11y.Bus",
-                "/org/a11y/bus",
-                "org.a11y.Status",
-                "IsEnabled",
-                "b",
-                "true",
-            ],
-        );
-        if atspi_status.ok {
-            atspi_status
-        } else {
-            command_check_with_session_bus(
-                "gsettings",
-                &[
-                    "set",
-                    "org.gnome.desktop.interface",
-                    "toolkit-accessibility",
-                    "true",
-                ],
-            )
-        }
-    };
+    let accessibility_command =
+        enable_accessibility(&before.accessibility, command_check_with_session_bus);
     let after = doctor_report();
     let before_ready = before.readiness.can_build_accessibility_tree;
     let after_ready = after.readiness.can_build_accessibility_tree;
-    let changed_accessibility = !before_ready && after_ready;
+    let saved_before = check_detail_contains_true(&before.accessibility.toolkit_accessibility);
+    let saved_after = check_detail_contains_true(&after.accessibility.toolkit_accessibility);
+    let changed_accessibility = after_ready && saved_after && (!before_ready || !saved_before);
     let requires_target_app_restart = changed_accessibility;
-    let message = if after_ready {
+    let message = if after_ready && !saved_after {
+        "AT-SPI is available at runtime, but toolkit-accessibility could not be verified as enabled in GSettings. Newly launched apps may have no accessibility tree. Check accessibility_command and the saved setting; other accessibility tools can change it."
+    } else if after_ready {
         if changed_accessibility {
             "AT-SPI accessibility is enabled. Restart already-running target apps if their AT-SPI tree is still empty."
         } else {
@@ -642,6 +635,75 @@ pub fn setup_accessibility_report() -> SetupReport {
     }
 }
 
+// Runtime IsEnabled does not establish the setting read by newly launched
+// GTK apps. Always check the saved key, even when an existing tree is usable.
+fn enable_accessibility(
+    before: &AccessibilityReport,
+    mut run: impl FnMut(&str, &[&str]) -> Check,
+) -> Check {
+    let setting = if check_detail_contains_true(&before.toolkit_accessibility) {
+        before.toolkit_accessibility.clone()
+    } else {
+        let write = run(
+            "gsettings",
+            &[
+                "set",
+                "org.gnome.desktop.interface",
+                "toolkit-accessibility",
+                "true",
+            ],
+        );
+        let read = run(
+            "gsettings",
+            &[
+                "get",
+                "org.gnome.desktop.interface",
+                "toolkit-accessibility",
+            ],
+        );
+        if !check_detail_contains_true(&read) {
+            let runtime = run(
+                "busctl",
+                &[
+                    "--user",
+                    "set-property",
+                    "org.a11y.Bus",
+                    "/org/a11y/bus",
+                    "org.a11y.Status",
+                    "IsEnabled",
+                    "b",
+                    "true",
+                ],
+            );
+            return Check::fail(format!(
+                "Saved toolkit-accessibility was not verified: {}; write: {}; runtime fallback: {}",
+                read.detail, write.detail, runtime.detail
+            ));
+        }
+        read
+    };
+    if !can_build_accessibility_tree(before) {
+        let runtime = run(
+            "busctl",
+            &[
+                "--user",
+                "set-property",
+                "org.a11y.Bus",
+                "/org/a11y/bus",
+                "org.a11y.Status",
+                "IsEnabled",
+                "b",
+                "true",
+            ],
+        );
+        return Check::ok(format!(
+            "Saved toolkit-accessibility verified: {}; runtime request: {}",
+            setting.detail, runtime.detail
+        ));
+    }
+    Check::ok("Saved toolkit-accessibility is enabled; runtime AT-SPI is available")
+}
+
 fn platform_report() -> PlatformReport {
     PlatformReport {
         os: std::env::consts::OS.to_string(),
@@ -656,6 +718,19 @@ fn platform_report() -> PlatformReport {
         xdg_runtime_dir: xdg_runtime_dir().map(|path| path.display().to_string()),
         gnome_shell_version: command_check("gnome-shell", &["--version"]),
         gnome_screenshot: command_check("gnome-screenshot", &["--version"]),
+        x11_display: x11_display_check(),
+    }
+}
+
+fn x11_display_check() -> Check {
+    if !crate::x11_display::is_native_x11_session() {
+        return Check::fail("not a native X11 session");
+    }
+    // The transport enforces the deadline, so no detached worker remains
+    // blocked after a diagnostic timeout.
+    match crate::x11_display::X11Display::connect().map(|display| display.describe()) {
+        Ok(detail) => Check::ok(detail),
+        Err(error) => Check::fail(format!("{error:#}")),
     }
 }
 
@@ -666,8 +741,14 @@ fn portal_report() -> (PortalReport, Check) {
             desktop_portal: bus_name_check("org.freedesktop.portal.Desktop"),
             remote_desktop,
             screencast,
-            screenshot: portal_interface_check("org.freedesktop.portal.Screenshot"),
-            input_capture: portal_interface_check("org.freedesktop.portal.InputCapture"),
+            screenshot: portal_interface_methods_check(
+                "org.freedesktop.portal.Screenshot",
+                SCREENSHOT_PORTAL_METHODS,
+            ),
+            input_capture: portal_interface_methods_check(
+                "org.freedesktop.portal.InputCapture",
+                INPUT_CAPTURE_PORTAL_METHODS,
+            ),
             mutter_remote_desktop: bus_name_check("org.gnome.Mutter.RemoteDesktop"),
             mutter_screencast: bus_name_check("org.gnome.Mutter.ScreenCast"),
         },
@@ -705,6 +786,7 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
     let cosmic_helper = backend_check(COSMIC_WAYLAND_BACKEND);
     let kwin = backend_check(KWIN_BACKEND);
     let hyprland = backend_check(HYPRLAND_BACKEND);
+    let niri = backend_check(NIRI_BACKEND);
     let backends = probes
         .iter()
         .map(|probe| (probe.id.to_string(), check_from_backend_probe(probe)))
@@ -721,11 +803,13 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
             "A KWin/Plasma window backend is available for list_windows, focused_window, and targeted input verification."
         } else if hyprland.ok {
             "A Hyprland window backend is available for list_windows, focused_window, and targeted input verification."
+        } else if niri.ok {
+            "A niri window backend is available for list_windows, focused_window, and targeted input verification."
         } else {
             "A window listing backend is available for list_windows, focused_window, and targeted input verification."
         }
     } else {
-        "Window listing is unavailable or denied. Computer Use can still use screenshots, AT-SPI, and global ydotool input, but targeted window input cannot be verified. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session."
+        "Window listing is unavailable or denied. Computer Use can still use screenshots, AT-SPI, and global ydotool input, but targeted window input cannot be verified. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session. On niri, ensure the session exposes NIRI_SOCKET so the niri IPC socket is reachable."
     }
     .to_string();
 
@@ -735,6 +819,7 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
         cosmic_helper,
         kwin,
         hyprland,
+        niri,
         backends,
         can_list_windows,
         can_focus_apps,
@@ -761,6 +846,7 @@ fn input_report() -> InputReport {
         ydotool_socket: ydotool_socket_check(),
         uinput: read_write_path_check(Path::new("/dev/uinput")),
         xdotool: command_path_check("xdotool"),
+        wtype: command_path_check("wtype"),
     }
 }
 
@@ -778,7 +864,28 @@ fn readiness_report(
         accessibility,
         windowing,
         input,
+        !screenshot_backends(platform, portals).is_empty(),
     )
+}
+
+/// Screenshot routes in the order `capture_screenshot_raw` tries them. Both the
+/// capability map and readiness read this list so they cannot disagree.
+fn screenshot_backends(platform: &PlatformReport, portals: &PortalReport) -> Vec<String> {
+    let mut backends = Vec::new();
+    if platform.gnome_shell_version.ok {
+        backends.push("gnome_shell".to_string());
+    }
+    if portals.screenshot.ok {
+        backends.push("portal".to_string());
+    }
+    if platform.x11_display.ok {
+        backends.push("x11".to_string());
+    }
+    // Subprocess fallback for background/systemd contexts the DBus paths reject.
+    if platform.gnome_screenshot.ok {
+        backends.push("gnome_screenshot".to_string());
+    }
+    backends
 }
 
 fn readiness_report_with_portal_keyboard(
@@ -787,6 +894,7 @@ fn readiness_report_with_portal_keyboard(
     accessibility: &AccessibilityReport,
     windowing: &WindowingReport,
     input: &InputReport,
+    can_capture_screenshots: bool,
 ) -> ReadinessReport {
     let mut blockers = Vec::new();
     let can_build_accessibility_tree = can_build_accessibility_tree(accessibility);
@@ -821,7 +929,14 @@ fn readiness_report_with_portal_keyboard(
 
     if !can_send_development_input {
         blockers.push(
-            "Development keyboard input is unavailable; enable XDG RemoteDesktop portal input on Wayland, xdotool with DISPLAY on X11, or ydotool with a connectable ydotoold socket. Read/write /dev/uinput alone provides only absolute pointer input."
+            "Development keyboard input is unavailable; enable XDG RemoteDesktop portal input or install wtype on compatible Wayland compositors, install xdotool with DISPLAY on X11, or use ydotool with a connectable ydotoold socket. Read/write /dev/uinput alone provides only absolute pointer input."
+                .to_string(),
+        );
+    }
+
+    if !can_capture_screenshots {
+        blockers.push(
+            "No screenshot route was detected: GNOME Shell is absent, the XDG portal does not export org.freedesktop.portal.Screenshot, this is not a native X11 session, and gnome-screenshot is not installed. get_app_state and screenshot return no image; element-aware actions from the accessibility tree still work."
                 .to_string(),
         );
     }
@@ -841,7 +956,10 @@ fn readiness_report_with_portal_keyboard(
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
     } else if !can_send_development_input {
-        "Enable a keyboard-capable input backend: enable the XDG RemoteDesktop portal on Wayland, install xdotool for X11, or start ydotoold with a socket accessible to this desktop user."
+        "Enable a keyboard-capable input backend: enable the XDG RemoteDesktop portal or install wtype on compatible Wayland compositors, install xdotool for X11, or start ydotoold with a socket accessible to this desktop user."
+            .to_string()
+    } else if !can_capture_screenshots {
+        "Enable a screenshot route: install an XDG desktop portal backend that implements Screenshot for this desktop, or install gnome-screenshot. Accessibility-tree actions work meanwhile."
             .to_string()
     } else {
         "Computer Use is ready: AT-SPI tree support, window targeting, and a Linux input backend are available."
@@ -855,6 +973,7 @@ fn readiness_report_with_portal_keyboard(
         can_focus_apps,
         can_focus_windows,
         can_send_development_input,
+        can_capture_screenshots,
         recommended_next_step,
         blockers,
     }
@@ -868,6 +987,10 @@ fn can_send_development_input(
     let force_ydotool = env_flag_enabled_any(FORCE_YDOTOOL_KEYBOARD_ENV_KEYS);
     let force_xdotool = env_flag_enabled_any(FORCE_XDOTOOL_KEYBOARD_ENV_KEYS);
     portal_keyboard_input_available(platform, remote_desktop_keyboard)
+        || platform_is_wayland(platform)
+            && wtype_compatible_wayland_desktop(platform.xdg_current_desktop.as_deref())
+            && input.wtype.ok
+            && !force_ydotool
         || should_advertise_xdotool(platform, input, force_ydotool, force_xdotool)
         || input.ydotool.ok && input.ydotool_socket.ok
 }
@@ -925,32 +1048,11 @@ fn dbus_session_address() -> Option<String> {
         })
 }
 
-fn ydotool_socket_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(value) = env_var("YDOTOOL_SOCKET") {
-        candidates.push(PathBuf::from(value));
-    }
-
-    if let Some(runtime_socket) = xdg_runtime_dir().map(|runtime| runtime.join(".ydotool_socket")) {
-        candidates.push(runtime_socket);
-    }
-    candidates.push(PathBuf::from("/tmp/.ydotool_socket"));
-    candidates
-}
-
 fn ydotool_socket_check() -> Check {
-    let mut checked = Vec::new();
-    for candidate in ydotool_socket_candidates() {
-        match socket_connect_result(&candidate) {
-            Ok(()) => return Check::ok(format!("connectable: {}", candidate.display())),
-            Err(detail) => checked.push(detail),
-        }
+    match ydotool::connectable_socket_path() {
+        Ok(path) => Check::ok(format!("connectable: {}", path.display())),
+        Err(detail) => Check::fail(format!("no trusted connectable ydotool socket ({detail})")),
     }
-
-    Check::fail(format!(
-        "no connectable ydotool socket ({})",
-        checked.join("; ")
-    ))
 }
 
 fn user_id() -> Option<String> {
@@ -974,6 +1076,15 @@ fn platform_is_wayland(platform: &PlatformReport) -> bool {
             .as_deref()
             .is_some_and(|display| !display.trim().is_empty()),
     }
+}
+
+pub(crate) fn wtype_compatible_wayland_desktop(desktop: Option<&str>) -> bool {
+    desktop.is_none_or(|desktop| {
+        let desktop = desktop.to_ascii_lowercase();
+        !["gnome", "kde", "plasma", "cosmic"]
+            .iter()
+            .any(|known_incompatible| desktop.contains(known_incompatible))
+    })
 }
 
 fn should_advertise_xdotool(
@@ -1020,12 +1131,13 @@ fn socket_connect_check(path: &Path) -> Check {
     }
 }
 
+#[cfg(test)]
 fn socket_connect_result(path: &Path) -> std::result::Result<(), String> {
     if !path.exists() {
         return Err(format!("missing: {}", path.display()));
     }
 
-    UnixDatagram::unbound()
+    std::os::unix::net::UnixDatagram::unbound()
         .and_then(|socket| socket.connect(path))
         .map_err(|error| format!("{}: datagram: {error}", path.display()))
 }
@@ -1058,9 +1170,42 @@ fn portal_interface_check(interface: &str) -> Check {
     )
 }
 
+/// Introspect a portal interface and require it to export `methods`.
+fn portal_interface_methods_check(interface: &str, methods: &[&str]) -> Check {
+    require_busctl_methods(portal_interface_check(interface), interface, methods)
+}
+
+fn require_busctl_methods(introspection: Check, interface: &str, methods: &[&str]) -> Check {
+    if !introspection.ok {
+        return introspection;
+    }
+    let missing = missing_busctl_methods(&introspection, methods);
+    if missing.is_empty() {
+        return introspection;
+    }
+    if !busctl_introspection_has_members(&introspection.detail) {
+        return Check::fail(format!(
+            "{interface} is not exported by the portal (introspection listed no members)"
+        ));
+    }
+    Check::fail(format!(
+        "{interface} is missing required methods: {}",
+        missing.join(", ")
+    ))
+}
+
+fn busctl_introspection_has_members(detail: &str) -> bool {
+    detail
+        .lines()
+        .any(|line| line.trim_start().starts_with('.'))
+}
+
 fn remote_desktop_portal_checks() -> (Check, Check, Check) {
     let introspection = portal_interface_check("org.freedesktop.portal.RemoteDesktop");
-    let screencast = portal_interface_check("org.freedesktop.portal.ScreenCast");
+    let screencast = portal_interface_methods_check(
+        "org.freedesktop.portal.ScreenCast",
+        SCREENCAST_PORTAL_METHODS,
+    );
     if !introspection.ok {
         return (introspection.clone(), introspection, screencast);
     }
@@ -1355,6 +1500,55 @@ fn run_command(command: &str, args: &[&str], with_session_bus: bool) -> Check {
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_repairs_saved_key_even_when_runtime_is_ready() {
+        let mut before = accessibility_report(Check::ok("bus"), Check::ok("false"));
+        before.at_spi_enabled = Check::ok("b true");
+        let mut calls = Vec::new();
+        let result = enable_accessibility(&before, |program, args| {
+            calls.push((program.to_string(), args.join(" ")));
+            Check::ok(if args[0] == "get" { "true" } else { "" })
+        });
+        assert!(result.ok);
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "gsettings".into(),
+                    "set org.gnome.desktop.interface toolkit-accessibility true".into()
+                ),
+                (
+                    "gsettings".into(),
+                    "get org.gnome.desktop.interface toolkit-accessibility".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_does_not_claim_saved_success_from_command_exit_status() {
+        let before = accessibility_report(Check::ok("bus"), Check::ok("false"));
+        let mut calls = Vec::new();
+        let result = enable_accessibility(&before, |program, args| {
+            calls.push(program.to_string());
+            Check::ok(if args[0] == "get" {
+                "false"
+            } else {
+                "exit status 0"
+            })
+        });
+        assert!(!result.ok);
+        assert!(result.detail.contains("not verified"));
+        assert_eq!(calls, ["gsettings", "gsettings", "busctl"]);
+    }
+
+    #[test]
+    fn setup_preserves_enabled_settings_without_writing() {
+        let before = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let result = enable_accessibility(&before, |_, _| panic!("already enabled"));
+        assert!(result.ok);
+    }
+
     fn platform_report() -> PlatformReport {
         PlatformReport {
             os: "linux".to_string(),
@@ -1369,6 +1563,7 @@ mod tests {
             xdg_runtime_dir: Some("/run/user/1000".to_string()),
             gnome_shell_version: Check::ok("GNOME Shell 46.0"),
             gnome_screenshot: Check::ok("gnome-screenshot 41.0"),
+            x11_display: Check::fail("not a native X11 session"),
         }
     }
 
@@ -1411,6 +1606,7 @@ mod tests {
             cosmic_helper: Check::fail("missing"),
             kwin: Check::fail("not a KWin session"),
             hyprland: Check::fail("not a Hyprland session"),
+            niri: Check::fail("not a niri session"),
             backends: BTreeMap::new(),
             can_list_windows,
             can_focus_apps: true,
@@ -1440,6 +1636,7 @@ mod tests {
             ydotool_socket,
             uinput,
             xdotool: Check::fail("missing xdotool"),
+            wtype: Check::fail("missing wtype"),
         }
     }
 
@@ -1458,6 +1655,26 @@ mod tests {
         );
 
         assert!(can_build_accessibility_tree(&report));
+    }
+
+    #[test]
+    fn capability_map_advertises_only_a_buildable_accessibility_tree() {
+        let platform = platform_report();
+        let portals = portal_report(Check::fail("missing"));
+        let windowing = windowing_report(false, false);
+        let input = input_report(false);
+
+        for accessibility in [
+            accessibility_report(Check::fail("permission denied"), Check::ok("true")),
+            accessibility_report(
+                Check::ok("('unix:path=/run/user/1000/at-spi/bus',)"),
+                Check::ok("false"),
+            ),
+        ] {
+            let capabilities =
+                capability_map(&platform, &portals, &accessibility, &windowing, &input);
+            assert!(capabilities.accessibility.is_empty());
+        }
     }
 
     #[test]
@@ -1545,6 +1762,7 @@ mod tests {
             ydotool_socket: Check::ok("connectable"),
             uinput: Check::fail("missing"),
             xdotool: Check::ok("xdotool"),
+            wtype: Check::fail("missing wtype"),
         };
 
         let capabilities = capability_map(
@@ -1577,6 +1795,36 @@ mod tests {
         assert_eq!(capabilities.input, ["xdotool"]);
         assert_eq!(capabilities.preferred.input.as_deref(), Some("xdotool"));
         assert!(readiness.can_send_development_input);
+    }
+
+    #[test]
+    fn wayland_diagnostics_advertise_wtype_without_portal_or_ydotool() {
+        let mut platform = platform_report();
+        platform.xdg_session_type = Some("wayland".to_string());
+        platform.xdg_current_desktop = Some("Hyprland".to_string());
+        platform.wayland_display = Some("wayland-0".to_string());
+        let portals = portal_report(Check::fail("missing"));
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        let mut input = input_report(false);
+        input.wtype = Check::ok("wtype");
+
+        let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
+        let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+
+        assert_eq!(capabilities.input, ["wtype"]);
+        assert_eq!(capabilities.preferred.input.as_deref(), Some("wtype"));
+        assert!(readiness.can_send_development_input);
+    }
+
+    #[test]
+    fn wtype_excludes_known_incompatible_wayland_desktops() {
+        assert!(wtype_compatible_wayland_desktop(Some("Hyprland")));
+        assert!(wtype_compatible_wayland_desktop(Some("sway")));
+        assert!(wtype_compatible_wayland_desktop(None));
+        assert!(!wtype_compatible_wayland_desktop(Some("GNOME")));
+        assert!(!wtype_compatible_wayland_desktop(Some("KDE;Plasma")));
+        assert!(!wtype_compatible_wayland_desktop(Some("COSMIC")));
     }
 
     #[test]
@@ -1670,6 +1918,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            true,
         );
 
         assert!(!capabilities.input.iter().any(|backend| backend == "portal"));
@@ -1709,6 +1958,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            true,
         );
 
         assert!(!portals.remote_desktop.ok);
@@ -1803,6 +2053,7 @@ mod tests {
             &accessibility_report(Check::ok("bus"), Check::ok("true")),
             &windowing_report(true, true),
             &input,
+            true,
         );
 
         assert!(portals.remote_desktop.ok);
@@ -1822,6 +2073,7 @@ mod tests {
             ydotool_socket: Check::ok("connectable"),
             uinput: Check::fail("missing"),
             xdotool: Check::ok("xdotool"),
+            wtype: Check::fail("missing wtype"),
         };
 
         let capabilities = capability_map(
@@ -1892,6 +2144,119 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("Exact window activation")));
+    }
+
+    #[test]
+    fn header_only_introspection_is_not_an_exported_interface() {
+        // busctl introspect of an interface the portal lacks: header line, exit 0.
+        let header_only = Check::ok("NAME TYPE SIGNATURE RESULT/VALUE FLAGS");
+
+        let check = require_busctl_methods(
+            header_only,
+            "org.freedesktop.portal.Screenshot",
+            SCREENSHOT_PORTAL_METHODS,
+        );
+
+        assert!(!check.ok);
+        assert!(check.detail.contains("is not exported by the portal"));
+    }
+
+    #[test]
+    fn portal_interface_must_export_every_required_method() {
+        let partial = Check::ok(
+            "NAME        TYPE     SIGNATURE RESULT/VALUE FLAGS\n.PickColor  method   sa{sv}    o            -\n.version    property u         2            emits-change",
+        );
+        let check = require_busctl_methods(
+            partial,
+            "org.freedesktop.portal.Screenshot",
+            SCREENSHOT_PORTAL_METHODS,
+        );
+        assert!(!check.ok);
+        assert!(check
+            .detail
+            .contains("missing required methods: Screenshot"));
+
+        let full = Check::ok(
+            "NAME        TYPE     SIGNATURE RESULT/VALUE FLAGS\n.PickColor  method   sa{sv}    o            -\n.Screenshot method   sa{sv}    o            -",
+        );
+        assert!(
+            require_busctl_methods(
+                full,
+                "org.freedesktop.portal.Screenshot",
+                SCREENSHOT_PORTAL_METHODS
+            )
+            .ok
+        );
+
+        let failed = Check::fail("busctl: No such interface");
+        let passthrough = require_busctl_methods(
+            failed,
+            "org.freedesktop.portal.Screenshot",
+            SCREENSHOT_PORTAL_METHODS,
+        );
+        assert!(!passthrough.ok);
+        assert_eq!(passthrough.detail, "busctl: No such interface");
+    }
+
+    #[test]
+    fn readiness_blocks_when_no_screenshot_route_is_detected() {
+        let mut platform = platform_report();
+        platform.gnome_shell_version = Check::fail("No such file or directory (os error 2)");
+        platform.gnome_screenshot = Check::fail("No such file or directory (os error 2)");
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        let input = input_report(true);
+        let portals = portal_report(Check::fail("missing"));
+
+        let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+
+        assert!(!readiness.can_capture_screenshots);
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("No screenshot route was detected")));
+        assert!(readiness
+            .recommended_next_step
+            .contains("Enable a screenshot route"));
+        let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
+        assert!(capabilities.screenshot.is_empty());
+        assert_eq!(capabilities.preferred.screenshot, None);
+    }
+
+    #[test]
+    fn native_x11_display_is_a_screenshot_route_ahead_of_gnome_screenshot() {
+        let mut platform = platform_report();
+        platform.gnome_shell_version = Check::fail("missing");
+        platform.x11_display = Check::ok("native X11 root window 2880x1920, depth 24");
+        let portals = portal_report(Check::fail("missing"));
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        let input = input_report(true);
+
+        let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
+        let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+
+        assert_eq!(capabilities.screenshot, ["x11", "gnome_screenshot"]);
+        assert_eq!(capabilities.preferred.screenshot.as_deref(), Some("x11"));
+        assert!(readiness.can_capture_screenshots);
+    }
+
+    #[test]
+    fn readiness_and_capabilities_share_the_screenshot_route_list() {
+        let mut platform = platform_report();
+        platform.gnome_shell_version = Check::fail("missing");
+        platform.gnome_screenshot = Check::fail("missing");
+        let mut portals = portal_report(Check::fail("missing"));
+        portals.screenshot = Check::ok(".Screenshot method sa{sv} o -");
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        let input = input_report(true);
+
+        let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+        let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
+
+        assert!(readiness.can_capture_screenshots);
+        assert_eq!(capabilities.screenshot, ["portal"]);
     }
 
     #[test]
