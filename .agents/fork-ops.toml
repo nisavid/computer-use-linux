@@ -97,6 +97,13 @@ portability_hint = "fork-specific"
 notes = "Upstream-owned. The fork carries only a weekly schedule trigger that catches stable-toolchain rot on main."
 
 [[local_surfaces]]
+kind = "other"
+path = ".github/workflows/sync-reminder.yml"
+domain = "validation"
+portability_hint = "fork-specific"
+notes = "Upstream-owned and kept identical to upstream. Disabled in GitHub Actions since 2026-10-01 because it reminds about a codex-desktop-linux copy this fork does not maintain."
+
+[[local_surfaces]]
 kind = "agent_instruction"
 path = "AGENTS.md"
 domains = ["authority", "workflow"]

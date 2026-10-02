@@ -19,6 +19,12 @@ infrastructure:
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
 - a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
 
+The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
+GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens
+`codex-sync` issues for an embedded copy in `codex-desktop-linux`, which this
+fork does not maintain. Keep the file identical to upstream and leave the
+workflow disabled.
+
 Update the baseline and this inventory when an accepted upstream sync or a
 fork-local product change alters either statement.
 
