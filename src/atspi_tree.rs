@@ -1,8 +1,8 @@
-use crate::atspi::{
-    self, AccessibilityConnection, AccessibleProxy, ObjectRefOwned, Proxies, StateSet,
-};
+use crate::atspi::{self, AccessibleProxy, ObjectRefOwned, Proxies, StateSet};
 use crate::diagnostics::hydrate_session_bus_env;
 use anyhow::{anyhow, Context, Result};
+
+use crate::atspi_transport::BoundedConnection as Connection;
 use futures_util::{stream, StreamExt};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -104,6 +104,11 @@ const HARD_SNAPSHOT_MAX_DEPTH: u32 = 64;
 const CHILD_READ_CONCURRENCY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_ROOTS: usize = 256;
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const PROVIDER_TIMEOUT: Duration = Duration::from_millis(300);
+const MAX_METADATA_BYTES: usize = 4096;
+const MAX_ACTIONS: usize = 64;
+const MAX_SNAPSHOT_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const ROOT_MATCH_CHILD_LIMIT: usize = 8;
 const MAX_DISCOVERY_CHILD_READS: usize = MAX_DISCOVERY_ROOTS * ROOT_MATCH_CHILD_LIMIT;
 
@@ -239,27 +244,90 @@ async fn children_up_to(
     }
 
     let child_count = proxy.child_count().await?;
-    Ok(
-        fetch_indexed_up_to(child_count, limit, remaining_attempts, |index| {
-            proxy.get_child_at_index(index)
-        })
-        .await,
-    )
+    let mut batch = fetch_indexed_up_to(child_count, limit, remaining_attempts, |index| {
+        proxy.get_child_at_index(index)
+    })
+    .await;
+    let original_len = batch.items.len();
+    batch.items.retain(valid_object_ref_metadata);
+    batch.incomplete |= batch.items.len() != original_len;
+    Ok(batch)
+}
+
+fn ensure_live_connection(conn: &Connection) -> Result<()> {
+    if conn.is_broken() {
+        return Err(anyhow!(
+            "AT-SPI connection closed or rejected an incoming message"
+        ));
+    }
+    Ok(())
+}
+
+async fn with_live_connection<T>(
+    conn: &Connection,
+    operation: impl Future<Output = T>,
+) -> Result<T> {
+    ensure_live_connection(conn)?;
+    tokio::select! {
+        biased;
+        _ = conn.broken() => Err(anyhow!("AT-SPI connection closed or rejected an incoming message")),
+        output = operation => { ensure_live_connection(conn)?; Ok(output) },
+    }
 }
 
 pub async fn list_accessible_apps(limit: usize) -> Result<Vec<AccessibleAppSummary>> {
-    let conn = connect().await?;
-    let mut remaining_child_reads = limit;
-    let roots = registry_children(&conn, limit, &mut remaining_child_reads).await?;
-    let dbus = DBusProxy::new(conn.connection()).await.ok();
-    let mut apps = Vec::new();
+    list_accessible_apps_with_connection(limit, DISCOVERY_TIMEOUT, connect()).await
+}
 
-    for object_ref in roots.into_iter().take(limit) {
-        if let Ok(proxy) = open_accessible(&conn, &object_ref).await {
-            apps.push(read_app_summary(&proxy, &object_ref, dbus.as_ref()).await);
-        }
+// Keep completed summaries outside the timed future so cancellation retains
+// useful discovery results, including when the registry or a provider wedges.
+async fn list_accessible_apps_with_connection(
+    limit: usize,
+    deadline: Duration,
+    connection: impl Future<Output = Result<Connection>>,
+) -> Result<Vec<AccessibleAppSummary>> {
+    let limit = limit.min(MAX_DISCOVERY_ROOTS);
+    if limit == 0 {
+        return Ok(Vec::new());
     }
-
+    let mut apps = Vec::new();
+    let mut active_connection = None;
+    let result = timeout(deadline, async {
+        active_connection = Some(connection.await?);
+        let conn = active_connection.as_ref().unwrap();
+        let mut remaining_child_reads = limit;
+        let roots = with_live_connection(
+            conn,
+            registry_children(conn, limit, &mut remaining_child_reads),
+        )
+        .await??;
+        let dbus = DBusProxy::new(conn).await.ok();
+        for object_ref in roots.into_iter().take(limit) {
+            let summary = with_live_connection(
+                conn,
+                timeout(PROVIDER_TIMEOUT, async {
+                    let proxy = open_accessible(conn, &object_ref).await.ok()?;
+                    Some(read_app_summary(&proxy, &object_ref, dbus.as_ref()).await)
+                }),
+            )
+            .await?;
+            if let Ok(Some(summary)) = summary {
+                apps.push(summary);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    if let Some(conn) = &active_connection {
+        ensure_live_connection(conn)?;
+    }
+    match result {
+        Ok(result) => result?,
+        Err(_) if apps.is_empty() => {
+            return Err(anyhow!("AT-SPI discovery exceeded its deadline"));
+        }
+        Err(_) => {} // Best-effort: return summaries completed before the deadline.
+    }
     Ok(apps)
 }
 
@@ -272,8 +340,9 @@ pub(crate) struct AccessibilitySnapshot {
     /// when they were matched by app name alone or not filtered at all: those
     /// roots can belong to any app, so no single pid describes the tree.
     pub root_pid: Option<u32>,
-    /// True when max_nodes, max_depth, or the child read budget stopped
-    /// traversal with unread elements left. Failed element reads do not count.
+    /// True when node, depth, child-read, or retained-metadata budgets stopped
+    /// traversal with unread elements left, or the shared connection failed.
+    /// Ordinary failed element reads do not count.
     pub truncated: bool,
 }
 
@@ -320,23 +389,49 @@ async fn snapshot_tree_inner(
     max_depth: u32,
 ) -> Result<AccessibilitySnapshot> {
     let conn = connect().await?;
+    snapshot_tree_on_connection(
+        &conn,
+        app_name_or_bundle_identifier,
+        target_pid,
+        max_nodes,
+        max_depth,
+        MAX_SNAPSHOT_METADATA_BYTES,
+    )
+    .await
+}
+
+async fn snapshot_tree_on_connection(
+    conn: &Connection,
+    app_name_or_bundle_identifier: Option<&str>,
+    target_pid: Option<u32>,
+    max_nodes: usize,
+    max_depth: u32,
+    metadata_budget: usize,
+) -> Result<AccessibilitySnapshot> {
     // App discovery is bounded independently so a tiny requested tree still
     // finds a target registered after the first accessibility root.
     let (mut remaining_registry_reads, mut remaining_filter_reads, mut remaining_traversal_reads) =
         snapshot_child_read_budgets(max_nodes);
-    let roots =
-        registry_children(&conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
-    let selected_roots = select_roots(
-        &conn,
-        roots,
-        app_name_or_bundle_identifier,
-        target_pid,
-        &mut remaining_filter_reads,
+    let roots = with_live_connection(
+        conn,
+        registry_children(conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads),
     )
-    .await;
+    .await??;
+    let selected_roots = with_live_connection(
+        conn,
+        select_roots(
+            conn,
+            roots,
+            app_name_or_bundle_identifier,
+            target_pid,
+            &mut remaining_filter_reads,
+        ),
+    )
+    .await?;
     let scoped = selected_roots.scoped;
     let root_pid = selected_roots.pid;
     let mut nodes = Vec::new();
+    let mut remaining_metadata = metadata_budget;
     let mut truncated = false;
     let mut traversal = BoundedTraversal::new(max_nodes);
 
@@ -348,22 +443,52 @@ async fn snapshot_tree_inner(
     );
 
     while let Some((object_ref, depth, parent_index)) = traversal.pop() {
-        let Ok(proxy) = open_accessible(&conn, &object_ref).await else {
+        if conn.is_broken() {
+            truncated = true;
+            break;
+        }
+        let Ok(proxy) = open_accessible(conn, &object_ref).await else {
             continue;
         };
         let index = nodes.len() as u32;
+        let node = match with_live_connection(
+            conn,
+            read_node(&proxy, &object_ref, index, parent_index, depth),
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        };
+        let Some(remaining) = remaining_metadata.checked_sub(node_metadata_bytes(&node)) else {
+            truncated = true;
+            break;
+        };
+        remaining_metadata = remaining;
         let remaining = traversal.remaining_capacity();
-        let node = read_node(&proxy, &object_ref, index, parent_index, depth).await;
         let child_refs = if depth < max_depth && remaining > 0 {
-            match children_up_to(&proxy, remaining, &mut remaining_traversal_reads).await {
-                Ok(batch) => {
+            match with_live_connection(
+                conn,
+                children_up_to(&proxy, remaining, &mut remaining_traversal_reads),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => {
                     // A read-budget cut inside the fetch reports `incomplete`; an
                     // already-exhausted budget returns the I/O-free empty batch, so
                     // fall back to the child_count read_node already fetched.
                     truncated |= batch.incomplete || (batch.attempted == 0 && node.child_count > 0);
                     batch.items
                 }
-                Err(_) => Vec::new(),
+                Ok(Err(_)) => Vec::new(),
+                Err(_) => {
+                    truncated = true;
+                    nodes.push(node);
+                    break;
+                }
             }
         } else {
             // Depth or node cap reached: any child this node reports is unread.
@@ -379,7 +504,7 @@ async fn snapshot_tree_inner(
                 .map(|child| (child, depth + 1, Some(index))),
         );
     }
-    truncated |= traversal.truncated();
+    truncated |= traversal.truncated() || conn.is_broken();
 
     Ok(AccessibilitySnapshot {
         nodes,
@@ -449,12 +574,23 @@ async fn focused_element_probe(
     require_scoped: bool,
 ) -> Result<FocusProbe> {
     let conn = connect().await?;
+    with_live_connection(
+        &conn,
+        focused_element_probe_on_connection(&conn, target_pid, require_scoped),
+    )
+    .await?
+}
+
+async fn focused_element_probe_on_connection(
+    conn: &Connection,
+    target_pid: Option<u32>,
+    require_scoped: bool,
+) -> Result<FocusProbe> {
     let mut remaining_registry_reads = MAX_DISCOVERY_ROOTS;
-    let roots =
-        registry_children(&conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
+    let roots = registry_children(conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
     let mut remaining_filter_reads = MAX_DISCOVERY_CHILD_READS;
     let selected_roots =
-        select_roots(&conn, roots, None, target_pid, &mut remaining_filter_reads).await;
+        select_roots(conn, roots, None, target_pid, &mut remaining_filter_reads).await;
     if require_scoped && !selected_roots.scoped {
         return Ok(FocusProbe::NoAccessibleApp);
     }
@@ -470,7 +606,7 @@ async fn focused_element_probe(
     );
 
     while let Some((object_ref, depth)) = traversal.pop() {
-        let Ok(proxy) = open_accessible(&conn, &object_ref).await else {
+        let Ok(proxy) = open_accessible(conn, &object_ref).await else {
             continue;
         };
         let Ok(state) = proxy.get_state().await else {
@@ -534,26 +670,42 @@ async fn perform_action_inner(
     requested_action: Option<&str>,
     name_only: bool,
 ) -> Result<ActionInvocation> {
-    let conn = connect().await?;
+    let conn = connect_for_mutation().await?;
+    perform_action_on_connection(&conn, object_ref_id, requested_action, name_only).await
+}
+
+async fn perform_action_on_connection(
+    conn: &Connection,
+    object_ref_id: &str,
+    requested_action: Option<&str>,
+    name_only: bool,
+) -> Result<ActionInvocation> {
     let object_ref = object_ref_from_id(object_ref_id)?;
-    let proxy = open_accessible(&conn, &object_ref)
-        .await
-        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
-    let action = proxy
-        .proxies()
-        .await?
-        .action()
-        .await
-        .context("element does not expose the AT-SPI Action interface")?;
-    let actions = action.get_actions().await.unwrap_or_default();
-    let action_index = if name_only {
-        select_named_action_index(&actions, requested_action.unwrap_or_default())?
-    } else {
-        select_action_index(&actions, requested_action)?
-    };
-    let action_name = actions
-        .get(action_index as usize)
-        .map(|action| action.name.clone());
+    let (action, action_index, action_name) = timeout(DISCOVERY_TIMEOUT, async {
+        let proxy = open_accessible(conn, &object_ref)
+            .await
+            .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+        let action = proxy
+            .proxies()
+            .await?
+            .action()
+            .await
+            .context("element does not expose the AT-SPI Action interface")?;
+        let actions = read_actions(&action).await?;
+        let action_index = if name_only {
+            select_named_action_index(&actions, requested_action.unwrap_or_default())?
+        } else {
+            select_action_index(&actions, requested_action)?
+        };
+        let action_name = actions
+            .get(action_index as usize)
+            .map(|action| action.name.clone());
+        Ok::<_, anyhow::Error>((action, action_index, action_name))
+    })
+    .await
+    .context("AT-SPI action metadata exceeded its deadline")??;
+    // Once sent, a mutation may finish after an observation deadline. Preserve
+    // its completion/error semantics instead of releasing the input lock early.
     let ok = action
         .do_action(action_index)
         .await
@@ -567,12 +719,24 @@ async fn perform_action_inner(
 }
 
 pub async fn set_element_value(object_ref_id: &str, value: &str) -> Result<ValueSetInvocation> {
-    let conn = connect().await?;
+    let conn = connect_for_mutation().await?;
+    set_element_value_on_connection(&conn, object_ref_id, value).await
+}
+
+async fn set_element_value_on_connection(
+    conn: &Connection,
+    object_ref_id: &str,
+    value: &str,
+) -> Result<ValueSetInvocation> {
     let object_ref = object_ref_from_id(object_ref_id)?;
-    let proxy = open_accessible(&conn, &object_ref)
-        .await
-        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
-    let proxies = proxy.proxies().await?;
+    let proxies = timeout(DISCOVERY_TIMEOUT, async {
+        let proxy = open_accessible(conn, &object_ref)
+            .await
+            .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+        proxy.proxies().await.map_err(anyhow::Error::from)
+    })
+    .await
+    .context("AT-SPI value metadata exceeded its deadline")??;
 
     if let Ok(numeric_value) = value.parse::<f64>() {
         if let Ok(value_proxy) = proxies.value().await {
@@ -610,9 +774,16 @@ pub async fn set_element_value(object_ref_id: &str, value: &str) -> Result<Value
     ))
 }
 
-async fn connect() -> Result<AccessibilityConnection> {
+async fn connect() -> Result<Connection> {
     hydrate_session_bus_env();
-    AccessibilityConnection::new()
+    crate::atspi_transport::connect()
+        .await
+        .context("failed to connect to AT-SPI bus")
+}
+
+async fn connect_for_mutation() -> Result<Connection> {
+    hydrate_session_bus_env();
+    crate::atspi_transport::connect_for_mutation()
         .await
         .context("failed to connect to AT-SPI bus")
 }
@@ -624,19 +795,21 @@ async fn connect() -> Result<AccessibilityConnection> {
 /// constructs a path-only proxy, so applications without P2P support remain
 /// addressable and unrelated confined peers cannot abort connection setup.
 async fn open_accessible<'r>(
-    conn: &AccessibilityConnection,
+    conn: &Connection,
     object_ref: &'r ObjectRefOwned,
 ) -> Result<AccessibleProxy<'r>, zbus::Error> {
-    object_ref.as_accessible_proxy(conn.connection()).await
+    object_ref.as_accessible_proxy(conn).await
 }
 
 async fn registry_children(
-    conn: &AccessibilityConnection,
+    conn: &Connection,
     limit: usize,
     remaining_child_reads: &mut usize,
 ) -> Result<Vec<ObjectRefOwned>> {
-    let root = conn
-        .root_accessible_on_registry()
+    let root = AccessibleProxy::builder(conn)
+        .destination("org.a11y.atspi.Registry")
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
         .await
         .context("failed to open AT-SPI registry root")?;
     let batch = children_up_to(&root, limit, remaining_child_reads)
@@ -667,14 +840,14 @@ fn app_name_needle(app_name_or_bundle_identifier: Option<&str>) -> Option<String
 }
 
 async fn select_roots(
-    conn: &AccessibilityConnection,
+    conn: &Connection,
     roots: Vec<ObjectRefOwned>,
     app_name_or_bundle_identifier: Option<&str>,
     target_pid: Option<u32>,
     remaining_child_reads: &mut usize,
 ) -> SelectedRoots {
     let needle = app_name_needle(app_name_or_bundle_identifier);
-    let dbus = DBusProxy::new(conn.connection()).await.ok();
+    let dbus = DBusProxy::new(conn).await.ok();
     let mut remaining = roots;
 
     if let Some(target_pid) = target_pid {
@@ -739,7 +912,7 @@ async fn select_roots(
 }
 
 async fn root_matches(
-    conn: &AccessibilityConnection,
+    conn: &Connection,
     object_ref: &ObjectRefOwned,
     needle: &str,
     remaining_child_reads: &mut usize,
@@ -775,8 +948,8 @@ async fn proxy_matches(
     object_ref: &ObjectRefOwned,
     needle: &str,
 ) -> bool {
-    let name = proxy.name().await.unwrap_or_default();
-    let role = proxy.get_role_name().await.unwrap_or_default();
+    let name = optional_string(proxy.name().await.ok()).unwrap_or_default();
+    let role = optional_string(proxy.get_role_name().await.ok()).unwrap_or_default();
     format!("{} {} {}", object_ref_id(object_ref), name, role)
         .to_ascii_lowercase()
         .contains(needle)
@@ -824,9 +997,34 @@ async fn read_node(
     }
 }
 
+// A node cap alone still permits thousands of individually valid large replies.
+// Charge retained metadata before adding the node to the snapshot or its cache.
+fn node_metadata_bytes(node: &AccessibilityNode) -> usize {
+    let mut bytes = node.object_ref.len() + node.role.len();
+    bytes += node.name.as_ref().map_or(0, String::len);
+    bytes += node.description.as_ref().map_or(0, String::len);
+    bytes += node.states.iter().map(String::len).sum::<usize>();
+    bytes += node
+        .actions
+        .iter()
+        .map(|action| action.name.len() + action.description.len() + action.keybinding.len())
+        .sum::<usize>();
+    bytes += node
+        .value
+        .as_ref()
+        .and_then(|value| value.text.as_ref())
+        .map_or(0, String::len);
+    bytes += node
+        .text
+        .as_ref()
+        .and_then(|text| text.content.as_ref())
+        .map_or(0, String::len);
+    bytes
+}
+
 async fn role_name(proxy: &AccessibleProxy<'_>) -> String {
     if let Ok(role) = proxy.get_role_name().await {
-        if !role.trim().is_empty() {
+        if role.len() <= MAX_METADATA_BYTES && !role.trim().is_empty() {
             return role;
         }
     }
@@ -846,7 +1044,7 @@ async fn bounds(proxy: &AccessibleProxy<'_>) -> Option<Bounds> {
 pub(crate) async fn object_ref_owner_pid(object_ref_id: &str) -> Result<Option<u32>> {
     let object_ref = object_ref_from_id(object_ref_id)?;
     let conn = connect().await?;
-    let dbus = DBusProxy::new(conn.connection()).await.ok();
+    let dbus = DBusProxy::new(&conn).await.ok();
     Ok(object_ref_pid(dbus.as_ref(), &object_ref).await)
 }
 
@@ -895,8 +1093,7 @@ async fn actions_from_proxies(proxies: Option<&Proxies<'_>>) -> Vec<Accessibilit
         return Vec::new();
     };
 
-    action_proxy
-        .get_actions()
+    read_actions(&action_proxy)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -908,6 +1105,25 @@ async fn actions_from_proxies(proxies: Option<&Proxies<'_>>) -> Vec<Accessibilit
             keybinding: action.keybinding,
         })
         .collect()
+}
+
+// Use the same complete collection for observation and action revalidation.
+// Reject excess metadata instead of truncating names or changing action indices.
+async fn read_actions(proxy: &atspi::ActionInterfaceProxy<'_>) -> Result<Vec<atspi::Action>> {
+    validate_actions(proxy.get_actions().await?)
+}
+
+fn validate_actions(actions: Vec<atspi::Action>) -> Result<Vec<atspi::Action>> {
+    if actions.len() > MAX_ACTIONS
+        || actions.iter().any(|action| {
+            [&action.name, &action.description, &action.keybinding]
+                .iter()
+                .any(|value| value.len() > MAX_METADATA_BYTES)
+        })
+    {
+        return Err(anyhow!("AT-SPI action metadata exceeds its size budget"));
+    }
+    Ok(actions)
 }
 
 async fn states_from_proxy(proxy: &AccessibleProxy<'_>) -> Vec<String> {
@@ -935,10 +1151,14 @@ async fn text_from_proxies(proxies: Option<&Proxies<'_>>) -> Option<Accessibilit
     let caret_offset = text.caret_offset().await.ok();
     let capped_count = character_count.min(MAX_TEXT_READBACK_CHARS);
     let content = if capped_count > 0 {
-        optional_string(text.get_text(0, capped_count).await.ok())
+        text.get_text(0, capped_count).await.ok()
     } else {
         None
     };
+    let oversized_content = content
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_TEXT_READBACK_CHARS as usize);
+    let content = bounded_text(content);
     let selection_count = text
         .get_nselections()
         .await
@@ -958,7 +1178,7 @@ async fn text_from_proxies(proxies: Option<&Proxies<'_>>) -> Option<Accessibilit
         character_count,
         caret_offset,
         content,
-        truncated: character_count > MAX_TEXT_READBACK_CHARS,
+        truncated: character_count > MAX_TEXT_READBACK_CHARS || oversized_content,
         selections,
     })
 }
@@ -1022,8 +1242,21 @@ fn select_named_action_index(actions: &[atspi::Action], name: &str) -> Result<i3
 
 fn optional_string(value: Option<String>) -> Option<String> {
     value
+        .filter(|value| value.len() <= MAX_METADATA_BYTES)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn bounded_text(value: Option<String>) -> Option<String> {
+    value
+        .filter(|value| value.chars().count() <= MAX_TEXT_READBACK_CHARS as usize)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_object_ref_metadata(object_ref: &ObjectRefOwned) -> bool {
+    object_ref.name_as_str().unwrap_or_default().len() + object_ref.path_as_str().len()
+        <= MAX_METADATA_BYTES
 }
 
 fn object_ref_from_id(object_ref_id: &str) -> Result<ObjectRefOwned> {
@@ -1263,5 +1496,463 @@ mod tests {
         let all_failed =
             fetch_indexed_up_to(2, 2, &mut failed_attempts, |_| async { Err::<i32, _>(()) }).await;
         assert!(all_failed.all_failed());
+    }
+
+    struct MockBus;
+
+    #[zbus::interface(name = "org.freedesktop.DBus")]
+    impl MockBus {
+        #[zbus(name = "GetConnectionUnixProcessID")]
+        fn get_connection_unix_process_id(&self, _name: &str) -> u32 {
+            std::process::id()
+        }
+    }
+
+    struct MockAccessible {
+        name: String,
+        stalled: bool,
+        children: Vec<ObjectRefOwned>,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl MockAccessible {
+        #[zbus(property)]
+        async fn name(&self) -> &str {
+            if self.stalled {
+                futures_util::future::pending::<()>().await;
+            }
+            &self.name
+        }
+
+        #[zbus(property)]
+        fn child_count(&self) -> i32 {
+            self.children.len() as i32
+        }
+
+        fn get_child_at_index(&self, index: i32) -> (String, zbus::OwnedObjectPath) {
+            let child = &self.children[index as usize];
+            (
+                child.name_as_str().unwrap().to_owned(),
+                zbus::OwnedObjectPath::try_from(child.path_as_str().to_owned()).unwrap(),
+            )
+        }
+
+        fn get_role_name(&self) -> &str {
+            "application"
+        }
+
+        fn get_interfaces(&self) -> Vec<&str> {
+            vec!["org.a11y.atspi.Accessible"]
+        }
+    }
+
+    async fn mock_registry(apps: &[(&str, bool)]) -> (zbus::Connection, Connection) {
+        mock_registry_on_pair(
+            apps,
+            crate::atspi_transport::test_connection_pair()
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn mock_registry_on_pair(
+        apps: &[(&str, bool)],
+        pair: (zbus::Connection, Connection),
+    ) -> (zbus::Connection, Connection) {
+        let (service, client) = pair;
+        service
+            .object_server()
+            .at("/org/freedesktop/DBus", MockBus)
+            .await
+            .unwrap();
+        let mut children = Vec::new();
+        for (index, (name, stalled)) in apps.iter().enumerate() {
+            let path = format!("/org/a11y/atspi/accessible/app{index}");
+            children.push(ObjectRefOwned::new(
+                service.unique_name().unwrap().clone().into(),
+                ObjectPath::try_from(path.clone()).unwrap(),
+            ));
+            service
+                .object_server()
+                .at(
+                    path,
+                    MockAccessible {
+                        name: (*name).to_string(),
+                        stalled: *stalled,
+                        children: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        service
+            .object_server()
+            .at(
+                "/org/a11y/atspi/accessible/root",
+                MockAccessible {
+                    name: "registry".to_string(),
+                    stalled: false,
+                    children,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .request_name("org.a11y.atspi.Registry")
+            .await
+            .unwrap();
+        service.request_name("org.freedesktop.DBus").await.unwrap();
+        (service, client)
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_includes_connect_and_zero_limit_stays_io_free() {
+        let started = tokio::time::Instant::now();
+        let result = list_accessible_apps_with_connection(
+            50,
+            Duration::from_millis(30),
+            futures_util::future::pending(),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let empty = list_accessible_apps_with_connection(
+            0,
+            Duration::from_millis(30),
+            futures_util::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_skips_stalled_provider_and_preserves_healthy_app() {
+        let (_service, conn) = mock_registry(&[("wedged", true), ("Calculator", false)]).await;
+        let started = tokio::time::Instant::now();
+        let apps = list_accessible_apps_with_connection(50, DISCOVERY_TIMEOUT, async { Ok(conn) })
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name.as_deref(), Some("Calculator"));
+        assert_eq!(apps[0].role, "application");
+        assert_eq!(apps[0].pid, Some(std::process::id()));
+        assert!(apps[0].object_ref.ends_with("/app1"));
+    }
+
+    #[tokio::test]
+    async fn discovery_total_deadline_returns_completed_summaries() {
+        let (_service, conn) =
+            mock_registry(&[("Calculator", false), ("wedged1", true), ("wedged2", true)]).await;
+        let started = tokio::time::Instant::now();
+        let apps = list_accessible_apps_with_connection(50, Duration::from_millis(450), async {
+            Ok(conn)
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name.as_deref(), Some("Calculator"));
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_oversized_metadata_without_truncating_identity() {
+        let oversized = "x".repeat(MAX_METADATA_BYTES + 1);
+        let (_service, conn) = mock_registry(&[(&oversized, false), ("Calculator", false)]).await;
+        let apps = list_accessible_apps_with_connection(50, DISCOVERY_TIMEOUT, async { Ok(conn) })
+            .await
+            .unwrap();
+        assert_eq!(apps.len(), 2);
+        assert!(apps[0].name.is_none());
+        assert_eq!(apps[1].name.as_deref(), Some("Calculator"));
+        let json = serde_json::to_string(&apps).unwrap();
+        assert!(!json.contains(&oversized));
+    }
+
+    struct MockActions(Vec<atspi::Action>);
+
+    #[zbus::interface(name = "org.a11y.atspi.Action")]
+    impl MockActions {
+        fn get_actions(&self) -> Vec<atspi::Action> {
+            self.0.clone()
+        }
+
+        async fn do_action(&self, index: i32) -> bool {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            index == 0
+        }
+    }
+
+    fn mock_action(name: &str) -> atspi::Action {
+        atspi::Action {
+            name: name.to_string(),
+            description: "Clicks".to_string(),
+            keybinding: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn action_reader_rejects_excess_count_and_metadata_and_preserves_names() {
+        let (service, conn) = crate::atspi_transport::test_connection_pair()
+            .await
+            .unwrap();
+        service
+            .object_server()
+            .at(
+                "/actions",
+                MockActions(vec![mock_action("click"); MAX_ACTIONS + 1]),
+            )
+            .await
+            .unwrap();
+        let proxy = atspi::ActionInterfaceProxy::builder(&conn)
+            .destination(service.unique_name().unwrap())
+            .path("/actions")
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        assert!(read_actions(&proxy).await.is_err());
+        let iface = service
+            .object_server()
+            .interface::<_, MockActions>("/actions")
+            .await
+            .unwrap();
+        iface.get_mut().await.0 = vec![mock_action(&"x".repeat(MAX_METADATA_BYTES + 1))];
+        assert!(read_actions(&proxy).await.is_err());
+        iface.get_mut().await.0 = vec![mock_action("click"); MAX_ACTIONS];
+        let actions = read_actions(&proxy).await.unwrap();
+        assert_eq!(actions.len(), MAX_ACTIONS);
+        assert_eq!(select_named_action_index(&actions, "click").unwrap(), 0);
+        assert_eq!(actions[0].description, "Clicks");
+    }
+
+    #[test]
+    fn metadata_and_text_budgets_preserve_utf8_and_reject_instead_of_truncate() {
+        assert_eq!(
+            optional_string(Some(" Calculator ".into())).as_deref(),
+            Some("Calculator")
+        );
+        assert!(optional_string(Some("x".repeat(MAX_METADATA_BYTES + 1))).is_none());
+        let unicode = "🦀".repeat(MAX_TEXT_READBACK_CHARS as usize);
+        assert_eq!(bounded_text(Some(unicode.clone())), Some(unicode));
+        assert!(bounded_text(Some("🦀".repeat(MAX_TEXT_READBACK_CHARS as usize + 1))).is_none());
+        let object =
+            object_ref_from_id(&format!(":1.42/{}", "x".repeat(MAX_METADATA_BYTES))).unwrap();
+        assert!(!valid_object_ref_metadata(&object));
+        let object = object_ref_from_id(":1.42/org/a11y/atspi/accessible/7").unwrap();
+        assert!(valid_object_ref_metadata(&object));
+    }
+
+    #[tokio::test]
+    async fn snapshot_metadata_budget_stops_retention_and_reports_partial_tree() {
+        let (_service, conn) = mock_registry(&[("Calculator", false), ("Terminal", false)]).await;
+        let snapshot = snapshot_tree_on_connection(&conn, None, None, 10, 4, 100)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].name.as_deref(), Some("Calculator"));
+        assert!(snapshot.truncated);
+        let complete =
+            snapshot_tree_on_connection(&conn, None, None, 10, 4, MAX_SNAPSHOT_METADATA_BYTES)
+                .await
+                .unwrap();
+        assert_eq!(complete.nodes.len(), 2);
+        assert!(!complete.truncated);
+    }
+
+    // No method timeout: completion must come from the read-failure signal,
+    // rather than waiting for another call on a connection without a reader.
+    #[tokio::test]
+    async fn oversized_provider_frame_returns_explicit_discovery_error() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(
+            &[
+                ("Calculator", false),
+                (&oversized, false),
+                ("Terminal", false),
+            ],
+            pair,
+        )
+        .await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            list_accessible_apps_with_connection(50, DISCOVERY_TIMEOUT, async { Ok(conn) }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_frame_preserves_completed_nodes_and_marks_truncation() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(
+            &[
+                ("Calculator", false),
+                (&oversized, false),
+                ("Terminal", false),
+            ],
+            pair,
+        )
+        .await;
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(2),
+            snapshot_tree_on_connection(&conn, None, None, 10, 4, MAX_SNAPSHOT_METADATA_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].name.as_deref(), Some("Calculator"));
+    }
+
+    #[tokio::test]
+    async fn root_filter_transport_failure_is_not_reported_as_no_match() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(&[(&oversized, false)], pair).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            snapshot_tree_on_connection(
+                &conn,
+                Some("Calculator"),
+                None,
+                10,
+                4,
+                MAX_SNAPSHOT_METADATA_BYTES,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn peer_disconnection_is_not_reported_as_absent_focus() {
+        let (service, conn) = mock_registry(&[("Calculator", false)]).await;
+        service.close().await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            with_live_connection(
+                &conn,
+                focused_element_probe_on_connection(&conn, Some(42), true),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    struct StalledRegistry;
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl StalledRegistry {
+        #[zbus(property)]
+        async fn child_count(&self) -> i32 {
+            futures_util::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_also_covers_registry_reads() {
+        let (service, conn) = mock_registry(&[]).await;
+        service
+            .object_server()
+            .remove::<MockAccessible, _>("/org/a11y/atspi/accessible/root")
+            .await
+            .unwrap();
+        service
+            .object_server()
+            .at("/org/a11y/atspi/accessible/root", StalledRegistry)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let result =
+            list_accessible_apps_with_connection(50, Duration::from_millis(30), async { Ok(conn) })
+                .await;
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    struct MutationInterfaces;
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl MutationInterfaces {
+        fn get_interfaces(&self) -> Vec<&str> {
+            vec![
+                "org.a11y.atspi.Accessible",
+                "org.a11y.atspi.Action",
+                "org.a11y.atspi.Value",
+            ]
+        }
+    }
+
+    struct MockValue(std::sync::Arc<std::sync::Mutex<f64>>);
+
+    #[zbus::interface(name = "org.a11y.atspi.Value")]
+    impl MockValue {
+        #[zbus(property)]
+        fn current_value(&self) -> f64 {
+            *self.0.lock().unwrap()
+        }
+
+        #[zbus(property)]
+        async fn set_current_value(&mut self, value: f64) {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            *self.0.lock().unwrap() = value;
+        }
+    }
+
+    #[tokio::test]
+    async fn mutations_wait_for_completion_beyond_the_observation_method_deadline() {
+        let (service, conn) = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        service
+            .object_server()
+            .at("/actions", MutationInterfaces)
+            .await
+            .unwrap();
+        service
+            .object_server()
+            .at("/actions", MockActions(vec![mock_action("click")]))
+            .await
+            .unwrap();
+        let value = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        service
+            .object_server()
+            .at("/actions", MockValue(value.clone()))
+            .await
+            .unwrap();
+        let object_ref = format!("{}/actions", service.unique_name().unwrap());
+        let started = tokio::time::Instant::now();
+        let action = perform_action_on_connection(&conn, &object_ref, Some("click"), true)
+            .await
+            .unwrap();
+        assert!(action.ok);
+        assert_eq!(action.action_name.as_deref(), Some("click"));
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        let result = set_element_value_on_connection(&conn, &object_ref, "42")
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ValueSetInvocation::Numeric { value: 42.0 }
+        ));
+        assert_eq!(*value.lock().unwrap(), 42.0);
     }
 }

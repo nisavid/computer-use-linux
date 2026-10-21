@@ -30,12 +30,13 @@ futures-util = "0.3.32"
 getrandom = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+rustix = { version = "1.1", features = ["net"] }
 rmcp = { version = "2.1.0", features = ["transport-io"] }
 schemars = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
-tokio = { version = "1.51.1", features = ["io-util", "macros", "process", "rt", "signal", "sync", "time"] }
+tokio = { version = "1.51.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
@@ -43,7 +44,11 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # origins for the EWMH backend (wmctrl -lG counts the frame offset twice, #157).
 x11rb = "0.14"
 xkeysym = "0.2.1"
-zbus = { version = "6.0.0", default-features = false, features = ["tokio", "proxy", "service"] }
+zbus = { version = "6.0.0", default-features = false, features = ["tokio", "proxy", "service", "unixexec", "ibus"] }
+
+# In-memory authenticated D-Bus fixtures; production AT-SPI routing stays on the bus.
+[dev-dependencies]
+zbus = { version = "6.0.0", default-features = false, features = ["tokio", "proxy", "service", "bus-impl"] }
 
 [profile.release]
 codegen-units = 1

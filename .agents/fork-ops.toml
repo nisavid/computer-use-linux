@@ -135,6 +135,26 @@ domain = "validation"
 portability_hint = "fork-specific"
 notes = "The zbus 6 migration removes the standalone-crate retirement exceptions; pre-existing build-only quick-xml exceptions remain."
 
+[[local_surfaces]]
+kind = "other"
+path = "src/atspi_tree.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Bounded AT-SPI discovery and provider metadata."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/atspi_transport.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Incoming AT-SPI D-Bus frame allocation budget."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/lib.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Private AT-SPI transport module registration."
 
 [[local_surfaces]]
 kind = "other"

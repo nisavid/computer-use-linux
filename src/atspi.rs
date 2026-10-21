@@ -15,7 +15,9 @@ pub(crate) use roles::Role;
 include!("atspi/state_names.rs");
 
 const NULL_PATH: &str = "/org/a11y/atspi/null";
+#[cfg(test)]
 const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+#[cfg(test)]
 const REGISTRY_NAME: &str = "org.a11y.atspi.Registry";
 const ACTIVATE_EVENT: &str = "window:activate";
 const ACTIVATE_MATCH: &str =
@@ -227,7 +229,7 @@ impl<'a> Proxies<'a> {
     default_service = "org.a11y.Bus",
     default_path = "/org/a11y/bus"
 )]
-trait Bus {
+pub(crate) trait Bus {
     fn get_address(&self) -> zbus::Result<String>;
 }
 
@@ -254,9 +256,11 @@ impl AccessibilityConnection {
         let connection = zbus::connection::Builder::address(address).build().await?;
         Ok(Self { connection })
     }
+    #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
+    #[cfg(test)]
     pub(crate) async fn root_accessible_on_registry(
         &self,
     ) -> zbus::Result<AccessibleProxy<'static>> {
