@@ -116,6 +116,21 @@ class AuditPolicyTests(unittest.TestCase):
             ):
                 self.assertEqual(audit.main(), 1)
 
+    def test_main_accepts_reviewed_notices_from_the_strict_audit_command(self):
+        result = subprocess.CompletedProcess([], 1, json.dumps(report()), "")
+        with (
+            patch.object(audit, "EXPIRES", dt.date.max),
+            patch.object(audit.subprocess, "run", return_value=result) as run,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(audit.main(), 0)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["cargo", "audit", "--json", "--deny", "warnings"],
+        )
+        self.assertFalse(run.call_args.kwargs["check"])
+
 
 if __name__ == "__main__":
     unittest.main()
