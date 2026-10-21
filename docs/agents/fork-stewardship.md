@@ -20,7 +20,8 @@ and drift-monitoring infrastructure:
 - `AGENTS.md`
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
-- a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
+- a weekly `schedule` trigger, immutable action pins, and disabled checkout
+  credential persistence in upstream's `.github/workflows/ci.yml`
 
 The fork also carries development dependency integrity enforcement:
 

@@ -94,7 +94,7 @@ kind = "other"
 path = ".github/workflows/ci.yml"
 domain = "validation"
 portability_hint = "fork-specific"
-notes = "Upstream-owned. The fork carries a weekly schedule trigger that catches stable-toolchain rot on main and Pi dependency integrity checks before installation."
+notes = "Upstream-owned. The fork carries a weekly schedule trigger that catches stable-toolchain rot on main, Pi dependency integrity checks before installation, immutable action pins, and disabled checkout credential persistence throughout the CI/release workflow."
 
 [[local_surfaces]]
 kind = "other"
