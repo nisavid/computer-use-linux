@@ -2,12 +2,12 @@ use crate::atspi::{self, AccessibleProxy, ObjectRefOwned, Proxies, StateSet};
 use crate::diagnostics::hydrate_session_bus_env;
 use anyhow::{anyhow, Context, Result};
 
+use crate::atspi_transport::BoundedConnection as Connection;
 use futures_util::{stream, StreamExt};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::{collections::VecDeque, future::Future, time::Duration};
 use tokio::time::timeout;
-use zbus::Connection;
 use zbus::{
     fdo::DBusProxy,
     names::{BusName, UniqueName},
@@ -254,6 +254,27 @@ async fn children_up_to(
     Ok(batch)
 }
 
+fn ensure_live_connection(conn: &Connection) -> Result<()> {
+    if conn.is_broken() {
+        return Err(anyhow!(
+            "AT-SPI connection closed or rejected an incoming message"
+        ));
+    }
+    Ok(())
+}
+
+async fn with_live_connection<T>(
+    conn: &Connection,
+    operation: impl Future<Output = T>,
+) -> Result<T> {
+    ensure_live_connection(conn)?;
+    tokio::select! {
+        biased;
+        _ = conn.broken() => Err(anyhow!("AT-SPI connection closed or rejected an incoming message")),
+        output = operation => { ensure_live_connection(conn)?; Ok(output) },
+    }
+}
+
 pub async fn list_accessible_apps(limit: usize) -> Result<Vec<AccessibleAppSummary>> {
     list_accessible_apps_with_connection(limit, DISCOVERY_TIMEOUT, connect()).await
 }
@@ -270,17 +291,26 @@ async fn list_accessible_apps_with_connection(
         return Ok(Vec::new());
     }
     let mut apps = Vec::new();
+    let mut active_connection = None;
     let result = timeout(deadline, async {
-        let conn = connection.await?;
+        active_connection = Some(connection.await?);
+        let conn = active_connection.as_ref().unwrap();
         let mut remaining_child_reads = limit;
-        let roots = registry_children(&conn, limit, &mut remaining_child_reads).await?;
-        let dbus = DBusProxy::new(&conn).await.ok();
+        let roots = with_live_connection(
+            conn,
+            registry_children(conn, limit, &mut remaining_child_reads),
+        )
+        .await??;
+        let dbus = DBusProxy::new(conn).await.ok();
         for object_ref in roots.into_iter().take(limit) {
-            let summary = timeout(PROVIDER_TIMEOUT, async {
-                let proxy = open_accessible(&conn, &object_ref).await.ok()?;
-                Some(read_app_summary(&proxy, &object_ref, dbus.as_ref()).await)
-            })
-            .await;
+            let summary = with_live_connection(
+                conn,
+                timeout(PROVIDER_TIMEOUT, async {
+                    let proxy = open_accessible(conn, &object_ref).await.ok()?;
+                    Some(read_app_summary(&proxy, &object_ref, dbus.as_ref()).await)
+                }),
+            )
+            .await?;
             if let Ok(Some(summary)) = summary {
                 apps.push(summary);
             }
@@ -288,6 +318,9 @@ async fn list_accessible_apps_with_connection(
         Ok::<_, anyhow::Error>(())
     })
     .await;
+    if let Some(conn) = &active_connection {
+        ensure_live_connection(conn)?;
+    }
     match result {
         Ok(result) => result?,
         Err(_) if apps.is_empty() => {
@@ -308,7 +341,8 @@ pub(crate) struct AccessibilitySnapshot {
     /// roots can belong to any app, so no single pid describes the tree.
     pub root_pid: Option<u32>,
     /// True when node, depth, child-read, or retained-metadata budgets stopped
-    /// traversal with unread elements left. Failed element reads do not count.
+    /// traversal with unread elements left, or the shared connection failed.
+    /// Ordinary failed element reads do not count.
     pub truncated: bool,
 }
 
@@ -378,15 +412,22 @@ async fn snapshot_tree_on_connection(
     // finds a target registered after the first accessibility root.
     let (mut remaining_registry_reads, mut remaining_filter_reads, mut remaining_traversal_reads) =
         snapshot_child_read_budgets(max_nodes);
-    let roots = registry_children(conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
-    let selected_roots = select_roots(
+    let roots = with_live_connection(
         conn,
-        roots,
-        app_name_or_bundle_identifier,
-        target_pid,
-        &mut remaining_filter_reads,
+        registry_children(conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads),
     )
-    .await;
+    .await??;
+    let selected_roots = with_live_connection(
+        conn,
+        select_roots(
+            conn,
+            roots,
+            app_name_or_bundle_identifier,
+            target_pid,
+            &mut remaining_filter_reads,
+        ),
+    )
+    .await?;
     let scoped = selected_roots.scoped;
     let root_pid = selected_roots.pid;
     let mut nodes = Vec::new();
@@ -402,11 +443,26 @@ async fn snapshot_tree_on_connection(
     );
 
     while let Some((object_ref, depth, parent_index)) = traversal.pop() {
+        if conn.is_broken() {
+            truncated = true;
+            break;
+        }
         let Ok(proxy) = open_accessible(conn, &object_ref).await else {
             continue;
         };
         let index = nodes.len() as u32;
-        let node = read_node(&proxy, &object_ref, index, parent_index, depth).await;
+        let node = match with_live_connection(
+            conn,
+            read_node(&proxy, &object_ref, index, parent_index, depth),
+        )
+        .await
+        {
+            Ok(node) => node,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        };
         let Some(remaining) = remaining_metadata.checked_sub(node_metadata_bytes(&node)) else {
             truncated = true;
             break;
@@ -414,15 +470,25 @@ async fn snapshot_tree_on_connection(
         remaining_metadata = remaining;
         let remaining = traversal.remaining_capacity();
         let child_refs = if depth < max_depth && remaining > 0 {
-            match children_up_to(&proxy, remaining, &mut remaining_traversal_reads).await {
-                Ok(batch) => {
+            match with_live_connection(
+                conn,
+                children_up_to(&proxy, remaining, &mut remaining_traversal_reads),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => {
                     // A read-budget cut inside the fetch reports `incomplete`; an
                     // already-exhausted budget returns the I/O-free empty batch, so
                     // fall back to the child_count read_node already fetched.
                     truncated |= batch.incomplete || (batch.attempted == 0 && node.child_count > 0);
                     batch.items
                 }
-                Err(_) => Vec::new(),
+                Ok(Err(_)) => Vec::new(),
+                Err(_) => {
+                    truncated = true;
+                    nodes.push(node);
+                    break;
+                }
             }
         } else {
             // Depth or node cap reached: any child this node reports is unread.
@@ -438,7 +504,7 @@ async fn snapshot_tree_on_connection(
                 .map(|child| (child, depth + 1, Some(index))),
         );
     }
-    truncated |= traversal.truncated();
+    truncated |= traversal.truncated() || conn.is_broken();
 
     Ok(AccessibilitySnapshot {
         nodes,
@@ -508,12 +574,23 @@ async fn focused_element_probe(
     require_scoped: bool,
 ) -> Result<FocusProbe> {
     let conn = connect().await?;
+    with_live_connection(
+        &conn,
+        focused_element_probe_on_connection(&conn, target_pid, require_scoped),
+    )
+    .await?
+}
+
+async fn focused_element_probe_on_connection(
+    conn: &Connection,
+    target_pid: Option<u32>,
+    require_scoped: bool,
+) -> Result<FocusProbe> {
     let mut remaining_registry_reads = MAX_DISCOVERY_ROOTS;
-    let roots =
-        registry_children(&conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
+    let roots = registry_children(conn, MAX_DISCOVERY_ROOTS, &mut remaining_registry_reads).await?;
     let mut remaining_filter_reads = MAX_DISCOVERY_CHILD_READS;
     let selected_roots =
-        select_roots(&conn, roots, None, target_pid, &mut remaining_filter_reads).await;
+        select_roots(conn, roots, None, target_pid, &mut remaining_filter_reads).await;
     if require_scoped && !selected_roots.scoped {
         return Ok(FocusProbe::NoAccessibleApp);
     }
@@ -529,7 +606,7 @@ async fn focused_element_probe(
     );
 
     while let Some((object_ref, depth)) = traversal.pop() {
-        let Ok(proxy) = open_accessible(&conn, &object_ref).await else {
+        let Ok(proxy) = open_accessible(conn, &object_ref).await else {
             continue;
         };
         let Ok(state) = proxy.get_state().await else {
@@ -1469,10 +1546,21 @@ mod tests {
         }
     }
 
-    async fn mock_registry(apps: &[(&str, bool)]) -> (Connection, Connection) {
-        let (service, client) = crate::atspi_transport::test_connection_pair()
-            .await
-            .unwrap();
+    async fn mock_registry(apps: &[(&str, bool)]) -> (zbus::Connection, Connection) {
+        mock_registry_on_pair(
+            apps,
+            crate::atspi_transport::test_connection_pair()
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn mock_registry_on_pair(
+        apps: &[(&str, bool)],
+        pair: (zbus::Connection, Connection),
+    ) -> (zbus::Connection, Connection) {
+        let (service, client) = pair;
         service
             .object_server()
             .at("/org/freedesktop/DBus", MockBus)
@@ -1672,6 +1760,101 @@ mod tests {
                 .unwrap();
         assert_eq!(complete.nodes.len(), 2);
         assert!(!complete.truncated);
+    }
+
+    // No method timeout: completion must come from the read-failure signal,
+    // rather than waiting for another call on a connection without a reader.
+    #[tokio::test]
+    async fn oversized_provider_frame_returns_explicit_discovery_error() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(
+            &[
+                ("Calculator", false),
+                (&oversized, false),
+                ("Terminal", false),
+            ],
+            pair,
+        )
+        .await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            list_accessible_apps_with_connection(50, DISCOVERY_TIMEOUT, async { Ok(conn) }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_frame_preserves_completed_nodes_and_marks_truncation() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(
+            &[
+                ("Calculator", false),
+                (&oversized, false),
+                ("Terminal", false),
+            ],
+            pair,
+        )
+        .await;
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(2),
+            snapshot_tree_on_connection(&conn, None, None, 10, 4, MAX_SNAPSHOT_METADATA_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].name.as_deref(), Some("Calculator"));
+    }
+
+    #[tokio::test]
+    async fn root_filter_transport_failure_is_not_reported_as_no_match() {
+        let oversized = "x".repeat(crate::atspi_transport::MAX_MESSAGE_BYTES);
+        let pair = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        let (_service, conn) = mock_registry_on_pair(&[(&oversized, false)], pair).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            snapshot_tree_on_connection(
+                &conn,
+                Some("Calculator"),
+                None,
+                10,
+                4,
+                MAX_SNAPSHOT_METADATA_BYTES,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn peer_disconnection_is_not_reported_as_absent_focus() {
+        let (service, conn) = mock_registry(&[("Calculator", false)]).await;
+        service.close().await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            with_live_connection(
+                &conn,
+                focused_element_probe_on_connection(&conn, Some(42), true),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
     }
 
     struct StalledRegistry;

@@ -27,17 +27,50 @@ const MAX_FRAME_FDS: usize = 64;
 const METHOD_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) async fn connect() -> Result<Connection> {
+/// A D-Bus connection with read-failure state published before zbus notifies
+/// pending calls. This avoids racing zbus's later `is_closed` update.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundedConnection {
+    connection: Connection,
+    read_failure: tokio::sync::watch::Receiver<bool>,
+}
+
+impl std::ops::Deref for BoundedConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl BoundedConnection {
+    pub(crate) fn is_broken(&self) -> bool {
+        *self.read_failure.borrow()
+            || self.read_failure.has_changed().is_err()
+            || self.connection.is_closed()
+    }
+
+    pub(crate) async fn broken(&self) {
+        let mut failure = self.read_failure.clone();
+        tokio::select! {
+            _ = failure.wait_for(|failed| *failed) => {},
+            _ = self.connection.closed() => {},
+        }
+    }
+}
+
+pub(crate) async fn connect() -> Result<BoundedConnection> {
     connect_with_method_timeout(Some(METHOD_TIMEOUT)).await
 }
 
 /// Mutations retain the baseline completion semantics: connection and address
 /// discovery are bounded, while the actual mutation may complete in its own time.
-pub(crate) async fn connect_for_mutation() -> Result<Connection> {
+pub(crate) async fn connect_for_mutation() -> Result<BoundedConnection> {
     connect_with_method_timeout(None).await
 }
 
-async fn connect_with_method_timeout(method_timeout: Option<Duration>) -> Result<Connection> {
+async fn connect_with_method_timeout(
+    method_timeout: Option<Duration>,
+) -> Result<BoundedConnection> {
     let session = connect_address(&Address::session()?)
         .await
         .context("connecting to the session bus")?;
@@ -49,24 +82,29 @@ async fn connect_with_method_timeout(method_timeout: Option<Duration>) -> Result
     connect_address_with_method_timeout(&address.parse()?, method_timeout).await
 }
 
-pub(crate) async fn connect_address(address: &Address) -> Result<Connection> {
+pub(crate) async fn connect_address(address: &Address) -> Result<BoundedConnection> {
     connect_address_with_method_timeout(address, Some(METHOD_TIMEOUT)).await
 }
 
 async fn connect_address_with_method_timeout(
     address: &Address,
     method_timeout: Option<Duration>,
-) -> Result<Connection> {
+) -> Result<BoundedConnection> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         let (socket, address) = open_socket(address).await?;
-        capped_builder(
+        let (failure, read_failure) = tokio::sync::watch::channel(false);
+        let connection = capped_builder(
             socket,
             address.guid().map(|guid| guid.as_str().to_owned()),
             method_timeout,
+            failure,
         )
         .build()
-        .await
-        .map_err(Into::into)
+        .await?;
+        Ok(BoundedConnection {
+            connection,
+            read_failure,
+        })
     })
     .await
     .context("accessibility bus connection timed out")?
@@ -76,6 +114,7 @@ fn capped_builder(
     socket: BoxedSplit,
     expected_guid: Option<String>,
     method_timeout: Option<Duration>,
+    failure: tokio::sync::watch::Sender<bool>,
 ) -> Builder<'static> {
     let (read, write) = socket.take();
     let read: Box<dyn ReadHalf> = Box::new(CappedRead {
@@ -87,6 +126,7 @@ fn capped_builder(
         handshake_bytes: 0,
         auth_line: Vec::new(),
         expected_guid,
+        failure,
     });
     let builder = Builder::socket(Split::new(read, write))
         .max_queued(std::num::NonZeroUsize::new(8).unwrap());
@@ -403,15 +443,15 @@ impl ReadHalf for DeferredRead {
 
 #[derive(Debug)]
 struct CappedRead {
+    failure: tokio::sync::watch::Sender<bool>,
     inner: DeferredRead,
     handshake_bytes: usize,
     auth_line: Vec<u8>,
     expected_guid: Option<String>,
 }
 
-#[async_trait]
-impl ReadHalf for CappedRead {
-    async fn receive_message(
+impl CappedRead {
+    async fn receive_bounded_message(
         &mut self,
         seq: u64,
         bytes: &mut Vec<u8>,
@@ -446,6 +486,22 @@ impl ReadHalf for CappedRead {
             return Err(zbus::Error::ExcessData);
         }
         self.inner.receive_message(seq, bytes, fds).await
+    }
+}
+
+#[async_trait]
+impl ReadHalf for CappedRead {
+    async fn receive_message(
+        &mut self,
+        seq: u64,
+        bytes: &mut Vec<u8>,
+        fds: &mut Vec<OwnedFd>,
+    ) -> zbus::Result<Message> {
+        let result = self.receive_bounded_message(seq, bytes, fds).await;
+        if result.is_err() {
+            self.failure.send_replace(true);
+        }
+        result
     }
 
     async fn recvmsg(&mut self, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
@@ -525,19 +581,19 @@ fn limit_error(message: &'static str) -> io::Error {
 /// Real zbus authentication and message dispatch over bounded in-memory byte
 /// streams, for provider tests on hosts that forbid creating kernel sockets.
 #[cfg(test)]
-pub(crate) async fn test_connection_pair() -> Result<(Connection, Connection)> {
+pub(crate) async fn test_connection_pair() -> Result<(Connection, BoundedConnection)> {
     test_connection_pair_with_method_timeout(Some(METHOD_TIMEOUT)).await
 }
 
 #[cfg(test)]
-pub(crate) async fn test_mutation_connection_pair() -> Result<(Connection, Connection)> {
+pub(crate) async fn test_mutation_connection_pair() -> Result<(Connection, BoundedConnection)> {
     test_connection_pair_with_method_timeout(None).await
 }
 
 #[cfg(test)]
 async fn test_connection_pair_with_method_timeout(
     method_timeout: Option<Duration>,
-) -> Result<(Connection, Connection)> {
+) -> Result<(Connection, BoundedConnection)> {
     use zbus::connection::socket::WriteHalf;
 
     #[derive(Debug)]
@@ -593,12 +649,25 @@ async fn test_connection_pair_with_method_timeout(
         .unique_name("org.freedesktop.DBus")
         // Builder waits for object-server subscription before returning.
         .serve_at("/org/test/Ready", Ready);
-    let client = capped_builder(socket(client), Some(GUID.to_owned()), method_timeout)
-        .auth_mechanism(AuthMechanism::Anonymous)
-        .p2p()
-        .unique_name(":1.43");
+    let (failure, read_failure) = tokio::sync::watch::channel(false);
+    let client = capped_builder(
+        socket(client),
+        Some(GUID.to_owned()),
+        method_timeout,
+        failure,
+    )
+    .auth_mechanism(AuthMechanism::Anonymous)
+    .p2p()
+    .unique_name(":1.43");
     tokio::time::timeout(CONNECT_TIMEOUT, async {
-        Ok(tokio::try_join!(server.build(), client.build())?)
+        let (server, connection) = tokio::try_join!(server.build(), client.build())?;
+        Ok((
+            server,
+            BoundedConnection {
+                connection,
+                read_failure,
+            },
+        ))
     })
     .await
     .context("test authentication timed out")?
@@ -632,6 +701,7 @@ mod tests {
             unix_socket(client),
             Some(GUID.to_owned()),
             Some(METHOD_TIMEOUT),
+            tokio::sync::watch::channel(false).0,
         )
         .p2p()
         .unique_name(":1.43");
@@ -723,6 +793,7 @@ mod tests {
             handshake_bytes: 0,
             auth_line: Vec::new(),
             expected_guid: None,
+            failure: tokio::sync::watch::channel(false).0,
         }
     }
 
