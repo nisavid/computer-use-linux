@@ -18,7 +18,7 @@ The fork carries these runtime behavior changes:
   `src/atspi_transport.rs` caps incoming D-Bus frames before allocation; the
   transport is wired through `src/lib.rs`.
 
-Upstream package and binary identities remain unchanged. Its carried
+Upstream package and binary identities remain unchanged. The fork's carried
 agent-maintenance and drift-monitoring infrastructure includes:
 
 - fork additions to upstream's `.agnix.toml`
