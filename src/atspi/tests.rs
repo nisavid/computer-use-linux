@@ -448,37 +448,38 @@ async fn private_bus_routes_references_and_reads_live_properties() {
 #[tokio::test]
 async fn private_bus_optional_interfaces_use_exact_names_and_propagate_errors() {
     tokio::time::timeout(Duration::from_secs(10), async {
-    let bus = TestBus::start();
-    let provider = Provider::start(&bus, "/org/example/object", "provider").await;
-    let client = bus.connect().await;
-    let accessible = ObjectRefOwned::new(
-        provider.connection.unique_name().unwrap().to_owned().into(),
-        ObjectPath::try_from("/org/example/object").unwrap(),
-    )
-    .as_accessible_proxy(&client)
-    .await
-    .unwrap();
-    provider.state.lock().unwrap().interfaces = vec![
-        "Action".into(),
-        "org.a11y.atspi.action".into(),
-        "org.a11y.atspi.TextExtra".into(),
-    ];
-    let proxies = accessible.proxies().await.unwrap();
-    assert!(proxies.action().await.is_err());
-    assert!(proxies.component().await.is_err());
-    assert!(proxies.value().await.is_err());
-    assert!(proxies.text().await.is_err());
-    assert!(proxies.editable_text().await.is_err());
-    provider.state.lock().unwrap().interfaces = vec!["org.a11y.atspi.Action".into()];
-    assert!(accessible.proxies().await.unwrap().action().await.is_ok());
-    provider.state.lock().unwrap().interfaces_fail = true;
-    let error = match accessible.proxies().await {
-        Ok(_) => panic!("GetInterfaces error lost"),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.Failed")
-    );
+        let bus = TestBus::start();
+        let provider = Provider::start(&bus, "/org/example/object", "provider").await;
+        let client = bus.connect().await;
+        let accessible = ObjectRefOwned::new(
+            provider.connection.unique_name().unwrap().to_owned().into(),
+            ObjectPath::try_from("/org/example/object").unwrap(),
+        )
+        .as_accessible_proxy(&client)
+        .await
+        .unwrap();
+        provider.state.lock().unwrap().interfaces = vec![
+            "Action".into(),
+            "org.a11y.atspi.action".into(),
+            "org.a11y.atspi.TextExtra".into(),
+        ];
+        let proxies = accessible.proxies().await.unwrap();
+        assert!(proxies.action().await.is_err());
+        assert!(proxies.component().await.is_err());
+        assert!(proxies.value().await.is_err());
+        assert!(proxies.text().await.is_err());
+        assert!(proxies.editable_text().await.is_err());
+        provider.state.lock().unwrap().interfaces = vec!["org.a11y.atspi.Action".into()];
+        assert!(accessible.proxies().await.unwrap().action().await.is_ok());
+        provider.state.lock().unwrap().interfaces_fail = true;
+        let error = match accessible.proxies().await {
+            Ok(_) => panic!("GetInterfaces error lost"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed("fixture error".into())))
+        );
     })
     .await
     .expect("private-bus AT-SPI test timed out");
