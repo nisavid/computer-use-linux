@@ -53,6 +53,10 @@ x11rb = "0.14"
 xkeysym = "0.2.1"
 zbus = "5.14.0"
 
+# In-memory authenticated D-Bus fixtures; production AT-SPI routing stays on the bus.
+[dev-dependencies]
+zbus = { version = "5.14.0", features = ["bus-impl"] }
+
 [profile.release]
 codegen-units = 1
 opt-level = 3

@@ -8,12 +8,18 @@
 `efedb9c107a49100c8d69eeffb9610dee1181d7a`. The onboarding baseline was
 `663930fef8d1bee64b7b8f833b68cff3196059e3`.
 
-The fork carries one runtime behavior change in `src/windowing/target.rs`:
-standalone app ID, WM class, and title selectors require a unique match, and
-title selectors prefer an exact match before falling back to a substring.
-Regression coverage lives in `src/windowing/mod.rs`. Package and binary
-identities remain unchanged. Its other carried changes are agent-maintenance
-and drift-monitoring infrastructure:
+The fork carries these runtime behavior changes:
+
+- `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
+  require a unique match, and title selectors prefer an exact match before
+  falling back to a substring. Regression coverage lives in
+  `src/windowing/mod.rs`.
+- `src/atspi_tree.rs`: discovery deadlines and provider metadata budgets.
+  `src/atspi_transport.rs` caps incoming D-Bus frames before allocation; the
+  transport is wired through `src/lib.rs`.
+
+Upstream package and binary identities remain unchanged. Its carried
+agent-maintenance and drift-monitoring infrastructure includes:
 
 - fork additions to upstream's `.agnix.toml`
 - `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`

@@ -134,3 +134,24 @@ path = ".cargo/audit.toml"
 domain = "validation"
 portability_hint = "fork-specific"
 notes = "Temporary informational zbus retirement exceptions until the AT-SPI stack supports zbus 6; vulnerability advisories remain enforced."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/atspi_tree.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Bounded AT-SPI discovery and provider metadata."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/atspi_transport.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Incoming AT-SPI D-Bus frame allocation budget."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/lib.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Private AT-SPI transport module registration."

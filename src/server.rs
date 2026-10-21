@@ -2630,7 +2630,7 @@ struct GetAppStateOutput {
     /// True when the snapshot was limited to selected app roots rather than the
     /// full desktop AT-SPI registry.
     tree_scoped: bool,
-    /// True when max_nodes, max_depth, or the child read budget stopped
+    /// True when node, depth, child-read, or retained-metadata budgets stopped
     /// traversal with unread elements left, so the tree is incomplete. Recover
     /// by scoping to a narrower app or window target and raising max_nodes or
     /// max_depth (hard caps 2000 and 64). Failed element reads do not count.
