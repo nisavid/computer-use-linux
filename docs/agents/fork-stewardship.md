@@ -21,6 +21,11 @@ and drift-monitoring infrastructure:
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
 - a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
+- a temporary, exact maintenance-notice exception in
+  `scripts/audit_dependencies.py`, exercised by the CI audit job and covered by
+  `scripts/audit_dependencies_test.py`; it expires on 2026-11-21 UTC and tracks
+  the AT-SPI/zbus 6 migration in
+  [issue #31](https://github.com/nisavid/computer-use-linux/issues/31)
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens
