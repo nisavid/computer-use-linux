@@ -17,7 +17,8 @@ infrastructure:
 - `AGENTS.md`
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
-- a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
+- a weekly `schedule` trigger and immutable action pins in upstream's
+  `.github/workflows/ci.yml`
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens
