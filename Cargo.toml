@@ -23,14 +23,6 @@ path = "src/bin/computer-use-linux-cosmic.rs"
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.102"
-# atspi without its "connection" feature: that feature pulls atspi-connection
-# with default features, which include "p2p" — and p2p peer enumeration during
-# connect() calls GetInterfaces on every a11y-bus peer, so a single
-# AppArmor-confined peer (e.g. snap-packaged Slack) aborts the whole
-# AccessibilityConnection. We deliberately never use P2P routing (issue #31),
-# so depend on atspi-connection directly with p2p off.
-atspi = { version = "0.29.0", default-features = false, features = ["proxies", "wrappers", "tokio"] }
-atspi-connection = { version = "0.13.0", default-features = false, features = ["wrappers"] }
 base64 = "0.22.1"
 evdev = "0.13.2"
 cosmic-protocols = { version = "0.2.0", default-features = false, features = ["client"] }
@@ -51,7 +43,7 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # origins for the EWMH backend (wmctrl -lG counts the frame offset twice, #157).
 x11rb = "0.14"
 xkeysym = "0.2.1"
-zbus = "5.14.0"
+zbus = { version = "6.0.0", default-features = false, features = ["tokio", "proxy", "service"] }
 
 [profile.release]
 codegen-units = 1

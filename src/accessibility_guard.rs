@@ -1,7 +1,6 @@
 //! Explicit, foreground GNOME accessibility hold-open. Never started by observation tools.
+use crate::atspi::AccessibilityConnection;
 use anyhow::{bail, Context, Result};
-use atspi::events::window::ActivateEvent;
-use atspi_connection::AccessibilityConnection;
 use futures_util::StreamExt;
 use std::{future::Future, process::Stdio, time::Duration};
 use tokio::{
@@ -77,7 +76,7 @@ pub(crate) async fn run() -> Result<()> {
         return Ok(());
     };
     if until_stopped(&mut stop, async {
-        timeout(DEADLINE, connection.register_event::<ActivateEvent>())
+        timeout(DEADLINE, connection.register_activation_listener())
             .await
             .context("accessibility listener registration timed out")?
             .map_err(Into::into)
@@ -124,7 +123,7 @@ pub(crate) async fn run() -> Result<()> {
         result.map(|_| ())
     }.await;
     drop(events);
-    let _ = timeout(DEADLINE, connection.deregister_event::<ActivateEvent>()).await;
+    let _ = timeout(DEADLINE, connection.deregister_activation_listener()).await;
     eprintln!("Accessibility guard stopped: no more setting writes; current saved setting left unchanged.");
     result
 }
