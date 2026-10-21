@@ -360,6 +360,143 @@ mod tests {
     }
 
     #[test]
+    fn metadata_targets_reject_ambiguous_matches_in_any_order() {
+        let cases = [
+            (
+                WindowTarget {
+                    app_id: Some(" trusted.app ".to_string()),
+                    ..Default::default()
+                },
+                "app_id trusted.app",
+                [
+                    window(11, "One", "TRUSTED.APP", "One"),
+                    window(22, "Two", "trusted.app", "Two"),
+                ],
+            ),
+            (
+                WindowTarget {
+                    wm_class: Some(" Trusted ".to_string()),
+                    ..Default::default()
+                },
+                "wm_class Trusted",
+                [
+                    window(11, "One", "one.app", "trusted"),
+                    window(22, "Two", "two.app", "TRUSTED"),
+                ],
+            ),
+            (
+                WindowTarget {
+                    title: Some(" Trusted ".to_string()),
+                    ..Default::default()
+                },
+                "title Trusted",
+                [
+                    window(11, "TRUSTED", "one.app", "One"),
+                    window(22, "trusted", "two.app", "Two"),
+                ],
+            ),
+            (
+                WindowTarget {
+                    title: Some(" trusted ".to_string()),
+                    ..Default::default()
+                },
+                "title containing trusted",
+                [
+                    window(11, "Trusted One", "one.app", "One"),
+                    window(22, "Two TRUSTED", "two.app", "Two"),
+                ],
+            ),
+        ];
+
+        for (target, description, mut windows) in cases {
+            for _ in 0..2 {
+                let error = resolve_window_target(&windows, &target)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(&format!("{description} matched multiple windows")));
+                assert!(error.contains("11"));
+                assert!(error.contains("22"));
+                assert!(error.contains("window_id"));
+                windows.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn title_target_prefers_a_unique_exact_match_in_any_order() {
+        let mut windows = [
+            window(11, "Trusted - copy", "copy.app", "Copy"),
+            window(22, "TRUSTED", "trusted.app", "Trusted"),
+        ];
+        let target = WindowTarget {
+            title: Some(" trusted ".to_string()),
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_window_target(&windows, &target).unwrap().window_id,
+                22
+            );
+            windows.reverse();
+        }
+    }
+
+    #[test]
+    fn metadata_targets_preserve_unique_matches_and_report_missing_matches() {
+        let windows = [window(22, "Trusted", "trusted.app", "Trusted")];
+        let targets = [
+            WindowTarget {
+                app_id: Some(" TRUSTED.APP ".to_string()),
+                ..Default::default()
+            },
+            WindowTarget {
+                wm_class: Some(" TRUSTED ".to_string()),
+                ..Default::default()
+            },
+            WindowTarget {
+                title: Some(" TRUSTED ".to_string()),
+                ..Default::default()
+            },
+            WindowTarget {
+                title: Some(" RUST ".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        for target in targets {
+            assert_eq!(
+                resolve_window_target(&windows, &target).unwrap().window_id,
+                22
+            );
+            assert!(resolve_window_target(&[], &target)
+                .unwrap_err()
+                .to_string()
+                .starts_with("No window"));
+        }
+    }
+
+    #[test]
+    fn window_id_disambiguates_duplicate_metadata() {
+        let windows = [
+            window(11, "Trusted", "trusted.app", "Trusted"),
+            window(22, "Trusted", "trusted.app", "Trusted"),
+        ];
+        let target = WindowTarget {
+            window_id: Some(22),
+            app_id: Some("trusted.app".to_string()),
+            wm_class: Some("Trusted".to_string()),
+            title: Some("Trusted".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_window_target(&windows, &target).unwrap().window_id,
+            22
+        );
+    }
+
+    #[test]
     fn resolves_terminal_target_by_tty() {
         let windows = vec![
             terminal_window(1, "Claude", "/dev/pts/0", 101, "claude", "/tmp"),

@@ -142,40 +142,35 @@ pub fn resolve_window_target<'a>(
     }
 
     if let Some(app_id) = normalized_target(target.app_id.as_deref()) {
-        if let Some(window) = windows.iter().find(|window| {
-            window
-                .app_id
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(&app_id))
-        }) {
-            return Ok(window);
-        }
-        bail!("No window matched app_id {app_id}.");
+        let matches = windows
+            .iter()
+            .filter(|window| optional_exact_match(&window.app_id, Some(&app_id)))
+            .collect();
+        return unique_window_match(matches, &format!("app_id {app_id}"));
     }
 
     if let Some(wm_class) = normalized_target(target.wm_class.as_deref()) {
-        if let Some(window) = windows.iter().find(|window| {
-            window
-                .wm_class
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(&wm_class))
-        }) {
-            return Ok(window);
-        }
-        bail!("No window matched wm_class {wm_class}.");
+        let matches = windows
+            .iter()
+            .filter(|window| optional_exact_match(&window.wm_class, Some(&wm_class)))
+            .collect();
+        return unique_window_match(matches, &format!("wm_class {wm_class}"));
     }
 
     if let Some(title) = normalized_target(target.title.as_deref()) {
-        let title_lower = title.to_ascii_lowercase();
-        if let Some(window) = windows.iter().find(|window| {
-            window
-                .title
-                .as_deref()
-                .is_some_and(|value| value.to_ascii_lowercase().contains(&title_lower))
-        }) {
-            return Ok(window);
+        let exact_matches = windows
+            .iter()
+            .filter(|window| optional_exact_match(&window.title, Some(&title)))
+            .collect::<Vec<_>>();
+        if !exact_matches.is_empty() {
+            return unique_window_match(exact_matches, &format!("title {title}"));
         }
-        bail!("No window title contained {title}.");
+
+        let matches = windows
+            .iter()
+            .filter(|window| optional_title_match(&window.title, Some(&title)))
+            .collect();
+        return unique_window_match(matches, &format!("title containing {title}"));
     }
 
     bail!("Pass window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd to target a window.");
@@ -266,7 +261,7 @@ fn unique_window_match<'a>(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "{description} matched multiple windows ({ids}); add window_id, tty, title, or terminal_command to disambiguate."
+                "{description} matched multiple windows ({ids}); pass a window_id from list_windows to select one."
             );
         }
     }
