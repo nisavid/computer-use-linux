@@ -3,6 +3,12 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+/**
+ * Validate a project lock before installing executable dependencies.
+ * @param {object} lock Parsed npm version 3 lockfile, including its packages map.
+ * @returns {void}
+ * @throws {Error} If remote packages lack explicit URLs or authoritative SHA-512 pins.
+ */
 export function checkLockfileIntegrity(lock) {
 	if (lock.lockfileVersion !== 3 || !lock.packages ||
 		typeof lock.packages !== "object" || Array.isArray(lock.packages)) {
@@ -19,6 +25,9 @@ export function checkLockfileIntegrity(lock) {
 		// Exempt only the root and explicitly local dependencies.
 		if (path === "" || entry.link === true ||
 			(typeof entry.resolved === "string" && entry.resolved.startsWith("file:"))) continue;
+		if (typeof entry.resolved !== "string" || !/^https?:\/\//i.test(entry.resolved)) {
+			errors.push(`${path}: remote tarball requires an explicit HTTP(S) resolved URL`);
+		}
 		const digest = typeof entry.integrity === "string"
 			? /^sha512-([A-Za-z0-9+/]{86}==)$/.exec(entry.integrity)?.[1]
 			: undefined;

@@ -5,9 +5,10 @@
 ignore = [
     # RUSTSEC-2026-0370 / -0371 / -0372 are informational retirement notices:
     # zvariant, zbus_names, and zvariant_derive moved into zbus 6.0.0.
-    # No vulnerability or patched standalone version is reported. These
-    # crates are used at runtime; this exception accepts their maintenance
-    # status, not an assertion that their inputs are unreachable.
+    # No vulnerability or patched standalone version is reported.
+    # zvariant and zbus_names are used at runtime; zvariant_derive is a
+    # compile-time procedural macro. These exceptions accept their
+    # maintenance status, not an assertion that inputs are unreachable.
     # Our AT-SPI stack requires zbus 5, including the latest published
     # atspi 0.30.0 and atspi-connection 0.14.0 checked on 2026-10-21.
     # Remove these exceptions when AT-SPI supports zbus 6 and the graph can

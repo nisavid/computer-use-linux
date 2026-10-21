@@ -18,8 +18,16 @@ test("checks every remote entry, including nested aliases and optional dependenc
 		for (const invalid of [undefined, "", "sha512-invalid", `sha512-${"A".repeat(85)}B==`, "sha1-abc"]) {
 			assert.throws(() => checkLockfileIntegrity(lockWith({ resolved, integrity: invalid, optional: true })), /SHA-512/);
 		}
-		assert.doesNotThrow(() => checkLockfileIntegrity(lockWith({ resolved, integrity: validDigest })));
+		if (resolved === undefined) {
+			assert.throws(() => checkLockfileIntegrity(lockWith({ resolved, integrity: validDigest })), /resolved URL/);
+		} else {
+			assert.doesNotThrow(() => checkLockfileIntegrity(lockWith({ resolved, integrity: validDigest })));
+		}
 	}
+	for (const resolved of ["", " ", "git+https://registry.example/repo.git"]) {
+		assert.throws(() => checkLockfileIntegrity(lockWith({ resolved, integrity: validDigest })), /resolved URL/);
+	}
+	assert.throws(() => checkLockfileIntegrity(lockWith({ integrity: validDigest, inBundle: true })), /resolved URL/);
 	assert.doesNotThrow(() => checkLockfileIntegrity(lockWith({ resolved: "file:../workspace", link: true })));
 	assert.doesNotThrow(() => checkLockfileIntegrity(lockWith({ resolved: "file:../local.tgz" })));
 	assert.doesNotThrow(() => checkLockfileIntegrity({ lockfileVersion: 3, packages: { "": { name: "root" } } }));
@@ -52,6 +60,12 @@ test("npm ci enforces outer integrity despite an incomplete published shrinkwrap
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const base = `http://127.0.0.1:${server.address().port}`;
+	/**
+	 * Pack a local fixture without contacting a registry or running package scripts.
+	 * @param {string} name Unique fixture directory and tarball name.
+	 * @param {Record<string, string | object>} files Package-relative fixture contents.
+	 * @returns {Buffer} Compressed tarball bytes for the local HTTP server.
+	 */
 	function pack(name, files) {
 		const root = join(dir, name);
 		mkdirSync(join(root, "package"), { recursive: true });
@@ -85,8 +99,8 @@ test("npm ci enforces outer integrity despite an incomplete published shrinkwrap
 		const candidate = structuredClone(lock);
 		if (name === "registry-substitution") {
 			delete candidate.packages["node_modules/parent/node_modules/child"].resolved;
-			tarballs.set("/child", JSON.stringify({ name: "child", "dist-tags": { latest: "1.0.0" },
-				versions: { "1.0.0": { name: "child", version: "1.0.0", dist: { tarball: `${base}/child.tgz` } } } }));
+			assert.throws(() => checkLockfileIntegrity(candidate), /resolved URL/);
+			continue;
 		}
 		checkLockfileIntegrity(candidate);
 		const project = join(dir, name);
