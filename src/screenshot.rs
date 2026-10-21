@@ -20,8 +20,7 @@ use tokio::process::Command;
 use zbus::{
     message::{Message, Type as MessageType},
     names::{BusName, OwnedUniqueName, WellKnownName},
-    zvariant::{OwnedObjectPath, OwnedValue, Value},
-    MatchRule, MessageStream, Proxy,
+    MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Proxy, Variant,
 };
 
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
@@ -389,9 +388,9 @@ async fn capture_with_portal() -> Result<RawScreenshotCapture> {
     )
     .await
     .context("failed to create XDG portal screenshot proxy")?;
-    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
-    options.insert("handle_token", Value::from(token.as_str()));
-    options.insert("interactive", Value::from(false));
+    let mut options: HashMap<&str, Variant<'_>> = HashMap::new();
+    options.insert("handle_token", Variant::from(token.as_str()));
+    options.insert("interactive", Variant::from(false));
     let handle: OwnedObjectPath = portal_proxy
         .call("Screenshot", &("", options))
         .await
@@ -480,8 +479,7 @@ async fn portal_desktop_owner(connection: &zbus::Connection) -> Result<OwnedUniq
     let dbus = zbus::fdo::DBusProxy::new(connection)
         .await
         .context("failed to create session-bus identity proxy")?;
-    let _: u32 = dbus
-        .start_service_by_name(WellKnownName::try_from(PORTAL_DESKTOP_SERVICE)?, 0)
+    dbus.start_service_by_name(WellKnownName::try_from(PORTAL_DESKTOP_SERVICE)?, 0)
         .await
         .context("failed to activate the XDG desktop portal")?;
     dbus.get_name_owner(BusName::try_from(PORTAL_DESKTOP_SERVICE)?)
@@ -495,11 +493,12 @@ async fn portal_response_stream(
 ) -> Result<MessageStream> {
     let response_rule = MatchRule::builder()
         .msg_type(MessageType::Signal)
-        .sender(portal_owner.clone())?
-        .interface(PORTAL_REQUEST_INTERFACE)?
-        .member("Response")?
-        .path_namespace(PORTAL_REQUEST_PATH_NAMESPACE)?
-        .build();
+        .sender(portal_owner.clone())
+        .interface(PORTAL_REQUEST_INTERFACE)
+        .member("Response")
+        .path_namespace(PORTAL_REQUEST_PATH_NAMESPACE)
+        .build()
+        .context("failed to build XDG portal screenshot response filter")?;
 
     MessageStream::for_match_rule(response_rule, connection, None)
         .await
@@ -510,7 +509,7 @@ async fn wait_for_portal_response(
     response_stream: &mut MessageStream,
     request_path: &str,
     portal_owner: &str,
-) -> Result<(u32, HashMap<String, OwnedValue>)> {
+) -> Result<(u32, HashMap<String, OwnedVariant>)> {
     loop {
         let response = response_stream
             .next()
@@ -847,9 +846,7 @@ mod tests {
     fn portal_response_requires_the_pinned_sender_and_exact_path() {
         let request_path = "/org/freedesktop/portal/desktop/request/1_7/token";
         let response = Message::signal(request_path, PORTAL_REQUEST_INTERFACE, "Response")
-            .unwrap()
             .sender(":1.42")
-            .unwrap()
             .build(&())
             .unwrap();
 

@@ -8,17 +8,41 @@
 `efedb9c107a49100c8d69eeffb9610dee1181d7a`. The onboarding baseline was
 `663930fef8d1bee64b7b8f833b68cff3196059e3`.
 
-At that baseline, the fork has no product, package, binary, or runtime behavior
-divergence. Its carried changes are agent-maintenance and drift-monitoring
-infrastructure:
+The fork carries a runtime behavior change in `src/windowing/target.rs`:
+standalone app ID, WM class, and title selectors require a unique match, and
+title selectors prefer an exact match before falling back to a substring.
+Regression coverage lives in `src/windowing/mod.rs`. Package and binary
+identities remain unchanged. Its other carried changes are agent-maintenance
+and drift-monitoring infrastructure:
 
 - fork additions to upstream's `.agnix.toml`
 - `.agents/fork-ops.toml` and `.agents/bootstrap-fork-ops.sh`
 - `AGENTS.md`
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
-- a weekly `schedule` trigger and immutable action pins in upstream's
-  `.github/workflows/ci.yml`
+- a weekly `schedule` trigger, immutable action pins, and disabled checkout
+  credential persistence in upstream's `.github/workflows/ci.yml`
+
+The fork also carries development dependency integrity enforcement:
+
+- `pi/package-lock.json` supplies six missing child tarball digests and omits
+  the parent's `hasShrinkwrap` reload flag, preserving the locked graph.
+- `scripts/check_npm_lockfile_integrity.mjs` and its npm regression test run
+  before the Pi CI job installs dependencies.
+- `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
+  constraint.
+
+The fork also uses zbus 6 and private AT-SPI bindings in `src/atspi.rs` and
+`src/atspi/`. The published AT-SPI wrappers require zbus 5 and its retired
+standalone wire-format crates. The private bindings preserve this application's
+protocol surface, destination-pinned calls, uncached properties, role/state
+labels, and disabled P2P routing. Their isolated D-Bus tests cover wire formats
+and connection behavior; the adapted definitions retain upstream MIT attribution
+in `THIRD_PARTY_LICENSES/atspi-MIT.txt`. Portal, GNOME, and KWin callers use the
+zbus 6 API while retaining their sender, path, and owner checks.
+
+The three informational retirement exceptions have been removed from
+`.cargo/audit.toml`; the existing build-only quick-xml exceptions remain.
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens

@@ -173,7 +173,7 @@ where
             .await
             .context("failed to resolve the KWin session-bus owner")?;
         let (sender, receiver) = mpsc::channel();
-        let callback_registered = connection
+        let rejected_callback = connection
             .object_server()
             .at(
                 callback_object_path.as_str(),
@@ -187,7 +187,7 @@ where
             )
             .await
             .context("failed to register temporary KWin callback object")?;
-        if !callback_registered {
+        if rejected_callback.is_some() {
             bail!("temporary KWin callback object path was already registered");
         }
         cleanup.owns_callback = true;
@@ -1349,9 +1349,7 @@ mod transaction_tests {
         let start_calls = Arc::new(AtomicUsize::new(0));
         let unload_calls = Arc::new(AtomicUsize::new(0));
         let service_connection = zbus::connection::Builder::address(bus.address.as_str())
-            .unwrap()
             .name(KWIN_SCRIPTING_SERVICE)
-            .unwrap()
             .serve_at(
                 KWIN_SCRIPTING_OBJECT_PATH,
                 FakeKwinScripting {
@@ -1361,12 +1359,10 @@ mod transaction_tests {
                     unload_calls: Arc::clone(&unload_calls),
                 },
             )
-            .unwrap()
             .build()
             .await
             .unwrap();
         let client_connection = zbus::connection::Builder::address(bus.address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap();
@@ -1430,9 +1426,7 @@ mod transaction_tests {
         let start_calls = Arc::new(AtomicUsize::new(0));
         let unload_calls = Arc::new(AtomicUsize::new(0));
         let service_connection = zbus::connection::Builder::address(bus.address.as_str())
-            .unwrap()
             .name(KWIN_SCRIPTING_SERVICE)
-            .unwrap()
             .serve_at(
                 KWIN_SCRIPTING_OBJECT_PATH,
                 FakeKwinScripting {
@@ -1442,12 +1436,10 @@ mod transaction_tests {
                     unload_calls: Arc::clone(&unload_calls),
                 },
             )
-            .unwrap()
             .build()
             .await
             .unwrap();
         let client_connection = zbus::connection::Builder::address(bus.address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap();
@@ -1469,7 +1461,8 @@ mod transaction_tests {
                 },
             )
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
 
         let error = call_kwin_script_on_connection_with_plugin_name(
             client_connection.clone(),

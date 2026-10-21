@@ -1,7 +1,25 @@
 // Scratch probe: surface the real AT-SPI connection error chain.
-use atspi_connection::AccessibilityConnection;
+use zbus::{Connection, OwnedObjectPath, Proxy};
 
-#[tokio::main]
+async fn probe() -> zbus::Result<usize> {
+    let session = Connection::session().await?;
+    let launcher = Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus").await?;
+    let address: String = launcher.call("GetAddress", &()).await?;
+    let connection = zbus::connection::Builder::address(address.as_str())
+        .build()
+        .await?;
+    let root = Proxy::new(
+        &connection,
+        "org.a11y.atspi.Registry",
+        "/org/a11y/atspi/accessible/root",
+        "org.a11y.atspi.Accessible",
+    )
+    .await?;
+    let children: Vec<(String, OwnedObjectPath)> = root.call("GetChildren", &()).await?;
+    Ok(children.len())
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!(
         "AT_SPI_BUS_ADDRESS={:?}",
@@ -11,17 +29,8 @@ async fn main() {
         "DBUS_SESSION_BUS_ADDRESS={:?}",
         std::env::var("DBUS_SESSION_BUS_ADDRESS")
     );
-    match AccessibilityConnection::new().await {
-        Ok(conn) => {
-            println!("connected OK");
-            match conn.root_accessible_on_registry().await {
-                Ok(root) => match root.get_children().await {
-                    Ok(children) => println!("registry children: {}", children.len()),
-                    Err(e) => println!("get_children error: {e:#?}"),
-                },
-                Err(e) => println!("registry root error: {e:#?}"),
-            }
-        }
-        Err(e) => println!("connect error: {e:#?}"),
+    match probe().await {
+        Ok(count) => println!("connected OK; registry children: {count}"),
+        Err(error) => println!("AT-SPI probe error: {error:#?}"),
     }
 }
