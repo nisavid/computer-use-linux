@@ -77,6 +77,7 @@ def check_report(report: dict, today: dt.date) -> list[str]:
 
 
 def main() -> int:
+    """Run the strict audit and report only the bounded maintenance exceptions."""
     try:
         result = subprocess.run(
             ["cargo", "audit", "--json", "--deny", "warnings"],

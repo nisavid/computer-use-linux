@@ -360,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    /// Duplicate metadata must fail regardless of case, whitespace, or ordering.
     fn metadata_targets_reject_ambiguous_matches_in_any_order() {
         let cases = [
             (
@@ -423,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    /// A unique exact title must take precedence over longer substring matches.
     fn title_target_prefers_a_unique_exact_match_in_any_order() {
         let mut windows = [
             window(11, "Trusted - copy", "copy.app", "Copy"),
@@ -443,6 +445,7 @@ mod tests {
     }
 
     #[test]
+    /// Unique selectors retain normalization and produce errors when absent.
     fn metadata_targets_preserve_unique_matches_and_report_missing_matches() {
         let windows = [window(22, "Trusted", "trusted.app", "Trusted")];
         let targets = [
@@ -477,6 +480,7 @@ mod tests {
     }
 
     #[test]
+    /// An observed window ID must still select among otherwise identical windows.
     fn window_id_disambiguates_duplicate_metadata() {
         let windows = [
             window(11, "Trusted", "trusted.app", "Trusted"),

@@ -113,6 +113,7 @@ where
     last_focused_window
 }
 
+/// Resolve selectors by precedence, rejecting ambiguity in metadata matches.
 pub fn resolve_window_target<'a>(
     windows: &'a [WindowInfo],
     target: &WindowTarget,
@@ -247,6 +248,7 @@ fn window_id_matches_json_number(actual: u64, requested: u64) -> bool {
         && (actual as f64) == (requested as f64)
 }
 
+/// Return the sole candidate or explain how to select an observed window ID.
 fn unique_window_match<'a>(
     matches: Vec<&'a WindowInfo>,
     description: &str,
