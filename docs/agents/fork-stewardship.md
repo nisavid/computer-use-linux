@@ -21,11 +21,20 @@ and drift-monitoring infrastructure:
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
 - a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
-- a temporary, exact maintenance-notice exception in
-  `scripts/audit_dependencies.py`, exercised by the CI audit job and covered by
-  `scripts/audit_dependencies_test.py`; it expires on 2026-11-21 UTC and tracks
-  the AT-SPI/zbus 6 migration in
-  [issue #31](https://github.com/nisavid/computer-use-linux/issues/31)
+
+The fork also carries development dependency integrity enforcement:
+
+- `pi/package-lock.json` supplies six missing child tarball digests and omits
+  the parent's `hasShrinkwrap` reload flag, preserving the locked graph.
+- `scripts/check_npm_lockfile_integrity.mjs` and its npm regression test run
+  before the Pi CI job installs dependencies.
+- `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
+  constraint.
+
+`.cargo/audit.toml` temporarily accepts the three informational retirement
+notices for standalone zvariant/zbus_names crates while the published AT-SPI
+stack still requires zbus 5. Each exception has a removal condition; vulnerability
+advisories remain enforced. Migrate this stack together when AT-SPI supports zbus 6.
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens

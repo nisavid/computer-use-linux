@@ -19,6 +19,25 @@ node --check npm/bin/computer-use-linux.js
 npm pack --dry-run
 ```
 
+For Pi extension development:
+
+```bash
+node scripts/check_npm_lockfile_integrity.mjs pi/package-lock.json
+node --test scripts/check_npm_lockfile_integrity_test.mjs
+npm ci --prefix pi --ignore-scripts --no-audit --no-fund
+npm run build:check --prefix pi
+npm run typecheck --prefix pi
+COMPUTER_USE_LINUX_TEST_BINARY="$PWD/target/debug/computer-use-linux" npm test --prefix pi
+```
+
+The Pi lock pins SHA-512 digests for every remote tarball. It deliberately omits
+`hasShrinkwrap` on the Pi coding-agent entry: npm 11 otherwise reloads that
+package's published shrinkwrap during `npm ci`, replacing the checked-in child
+digests with incomplete upstream metadata. The complete locked dependency tree
+and all versions stay unchanged. Run the dependency-free check before installing
+after any lockfile regeneration; do not restore shrinkwrap reload flags. The npm
+regression test checks both a valid install and rejection of substituted bytes.
+
 ## Before Opening a PR
 
 Run the same gates CI runs:
