@@ -93,10 +93,10 @@ impl StateSet {
             .try_into()
             .map_err(|_| zbus::Error::Failure("AT-SPI state requires two words".into()))?;
         let bits = u64::from(low) | (u64::from(high) << 32);
-        if bits >> STATE_NAMES.len() != 0 {
-            return Err(zbus::Error::Failure("unknown AT-SPI state bits".into()));
-        }
-        Ok(Self(bits))
+        // Newer providers may add states; retain known flags so an unfamiliar
+        // bit cannot hide a focused node or prevent traversal of its children.
+        let known = (1_u64 << STATE_NAMES.len()) - 1;
+        Ok(Self(bits & known))
     }
     pub(crate) fn focused(&self) -> bool {
         self.0 & (1 << 12) != 0

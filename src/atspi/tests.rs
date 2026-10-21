@@ -51,7 +51,17 @@ fn state_wire_requires_two_words_and_preserves_low_then_high_bit_order() {
         .unwrap()
         .labels()
         .is_empty());
-    for words in [vec![], vec![0_u32], vec![0, 0, 0], vec![0, 1 << 12]] {
+    let states: StateSet = decode_wire("au", &vec![0_u32, 1_u32 << 10]).unwrap();
+    assert_eq!(states.labels(), ["has-popup"]);
+    for unknown in [1_u32 << 12, 1 << 13, 1 << 31] {
+        let states: StateSet = decode_wire("au", &vec![0_u32, unknown]).unwrap();
+        assert!(!states.focused());
+        assert!(states.labels().is_empty());
+        let states: StateSet = decode_wire("au", &vec![1_u32 << 12, unknown | (1 << 11)]).unwrap();
+        assert!(states.focused());
+        assert_eq!(states.labels(), ["focused", "read-only"]);
+    }
+    for words in [vec![], vec![0_u32], vec![0, 0, 0]] {
         assert!(decode_wire::<StateSet>("au", &words).is_err());
     }
 }
