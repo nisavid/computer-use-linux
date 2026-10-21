@@ -127,3 +127,10 @@ kind = "config"
 path = ".agnix.toml"
 domain = "agent-document-validation"
 portability_hint = "shared-with-fork-policy"
+
+[[local_surfaces]]
+kind = "config"
+path = ".cargo/audit.toml"
+domain = "validation"
+portability_hint = "fork-specific"
+notes = "Temporary informational zbus retirement exceptions until the AT-SPI stack supports zbus 6; vulnerability advisories remain enforced."

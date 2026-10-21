@@ -28,6 +28,11 @@ The fork also carries development dependency integrity enforcement:
 - `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
   constraint.
 
+`.cargo/audit.toml` temporarily accepts the three informational retirement
+notices for standalone zvariant/zbus_names crates while the published AT-SPI
+stack still requires zbus 5. Each exception has a removal condition; vulnerability
+advisories remain enforced. Migrate this stack together when AT-SPI supports zbus 6.
+
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens
 `codex-sync` issues for an embedded copy in `codex-desktop-linux`, which this
