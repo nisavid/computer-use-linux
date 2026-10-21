@@ -29,11 +29,11 @@ mod tests {
     use super::*;
     use crate::terminal::{TerminalProcess, TerminalWindowContext};
     use std::collections::HashMap;
-    use zbus::zvariant::OwnedValue;
-    use zbus::zvariant::Value;
+    use zbus::OwnedVariant;
+    use zbus::Variant;
 
-    fn owned_value(value: Value<'_>) -> OwnedValue {
-        OwnedValue::try_from(value).unwrap()
+    fn owned_value(value: Variant<'_>) -> OwnedVariant {
+        OwnedVariant::try_from(value).unwrap()
     }
 
     #[test]
@@ -810,17 +810,20 @@ mod tests {
     #[test]
     fn extracts_known_window_properties() {
         let properties = HashMap::from([
-            ("title".to_string(), owned_value(Value::from("Ghostty"))),
+            ("title".to_string(), owned_value(Variant::from("Ghostty"))),
             (
                 "app-id".to_string(),
-                owned_value(Value::from("com.mitchellh.ghostty.desktop")),
+                owned_value(Variant::from("com.mitchellh.ghostty.desktop")),
             ),
-            ("wm-class".to_string(), owned_value(Value::from("Ghostty"))),
-            ("client-type".to_string(), owned_value(Value::from(0_u32))),
-            ("is-hidden".to_string(), owned_value(Value::from(false))),
-            ("has-focus".to_string(), owned_value(Value::from(true))),
-            ("width".to_string(), owned_value(Value::from(1200_u32))),
-            ("height".to_string(), owned_value(Value::from(800_u32))),
+            (
+                "wm-class".to_string(),
+                owned_value(Variant::from("Ghostty")),
+            ),
+            ("client-type".to_string(), owned_value(Variant::from(0_u32))),
+            ("is-hidden".to_string(), owned_value(Variant::from(false))),
+            ("has-focus".to_string(), owned_value(Variant::from(true))),
+            ("width".to_string(), owned_value(Variant::from(1200_u32))),
+            ("height".to_string(), owned_value(Variant::from(800_u32))),
         ]);
 
         let info = window_from_properties(42, &properties);

@@ -1,15 +1,8 @@
+use crate::atspi::{
+    self, AccessibilityConnection, AccessibleProxy, ObjectRefOwned, Proxies, StateSet,
+};
 use crate::diagnostics::hydrate_session_bus_env;
 use anyhow::{anyhow, Context, Result};
-use atspi::{
-    proxy::{
-        accessible::{AccessibleProxy, ObjectRefExt},
-        proxy_ext::ProxyExt,
-    },
-    CoordType, ObjectRef, ObjectRefOwned, StateSet,
-};
-// Direct dependency (p2p feature off) — see Cargo.toml for why we bypass
-// atspi's "connection" re-export.
-use atspi_connection::AccessibilityConnection;
 use futures_util::{stream, StreamExt};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -18,7 +11,7 @@ use tokio::time::timeout;
 use zbus::{
     fdo::DBusProxy,
     names::{BusName, UniqueName},
-    zvariant::ObjectPath,
+    ObjectPath,
 };
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -483,7 +476,7 @@ async fn focused_element_probe(
         let Ok(state) = proxy.get_state().await else {
             continue;
         };
-        if state.contains(atspi::State::Focused) {
+        if state.focused() {
             let proxies = proxy.proxies().await.ok();
             let is_terminal = matches!(proxy.get_role().await, Ok(atspi::Role::Terminal));
             return Ok(FocusProbe::Found(FocusedElementSummary {
@@ -626,20 +619,14 @@ async fn connect() -> Result<AccessibilityConnection> {
 
 /// Open an `AccessibleProxy` for an object on the a11y bus.
 ///
-/// We deliberately avoid `AccessibilityConnection::object_as_accessible` (the
-/// `P2P` trait). For apps that advertise a peer-to-peer bus address it routes
-/// reads over that socket, but for apps that don't (notably GTK4 apps such as
-/// Nautilus / Text Editor / baobab, which don't implement the legacy
-/// `GetApplicationBusAddress`) it falls back to a proxy built with only a path
-/// and *no destination*. On the shared a11y bus that proxy can't address the
-/// app and every call fails with `ServiceUnknown`, which surfaces as an empty
-/// tree (`role: "unknown"`, `child_count: 0`). `as_accessible_proxy` always
-/// pins the destination to the object's bus name, so it works for every app
-/// regardless of P2P support. See issue #31.
+/// The private binding always pins the destination to the object's unique bus
+/// name on the shared accessibility bus. It never discovers P2P peers or
+/// constructs a path-only proxy, so applications without P2P support remain
+/// addressable and unrelated confined peers cannot abort connection setup.
 async fn open_accessible<'r>(
     conn: &AccessibilityConnection,
     object_ref: &'r ObjectRefOwned,
-) -> Result<AccessibleProxy<'r>, atspi::AtspiError> {
+) -> Result<AccessibleProxy<'r>, zbus::Error> {
     object_ref.as_accessible_proxy(conn.connection()).await
 }
 
@@ -870,7 +857,7 @@ async fn object_ref_pid(dbus: Option<&DBusProxy<'_>>, object_ref: &ObjectRefOwne
 }
 
 async fn bounds_from_proxies(
-    proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>,
+    proxies: Option<&Proxies<'_>>,
     proxy: &AccessibleProxy<'_>,
 ) -> Option<Bounds> {
     let owned_proxies;
@@ -881,7 +868,7 @@ async fn bounds_from_proxies(
         &owned_proxies
     };
     let component = proxies.component().await.ok()?;
-    let (x, y, width, height) = component.get_extents(CoordType::Screen).await.ok()?;
+    let (x, y, width, height) = component.get_extents(0_u32).await.ok()?;
     normalize_bounds(Bounds {
         x,
         y,
@@ -900,9 +887,7 @@ fn normalize_bounds(bounds: Bounds) -> Option<Bounds> {
     Some(bounds)
 }
 
-async fn actions_from_proxies(
-    proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>,
-) -> Vec<AccessibilityAction> {
+async fn actions_from_proxies(proxies: Option<&Proxies<'_>>) -> Vec<AccessibilityAction> {
     let Some(proxies) = proxies else {
         return Vec::new();
     };
@@ -933,9 +918,7 @@ async fn states_from_proxy(proxy: &AccessibleProxy<'_>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn value_from_proxies(
-    proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>,
-) -> Option<AccessibilityValue> {
+async fn value_from_proxies(proxies: Option<&Proxies<'_>>) -> Option<AccessibilityValue> {
     let value = proxies?.value().await.ok()?;
     Some(AccessibilityValue {
         current: value.current_value().await.ok()?,
@@ -946,9 +929,7 @@ async fn value_from_proxies(
     })
 }
 
-async fn text_from_proxies(
-    proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>,
-) -> Option<AccessibilityText> {
+async fn text_from_proxies(proxies: Option<&Proxies<'_>>) -> Option<AccessibilityText> {
     let text = proxies?.text().await.ok()?;
     let character_count = text.character_count().await.ok()?.max(0);
     let caret_offset = text.caret_offset().await.ok();
@@ -982,7 +963,7 @@ async fn text_from_proxies(
     })
 }
 
-async fn supports_editable_text(proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>) -> bool {
+async fn supports_editable_text(proxies: Option<&Proxies<'_>>) -> bool {
     let Some(proxies) = proxies else {
         return false;
     };
@@ -990,7 +971,7 @@ async fn supports_editable_text(proxies: Option<&atspi::proxy::proxy_ext::Proxie
 }
 
 fn state_labels(state_set: StateSet) -> Vec<String> {
-    state_set.iter().map(|state| state.to_string()).collect()
+    state_set.labels()
 }
 
 fn select_action_index(actions: &[atspi::Action], requested_action: Option<&str>) -> Result<i32> {
@@ -1051,7 +1032,7 @@ fn object_ref_from_id(object_ref_id: &str) -> Result<ObjectRefOwned> {
         .with_context(|| format!("invalid AT-SPI bus name in object ref {object_ref_id}"))?;
     let path = ObjectPath::try_from(path.to_string())
         .with_context(|| format!("invalid AT-SPI object path in object ref {object_ref_id}"))?;
-    Ok(ObjectRef::new_owned(name, path))
+    Ok(ObjectRefOwned::new(name, path))
 }
 
 fn split_object_ref_id(object_ref_id: &str) -> Result<(&str, &str)> {
@@ -1144,7 +1125,7 @@ mod tests {
 
     #[test]
     fn state_labels_serialize_in_bit_order() {
-        let labels = state_labels(StateSet::new(atspi::State::Focused | atspi::State::Checked));
+        let labels = state_labels(StateSet::from_words(vec![(1 << 12) | (1 << 4), 0]).unwrap());
 
         assert_eq!(labels, vec!["checked".to_string(), "focused".to_string()]);
     }

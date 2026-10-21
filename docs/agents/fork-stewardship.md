@@ -8,7 +8,7 @@
 `efedb9c107a49100c8d69eeffb9610dee1181d7a`. The onboarding baseline was
 `663930fef8d1bee64b7b8f833b68cff3196059e3`.
 
-The fork carries one runtime behavior change in `src/windowing/target.rs`:
+The fork carries a runtime behavior change in `src/windowing/target.rs`:
 standalone app ID, WM class, and title selectors require a unique match, and
 title selectors prefer an exact match before falling back to a substring.
 Regression coverage lives in `src/windowing/mod.rs`. Package and binary
@@ -31,10 +31,17 @@ The fork also carries development dependency integrity enforcement:
 - `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
   constraint.
 
-`.cargo/audit.toml` temporarily accepts the three informational retirement
-notices for standalone zvariant/zbus_names crates while the published AT-SPI
-stack still requires zbus 5. Each exception has a removal condition; vulnerability
-advisories remain enforced. Migrate this stack together when AT-SPI supports zbus 6.
+The fork also uses zbus 6 and private AT-SPI bindings in `src/atspi.rs` and
+`src/atspi/`. The published AT-SPI wrappers require zbus 5 and its retired
+standalone wire-format crates. The private bindings preserve this application's
+protocol surface, destination-pinned calls, uncached properties, role/state
+labels, and disabled P2P routing. Their isolated D-Bus tests cover wire formats
+and connection behavior; the adapted definitions retain upstream MIT attribution
+in `THIRD_PARTY_LICENSES/atspi-MIT.txt`. Portal, GNOME, and KWin callers use the
+zbus 6 API while retaining their sender, path, and owner checks.
+
+The three informational retirement exceptions have been removed from
+`.cargo/audit.toml`; the existing build-only quick-xml exceptions remain.
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens

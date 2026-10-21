@@ -7,8 +7,7 @@ use anyhow::{bail, Context, Result};
 use std::{collections::HashMap, process::Command};
 use zbus::{
     names::{BusName, OwnedUniqueName},
-    zvariant::OwnedValue,
-    Proxy,
+    OwnedVariant, Proxy,
 };
 
 pub const GNOME_SHELL_INTROSPECT_BACKEND: &str = "gnome-shell-introspect";
@@ -81,7 +80,7 @@ pub async fn list_introspect_windows() -> Result<Vec<WindowInfo>> {
     )
     .await
     .context("failed to create GNOME Shell introspection proxy")?;
-    let windows: HashMap<u64, HashMap<String, OwnedValue>> = proxy
+    let windows: HashMap<u64, HashMap<String, OwnedVariant>> = proxy
         .call("GetWindows", &())
         .await
         .context("GNOME Shell GetWindows call failed")?;
@@ -191,7 +190,7 @@ pub(crate) async fn resize_extension_window(
     extension_window_op("ResizeWindow", &(window_id, width, height)).await
 }
 
-async fn extension_window_op<B: serde::Serialize + zbus::zvariant::DynamicType>(
+async fn extension_window_op<B: serde::Serialize + zbus::DynamicType>(
     method: &str,
     body: &B,
 ) -> Result<String> {
@@ -314,7 +313,7 @@ fn parse_gdbus_unique_name(output: &str) -> Option<String> {
 
 pub(crate) fn window_from_properties(
     window_id: u64,
-    properties: &HashMap<String, OwnedValue>,
+    properties: &HashMap<String, OwnedVariant>,
 ) -> WindowInfo {
     let width = get_u32(properties, "width");
     let height = get_u32(properties, "height");
@@ -341,26 +340,26 @@ pub(crate) fn window_from_properties(
     }
 }
 
-fn get_string(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+fn get_string(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<String> {
     properties
         .get(key)
         .and_then(|value| <&str>::try_from(value).ok())
         .map(ToOwned::to_owned)
 }
 
-fn get_bool(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
+fn get_bool(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<bool> {
     properties
         .get(key)
         .and_then(|value| bool::try_from(value).ok())
 }
 
-fn get_u32(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
+fn get_u32(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<u32> {
     properties
         .get(key)
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn get_i32(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<i32> {
+fn get_i32(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<i32> {
     properties.get(key).and_then(|value| {
         i32::try_from(value).ok().or_else(|| {
             u32::try_from(value)

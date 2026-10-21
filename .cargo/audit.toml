@@ -3,22 +3,6 @@
 # Ignored advisories must carry a justification and an unignore condition.
 [advisories]
 ignore = [
-    # RUSTSEC-2026-0370 / -0371 / -0372 are informational retirement notices:
-    # zvariant, zbus_names, and zvariant_derive moved into zbus 6.0.0.
-    # No vulnerability or patched standalone version is reported.
-    # zvariant and zbus_names are used at runtime; zvariant_derive is a
-    # compile-time procedural macro. These exceptions accept their
-    # maintenance status, not an assertion that inputs are unreachable.
-    # Our AT-SPI stack requires zbus 5, including the latest published
-    # atspi 0.30.0 and atspi-connection 0.14.0 checked on 2026-10-21.
-    # Remove these exceptions when AT-SPI supports zbus 6 and the graph can
-    # migrate together (verify cargo tree -i zvariant and -i zbus_names).
-    # This does not ignore any present or future vulnerability advisory.
-    # https://github.com/z-galaxy/zbus/issues/2043
-    "RUSTSEC-2026-0370",
-    "RUSTSEC-2026-0371",
-    "RUSTSEC-2026-0372",
-
     # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.39.x DoS issues
     # (quadratic dup-attribute check, unbounded namespace allocation).
     # quick-xml is reachable only through wayland-scanner, a proc-macro that
