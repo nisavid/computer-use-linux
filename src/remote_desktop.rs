@@ -17,11 +17,7 @@ use std::{
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use xkeysym::Keysym;
-use zbus::{
-    proxy::SignalStream,
-    zvariant::{OwnedObjectPath, OwnedValue, Value},
-    Connection, Proxy,
-};
+use zbus::{proxy::SignalStream, Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
 
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -1304,7 +1300,7 @@ fn restore_token_to_keep(granted: bool, parsed: ParsedRestoreToken) -> ParsedRes
     }
 }
 
-fn parse_restore_token(results: &HashMap<String, OwnedValue>) -> ParsedRestoreToken {
+fn parse_restore_token(results: &HashMap<String, OwnedVariant>) -> ParsedRestoreToken {
     let Some(value) = results.get("restore_token") else {
         return ParsedRestoreToken::Absent;
     };
@@ -1639,12 +1635,15 @@ async fn create_remote_desktop_session(connection: &Connection) -> Result<OwnedO
     let (request_path, mut response_stream) =
         portal_request_stream(connection, "rd_create").await?;
     let session_token = request_token("rd_session");
-    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    let mut options: HashMap<&str, Variant<'_>> = HashMap::new();
     options.insert(
         "handle_token",
-        Value::from(last_path_component(&request_path)),
+        Variant::from(last_path_component(&request_path)),
     );
-    options.insert("session_handle_token", Value::from(session_token.as_str()));
+    options.insert(
+        "session_handle_token",
+        Variant::from(session_token.as_str()),
+    );
 
     let handle: OwnedObjectPath = tokio::time::timeout(
         PORTAL_CALL_TIMEOUT,
@@ -1705,17 +1704,17 @@ async fn select_devices(
         portal_request_stream(connection, request_prefix).await?;
     let requested =
         device_select_persistence(permit.is_some(), permit.and_then(RestorePermit::token));
-    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    let mut options: HashMap<&str, Variant<'_>> = HashMap::new();
     options.insert(
         "handle_token",
-        Value::from(last_path_component(&request_path)),
+        Variant::from(last_path_component(&request_path)),
     );
-    options.insert("types", Value::from(device_types));
+    options.insert("types", Variant::from(device_types));
     if let Some(mode) = requested.persist_mode {
-        options.insert("persist_mode", Value::from(mode));
+        options.insert("persist_mode", Variant::from(mode));
     }
     if let Some(token) = requested.restore_token.as_deref() {
-        options.insert("restore_token", Value::from(token));
+        options.insert("restore_token", Variant::from(token));
     }
 
     let handle: OwnedObjectPath = tokio::time::timeout(
@@ -1734,13 +1733,13 @@ async fn select_devices(
 }
 
 fn insert_screencast_source_options<'a>(
-    options: &mut HashMap<&'a str, Value<'a>>,
+    options: &mut HashMap<&'a str, Variant<'a>>,
     handle_token: &'a str,
 ) {
-    options.insert("handle_token", Value::from(handle_token));
-    options.insert("types", Value::from(SOURCE_MONITOR));
-    options.insert("multiple", Value::from(true));
-    options.insert("cursor_mode", Value::from(CURSOR_MODE_HIDDEN));
+    options.insert("handle_token", Variant::from(handle_token));
+    options.insert("types", Variant::from(SOURCE_MONITOR));
+    options.insert("multiple", Variant::from(true));
+    options.insert("cursor_mode", Variant::from(CURSOR_MODE_HIDDEN));
 }
 
 async fn select_monitor_sources(connection: &Connection, session: &OwnedObjectPath) -> Result<()> {
@@ -1750,7 +1749,7 @@ async fn select_monitor_sources(connection: &Connection, session: &OwnedObjectPa
     // Persistence stays on RemoteDesktop.SelectDevices. persist_mode or
     // restore_token here makes the portal reject the call: "Remote desktop
     // sessions cannot persist".
-    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    let mut options: HashMap<&str, Variant<'_>> = HashMap::new();
     insert_screencast_source_options(&mut options, last_path_component(&request_path));
 
     let handle: OwnedObjectPath = tokio::time::timeout(
@@ -1774,10 +1773,10 @@ async fn start_remote_desktop_session(
 ) -> Result<(u32, Vec<PortalStream>, ParsedRestoreToken)> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
     let (request_path, mut response_stream) = portal_request_stream(connection, "rd_start").await?;
-    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    let mut options: HashMap<&str, Variant<'_>> = HashMap::new();
     options.insert(
         "handle_token",
-        Value::from(last_path_component(&request_path)),
+        Variant::from(last_path_component(&request_path)),
     );
 
     let handle: OwnedObjectPath = tokio::time::timeout(
@@ -1812,7 +1811,7 @@ async fn notify_pointer_motion_absolute(
     x: f64,
     y: f64,
 ) -> Result<()> {
-    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<&str, Variant<'_>> = HashMap::new();
     let _: () = tokio::time::timeout(
         INPUT_TIMEOUT,
         proxy.call(
@@ -1832,7 +1831,7 @@ async fn notify_pointer_button(
     button: i32,
     state: u32,
 ) -> Result<()> {
-    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<&str, Variant<'_>> = HashMap::new();
     let _: () = tokio::time::timeout(
         INPUT_TIMEOUT,
         proxy.call("NotifyPointerButton", &(session, options, button, state)),
@@ -1849,7 +1848,7 @@ async fn notify_pointer_axis_discrete(
     axis: u32,
     steps: i32,
 ) -> Result<()> {
-    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<&str, Variant<'_>> = HashMap::new();
     let _: () = tokio::time::timeout(
         INPUT_TIMEOUT,
         proxy.call(
@@ -1883,7 +1882,7 @@ async fn notify_keyboard_keysym(
     keysym: i32,
     state: u32,
 ) -> Result<()> {
-    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<&str, Variant<'_>> = HashMap::new();
     let _: () = tokio::time::timeout(
         INPUT_TIMEOUT,
         proxy.call("NotifyKeyboardKeysym", &(session, options, keysym, state)),
@@ -1900,7 +1899,7 @@ async fn notify_keyboard_keycode(
     keycode: i32,
     state: u32,
 ) -> Result<()> {
-    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<&str, Variant<'_>> = HashMap::new();
     let _: () = tokio::time::timeout(
         INPUT_TIMEOUT,
         proxy.call("NotifyKeyboardKeycode", &(session, options, keycode, state)),
@@ -1990,7 +1989,7 @@ async fn await_portal_response(
     handle: OwnedObjectPath,
     expected_request_path: &str,
     response_stream: &mut SignalStream<'_>,
-) -> Result<(u32, HashMap<String, OwnedValue>)> {
+) -> Result<(u32, HashMap<String, OwnedVariant>)> {
     if handle.as_str() != expected_request_path {
         *response_stream = Proxy::new(
             connection,
@@ -2043,14 +2042,14 @@ async fn mutter_stage_views_scaled(connection: &Connection) -> bool {
 }
 
 /// The trailing `a{sv}` of GetCurrentState's `(ua(...)a(...)a{sv})` reply.
-fn current_state_properties(message: &zbus::Message) -> Option<HashMap<String, OwnedValue>> {
+fn current_state_properties(message: &zbus::Message) -> Option<HashMap<String, OwnedVariant>> {
     let body = message.body();
-    let state: zbus::zvariant::Structure = body.deserialize().ok()?;
+    let state: zbus::Structure = body.deserialize().ok()?;
     let properties = state.fields().get(3)?.try_clone().ok()?;
-    OwnedValue::try_from(properties).ok()?.try_into().ok()
+    OwnedVariant::try_from(properties).ok()?.try_into().ok()
 }
 
-fn layout_mode_is_logical(properties: &HashMap<String, OwnedValue>) -> bool {
+fn layout_mode_is_logical(properties: &HashMap<String, OwnedVariant>) -> bool {
     properties
         .get("layout-mode")
         .and_then(|value| value.try_clone().ok())
@@ -2078,8 +2077,8 @@ fn assign_stream_pixel_scales(streams: &mut [PortalStream], layout: Option<&[Log
     }
 }
 
-fn parse_streams(value: &OwnedValue) -> Result<Vec<PortalStream>> {
-    let streams: Vec<(u32, HashMap<String, OwnedValue>)> = value
+fn parse_streams(value: &OwnedVariant) -> Result<Vec<PortalStream>> {
+    let streams: Vec<(u32, HashMap<String, OwnedVariant>)> = value
         .try_clone()
         .context("failed to clone streams response")?
         .try_into()
@@ -2095,7 +2094,7 @@ fn parse_streams(value: &OwnedValue) -> Result<Vec<PortalStream>> {
         .collect())
 }
 
-fn get_pair_i32(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<(i32, i32)> {
+fn get_pair_i32(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<(i32, i32)> {
     properties.get(key).and_then(|value| {
         value
             .try_clone()
@@ -2722,10 +2721,91 @@ mod tests {
     #[test]
     fn only_mutter_logical_layout_mode_counts_as_scaled_stage_views() {
         let mode =
-            |value: u32| HashMap::from([("layout-mode".to_string(), OwnedValue::from(value))]);
+            |value: u32| HashMap::from([("layout-mode".to_string(), OwnedVariant::from(value))]);
         assert!(layout_mode_is_logical(&mode(1)));
         assert!(!layout_mode_is_logical(&mode(2)));
         assert!(!layout_mode_is_logical(&HashMap::new()));
+    }
+
+    #[test]
+    fn mutter_current_state_decodes_four_top_level_fields() {
+        type Properties = HashMap<&'static str, Variant<'static>>;
+        let monitor_spec = ("DP-1", "Example", "Monitor", "1234");
+        let mode = (
+            "1920x1080@60.000",
+            1920_i32,
+            1080_i32,
+            60_f64,
+            1_f64,
+            vec![1_f64, 1.25_f64, 2_f64],
+            Properties::from([("is-current", Variant::from(true))]),
+        );
+        let monitors = vec![(monitor_spec, vec![mode], Properties::new())];
+        let logical_monitors = vec![(
+            0_i32,
+            0_i32,
+            1.25_f64,
+            0_u32,
+            true,
+            vec![monitor_spec],
+            Properties::new(),
+        )];
+        let properties = Properties::from([("layout-mode", Variant::from(1_u32))]);
+        let request = zbus::Message::method_call(MUTTER_DISPLAY_CONFIG_PATH, "GetCurrentState")
+            .interface(MUTTER_DISPLAY_CONFIG)
+            .sender(":1.7")
+            .build(&())
+            .unwrap();
+        let response = zbus::Message::method_return(&request.header())
+            .build(&(42_u32, monitors, logical_monitors, properties))
+            .unwrap();
+        assert_eq!(
+            response.body().signature().to_string_no_parens(),
+            "ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv}"
+        );
+
+        let properties = current_state_properties(&response).expect("Mutter state properties");
+        assert!(layout_mode_is_logical(&properties));
+        assert_eq!(properties.len(), 1);
+    }
+
+    #[test]
+    fn portal_start_response_decodes_streams_and_restore_token() {
+        let properties = HashMap::from([
+            ("position", Variant::from((-1920_i32, 0_i32))),
+            ("size", Variant::from((1920_i32, 1080_i32))),
+        ]);
+        let results = HashMap::from([
+            ("streams", Variant::from(vec![(17_u32, properties)])),
+            ("devices", Variant::from(DEVICE_POINTER)),
+            ("restore_token", Variant::from("opaque-restore-token")),
+        ]);
+        let response = zbus::Message::signal(
+            "/org/freedesktop/portal/desktop/request/1_7/token",
+            PORTAL_REQUEST_INTERFACE,
+            "Response",
+        )
+        .build(&(0_u32, results))
+        .unwrap();
+        assert_eq!(response.body().signature().to_string_no_parens(), "ua{sv}");
+
+        let (code, results): (u32, HashMap<String, OwnedVariant>) =
+            response.body().deserialize().unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            u32::try_from(results.get("devices").unwrap()).unwrap(),
+            DEVICE_POINTER
+        );
+        let streams = parse_streams(results.get("streams").unwrap()).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].node_id, 17);
+        assert_eq!(streams[0].position, Some((-1920, 0)));
+        assert_eq!(streams[0].size, Some((1920, 1080)));
+        assert!(matches!(
+            parse_restore_token(&results),
+            ParsedRestoreToken::Usable(token) if token == "opaque-restore-token"
+        ));
+        assert!(parse_streams(&OwnedVariant::from(17_u32)).is_err());
     }
 
     #[test]
@@ -2809,7 +2889,7 @@ mod tests {
             ParsedRestoreToken::Rejected
         ));
 
-        results.insert("restore_token".to_string(), OwnedValue::from(1u32));
+        results.insert("restore_token".to_string(), OwnedVariant::from(1u32));
         assert!(matches!(
             parse_restore_token(&results),
             ParsedRestoreToken::Rejected
@@ -2986,8 +3066,8 @@ mod tests {
         assert!(std::fs::read_dir(&real).unwrap().next().is_none());
     }
 
-    fn owned_portal_string(value: &str) -> OwnedValue {
-        OwnedValue::try_from(zbus::zvariant::Value::from(value)).expect("string portal value")
+    fn owned_portal_string(value: &str) -> OwnedVariant {
+        OwnedVariant::try_from(zbus::Variant::from(value)).expect("string portal value")
     }
 
     struct TempState {

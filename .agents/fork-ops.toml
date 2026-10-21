@@ -94,7 +94,7 @@ kind = "other"
 path = ".github/workflows/ci.yml"
 domain = "validation"
 portability_hint = "fork-specific"
-notes = "Upstream-owned. The fork carries a weekly schedule trigger that catches stable-toolchain rot on main and Pi dependency integrity checks before installation."
+notes = "Upstream-owned. The fork carries a weekly schedule trigger that catches stable-toolchain rot on main, Pi dependency integrity checks before installation, immutable action pins, and disabled checkout credential persistence throughout the CI/release workflow."
 
 [[local_surfaces]]
 kind = "other"
@@ -133,7 +133,7 @@ kind = "config"
 path = ".cargo/audit.toml"
 domain = "validation"
 portability_hint = "fork-specific"
-notes = "Temporary informational zbus retirement exceptions until the AT-SPI stack supports zbus 6; vulnerability advisories remain enforced."
+notes = "The zbus 6 migration removes the standalone-crate retirement exceptions; pre-existing build-only quick-xml exceptions remain."
 
 [[local_surfaces]]
 kind = "other"
@@ -155,3 +155,10 @@ path = "src/lib.rs"
 domain = "runtime"
 portability_hint = "fork-specific"
 notes = "Private AT-SPI transport module registration."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/atspi.rs"
+domain = "accessibility"
+portability_hint = "fork-specific"
+notes = "Private AT-SPI bindings using zbus 6, with protocol tests and role/state definitions in src/atspi/. The dependency graph no longer includes retired standalone zvariant or zbus_names crates."

@@ -6,18 +6,18 @@
 
 use std::{io, os::fd::OwnedFd, process::Stdio, time::Duration};
 
+use crate::atspi::BusProxy;
 use anyhow::{bail, Context, Result};
-use atspi::proxy::bus::BusProxy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zbus::{
     address::transport::{TcpTransportFamily, Transport, UnixSocket},
     connection::{
-        socket::{BoxedSplit, ReadHalf, Split},
-        Builder,
+        socket::{BoxedSplit, ReadHalf, Split, WriteHalf},
+        AuthMechanism, Builder,
     },
     export::async_trait::async_trait,
     fdo::ConnectionCredentials,
-    Address, AuthMechanism, Connection, Message,
+    Address, Connection, Message,
 };
 
 pub(crate) const MAX_MESSAGE_BYTES: usize = 256 * 1024;
@@ -88,10 +88,175 @@ fn capped_builder(
         auth_line: Vec::new(),
         expected_guid,
     });
-    let builder = Builder::socket(Split::new(read, write)).max_queued(8);
+    let builder = Builder::socket(Split::new(read, write))
+        .max_queued(std::num::NonZeroUsize::new(8).unwrap());
     match method_timeout {
         Some(timeout) => builder.method_timeout(timeout),
         None => builder,
+    }
+}
+
+// zbus 6 keeps its built-in socket adapters private. These byte-stream
+// adapters preserve authentication and descriptor passing while placing the
+// frame-size check in front of its decoder.
+#[derive(Debug)]
+struct UnixIo(std::sync::Arc<tokio::net::UnixStream>);
+
+fn unix_socket(stream: tokio::net::UnixStream) -> BoxedSplit {
+    let stream = std::sync::Arc::new(stream);
+    Split::new(
+        Box::new(UnixIo(stream.clone())) as Box<dyn ReadHalf>,
+        Box::new(UnixIo(stream)) as Box<dyn WriteHalf>,
+    )
+}
+
+#[async_trait]
+impl ReadHalf for UnixIo {
+    async fn recvmsg(&mut self, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+        use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+        self.0
+            .async_io(tokio::io::Interest::READABLE, || {
+                let mut storage = [std::mem::MaybeUninit::uninit();
+                    rustix::cmsg_space!(ScmRights(MAX_FRAME_FDS))];
+                let mut ancillary = RecvAncillaryBuffer::new(&mut storage);
+                let result = recvmsg(
+                    self.0.as_ref(),
+                    &mut [io::IoSliceMut::new(buf)],
+                    &mut ancillary,
+                    RecvFlags::CMSG_CLOEXEC,
+                )?;
+                let mut fds = Vec::new();
+                for message in ancillary.drain() {
+                    match message {
+                        RecvAncillaryMessage::ScmRights(received) => fds.extend(received),
+                        RecvAncillaryMessage::ScmCredentials(_) => {}
+                        _ => {
+                            return Err(limit_error(
+                                "unexpected accessibility message ancillary data",
+                            ))
+                        }
+                    }
+                }
+                if fds.len() > MAX_FRAME_FDS
+                    || result.flags.contains(rustix::net::ReturnFlags::CTRUNC)
+                {
+                    return Err(limit_error(
+                        "accessibility message descriptors exceed limit",
+                    ));
+                }
+                Ok((result.bytes, fds))
+            })
+            .await
+    }
+
+    fn can_pass_unix_fd(&self) -> bool {
+        true
+    }
+
+    async fn peer_credentials(&mut self) -> io::Result<ConnectionCredentials> {
+        let peer = self.0.peer_cred()?;
+        let mut credentials = ConnectionCredentials::default().set_unix_user_id(peer.uid());
+        if let Some(pid) = peer.pid() {
+            credentials = credentials.set_process_id(pid as u32);
+        }
+        Ok(credentials)
+    }
+}
+
+#[async_trait]
+impl WriteHalf for UnixIo {
+    async fn sendmsg(
+        &mut self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> io::Result<usize> {
+        use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        if fds.len() > MAX_FRAME_FDS {
+            return Err(limit_error("too many outgoing accessibility descriptors"));
+        }
+        self.0
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                let mut storage = [std::mem::MaybeUninit::uninit();
+                    rustix::cmsg_space!(ScmRights(MAX_FRAME_FDS))];
+                let mut ancillary = SendAncillaryBuffer::new(&mut storage);
+                if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(fds)) {
+                    return Err(limit_error(
+                        "outgoing accessibility descriptors exceed limit",
+                    ));
+                }
+                Ok(sendmsg(
+                    self.0.as_ref(),
+                    &[io::IoSlice::new(buf)],
+                    &mut ancillary,
+                    SendFlags::NOSIGNAL,
+                )?)
+            })
+            .await
+    }
+
+    async fn close(&mut self) -> io::Result<()> {
+        rustix::net::shutdown(self.0.as_ref(), rustix::net::Shutdown::Both)?;
+        Ok(())
+    }
+
+    fn can_pass_unix_fd(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct StreamRead<R>(R, AuthMechanism);
+#[derive(Debug)]
+struct StreamWrite<W>(W);
+
+fn stream_socket<S>(stream: S, auth: AuthMechanism) -> BoxedSplit
+where
+    S: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Unpin
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+{
+    let (read, write) = tokio::io::split(stream);
+    Split::new(
+        Box::new(StreamRead(read, auth)) as Box<dyn ReadHalf>,
+        Box::new(StreamWrite(write)) as Box<dyn WriteHalf>,
+    )
+}
+
+#[async_trait]
+impl<R: tokio::io::AsyncRead + Unpin + std::fmt::Debug + Send + Sync + 'static> ReadHalf
+    for StreamRead<R>
+{
+    async fn recvmsg(&mut self, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+        Ok((self.0.read(buf).await?, Vec::new()))
+    }
+    fn auth_mechanism(&self) -> AuthMechanism {
+        self.1
+    }
+}
+
+#[async_trait]
+impl<W: tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send + Sync + 'static> WriteHalf
+    for StreamWrite<W>
+{
+    async fn sendmsg(
+        &mut self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> io::Result<usize> {
+        if !fds.is_empty() {
+            return Err(limit_error("byte stream cannot pass file descriptors"));
+        }
+        self.0.write(buf).await
+    }
+    async fn flush(&mut self) -> io::Result<()> {
+        self.0.flush().await
+    }
+    async fn close(&mut self) -> io::Result<()> {
+        self.0.shutdown().await
     }
 }
 
@@ -115,7 +280,7 @@ async fn open_socket(address: &Address) -> Result<(BoxedSplit, Address)> {
                     }
                     _ => bail!("unsupported accessibility bus Unix address"),
                 };
-                stream.into()
+                unix_socket(stream)
             }
             Transport::Tcp(tcp) => {
                 let mut last_error =
@@ -151,7 +316,7 @@ async fn open_socket(address: &Address) -> Result<(BoxedSplit, Address)> {
                     }
                     stream.write_all(&bytes).await?;
                 }
-                stream.into()
+                stream_socket(stream, AuthMechanism::Anonymous)
             }
             Transport::Unixexec(exec) => {
                 let mut command = tokio::process::Command::new(exec.path());
@@ -164,10 +329,13 @@ async fn open_socket(address: &Address) -> Result<(BoxedSplit, Address)> {
                     command.arg0(arg0);
                 }
                 let mut child = command.spawn()?;
-                let read: Box<dyn ReadHalf> =
-                    Box::new(child.stdout.take().context("missing bus stdout")?);
-                let write: Box<dyn zbus::connection::socket::WriteHalf> =
-                    Box::new(child.stdin.take().context("missing bus stdin")?);
+                let read: Box<dyn ReadHalf> = Box::new(StreamRead(
+                    child.stdout.take().context("missing bus stdout")?,
+                    AuthMechanism::External,
+                ));
+                let write: Box<dyn zbus::connection::socket::WriteHalf> = Box::new(StreamWrite(
+                    child.stdin.take().context("missing bus stdin")?,
+                ));
                 Split::new(read, write)
             }
             Transport::Ibus(_) => {
@@ -418,17 +586,17 @@ async fn test_connection_pair_with_method_timeout(
     const GUID: &str = "0123456789abcdef0123456789abcdef";
     let (server, client) = tokio::io::duplex(16 * 1024);
     let server = Builder::socket(socket(server))
-        .server(zbus::Guid::from_static_str(GUID)?)?
+        .server(zbus::Guid::from_static_str(GUID)?)
         .auth_mechanism(AuthMechanism::Anonymous)
         .p2p()
         // Model both the registry/provider and the bus PID lookup service.
-        .unique_name("org.freedesktop.DBus")?
+        .unique_name("org.freedesktop.DBus")
         // Builder waits for object-server subscription before returning.
-        .serve_at("/org/test/Ready", Ready)?;
+        .serve_at("/org/test/Ready", Ready);
     let client = capped_builder(socket(client), Some(GUID.to_owned()), method_timeout)
         .auth_mechanism(AuthMechanism::Anonymous)
         .p2p()
-        .unique_name(":1.43")?;
+        .unique_name(":1.43");
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         Ok(tokio::try_join!(server.build(), client.build())?)
     })
@@ -438,12 +606,91 @@ async fn test_connection_pair_with_method_timeout(
 
 #[cfg(test)]
 mod tests {
+    struct UnixService;
+
+    #[zbus::interface(name = "org.test.UnixTransport")]
+    impl UnixService {
+        fn descriptor(&self) -> zbus::fdo::Result<zbus::OwnedFd> {
+            let file = std::fs::File::open("/dev/null")
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            Ok(zbus::OwnedFd::from(OwnedFd::from(file)))
+        }
+    }
+
+    // This exercises the real Unix adapter against zbus's native transport,
+    // including EXTERNAL authentication and descriptors carried in a reply.
+    #[tokio::test]
+    async fn unix_transport_authenticates_and_preserves_reply_descriptors() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        const GUID: &str = "0123456789abcdef0123456789abcdef";
+        let server = Builder::unix_stream(server.into_std().unwrap())
+            .server(zbus::Guid::from_static_str(GUID).unwrap())
+            .p2p()
+            .unique_name("org.freedesktop.DBus")
+            .serve_at("/org/test/Unix", UnixService);
+        let client = capped_builder(
+            unix_socket(client),
+            Some(GUID.to_owned()),
+            Some(METHOD_TIMEOUT),
+        )
+        .p2p()
+        .unique_name(":1.43");
+        let (server, client) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            tokio::try_join!(server.build(), client.build())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let proxy = zbus::Proxy::new(
+            &client,
+            "org.freedesktop.DBus",
+            "/org/test/Unix",
+            "org.test.UnixTransport",
+        )
+        .await
+        .unwrap();
+        let fd: zbus::OwnedFd = proxy.call("Descriptor", &()).await.unwrap();
+        assert!(std::fs::File::from(OwnedFd::from(fd)).metadata().is_ok());
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn unix_transport_rejects_excess_ancillary_descriptors() {
+        use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use std::os::fd::AsFd;
+
+        let (sender, receiver) = tokio::net::UnixStream::pair().unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fds = vec![file.as_fd(); MAX_FRAME_FDS + 1];
+        let mut storage =
+            [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FRAME_FDS + 1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut storage);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+        sender
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                sendmsg(
+                    &sender,
+                    &[io::IoSlice::new(b"x")],
+                    &mut ancillary,
+                    SendFlags::NOSIGNAL,
+                )
+                .map_err(io::Error::from)
+            })
+            .await
+            .unwrap();
+        let mut receiver = UnixIo(std::sync::Arc::new(receiver));
+        let error = ReadHalf::recvmsg(&mut receiver, &mut [0; 16])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use zbus::zvariant::Endian;
+    use zbus::wire::Endian;
 
     #[derive(Debug)]
     struct ScriptedRead {
@@ -572,7 +819,6 @@ mod tests {
     async fn normal_messages_in_both_byte_orders_decode_after_partial_header_reads() {
         for endian in [Endian::Little, Endian::Big] {
             let message = Message::signal("/org/test", "org.test.Interface", "Changed")
-                .unwrap()
                 .endian(endian)
                 .build(&"hello")
                 .unwrap();
@@ -591,8 +837,7 @@ mod tests {
         use std::os::fd::AsFd;
         let file = std::fs::File::open("/dev/null").unwrap();
         let message = Message::signal("/org/test", "org.test.Interface", "Changed")
-            .unwrap()
-            .build(&zbus::zvariant::Fd::from(file.as_fd()))
+            .build(&zbus::Fd::from(file.as_fd()))
             .unwrap();
         let mut read = capped(Box::new(ScriptedRead {
             data: message.data().to_vec(),
@@ -605,7 +850,7 @@ mod tests {
             .receive_message(0, &mut Vec::new(), &mut Vec::new())
             .await
             .unwrap();
-        let descriptor: zbus::zvariant::OwnedFd = received.body().deserialize().unwrap();
+        let descriptor: zbus::OwnedFd = received.body().deserialize().unwrap();
         assert!(std::fs::File::from(OwnedFd::from(descriptor))
             .metadata()
             .is_ok());
@@ -615,7 +860,6 @@ mod tests {
     async fn authentication_is_bounded_and_does_not_read_binary_messages() {
         let auth = b"OK 0123456789abcdef0123456789abcdef\r\n";
         let message = Message::signal("/org/test", "org.test.Interface", "Changed")
-            .unwrap()
             .build(&"hello")
             .unwrap();
         let mut bytes = auth.to_vec();

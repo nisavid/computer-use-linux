@@ -26,7 +26,8 @@ agent-maintenance and drift-monitoring infrastructure includes:
 - `AGENTS.md`
 - `docs/agents/`
 - `.agents/upstream-drift.sh` and `.github/workflows/upstream-drift.yml`
-- a weekly `schedule` trigger in upstream's `.github/workflows/ci.yml`
+- a weekly `schedule` trigger, immutable action pins, and disabled checkout
+  credential persistence in upstream's `.github/workflows/ci.yml`
 
 The fork also carries development dependency integrity enforcement:
 
@@ -37,10 +38,17 @@ The fork also carries development dependency integrity enforcement:
 - `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
   constraint.
 
-`.cargo/audit.toml` temporarily accepts the three informational retirement
-notices for standalone zvariant/zbus_names crates while the published AT-SPI
-stack still requires zbus 5. Each exception has a removal condition; vulnerability
-advisories remain enforced. Migrate this stack together when AT-SPI supports zbus 6.
+The fork also uses zbus 6 and private AT-SPI bindings in `src/atspi.rs` and
+`src/atspi/`. The published AT-SPI wrappers require zbus 5 and its retired
+standalone wire-format crates. The private bindings preserve this application's
+protocol surface, destination-pinned calls, uncached properties, role/state
+labels, and disabled P2P routing. Their isolated D-Bus tests cover wire formats
+and connection behavior; the adapted definitions retain upstream MIT attribution
+in `THIRD_PARTY_LICENSES/atspi-MIT.txt`. Portal, GNOME, and KWin callers use the
+zbus 6 API while retaining their sender, path, and owner checks.
+
+The three informational retirement exceptions have been removed from
+`.cargo/audit.toml`; the existing build-only quick-xml exceptions remain.
 
 The fork also disables upstream's `.github/workflows/sync-reminder.yml` in
 GitHub Actions (since 2026-10-01) rather than editing it. That workflow opens
