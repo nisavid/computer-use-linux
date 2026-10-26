@@ -229,9 +229,13 @@ The binary speaks the `rmcp` 2024-11-05 stdio protocol. Pass `mcp` as the only a
 This repo is a plugin marketplace for both Claude Code and Codex. The plugin
 registers the MCP server and ships the `computer-use-linux` skill. On first
 start it downloads the release binaries pinned to the plugin version, checks
-each against its published `.sha256`, and caches them under
-`~/.cache/computer-use-linux/plugin/`. It needs `curl` or `wget`, and nothing
-else is installed.
+each against SHA-256 digests bundled in the plugin, and caches them under
+`~/.cache/computer-use-linux/plugin/`. It verifies both cached files on every
+launch. Automatic downloads require `curl` and allow only HTTPS, including
+redirects; nothing else is installed. Wget-only hosts can install curl or use
+`COMPUTER_USE_LINUX_BIN` to select a trusted local build.
+Verified downloads use a separate cache namespace from older plugin launchers,
+so an overlapping old download cannot replace a verified executable.
 
 Claude Code:
 
@@ -436,7 +440,7 @@ files.
 | Variable | Effect |
 | --- | --- |
 | `COMPUTER_USE_LINUX_BIN` | Run this absolute binary path instead of the one bundled by the npm package. Relative paths are ignored. |
-| `COMPUTER_USE_LINUX_DOWNLOAD_BASE` | Override the GitHub release base URL the installer downloads from (mirrors, air-gapped hosts). |
+| `COMPUTER_USE_LINUX_DOWNLOAD_BASE` | Override the release base with an HTTPS mirror serving the exact pinned binaries. Does not override bundled digests. For local builds, use the local-binary options. |
 | `COMPUTER_USE_LINUX_SKIP_DOWNLOAD=1` | Skip the post-install binary download entirely. |
 | `COMPUTER_USE_LINUX_LOCAL_BINARY` / `…_LOCAL_COSMIC_HELPER` | Install from a local build instead of downloading (used by CI and local testing). |
 

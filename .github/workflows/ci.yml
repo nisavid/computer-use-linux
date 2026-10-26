@@ -157,6 +157,7 @@ jobs:
           test "$cargo_version" = "$npm_version"
       - run: node --check npm/install.js
       - run: node --check npm/bin/computer-use-linux.js
+      - run: node --test scripts/release_integrity_test.mjs
       - run: cargo build --locked
       - name: Test npm wrapper against local binary
         run: |
@@ -282,6 +283,15 @@ jobs:
             sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
             sha256sum computer-use-linux-cosmic-${{ matrix.target }} > computer-use-linux-cosmic-${{ matrix.target }}.sha256
           )
+      - name: Check release bytes match source-distributed plugin pins
+        run: node scripts/update_release_pins.mjs --check dist "${{ matrix.target }}"
+      # Bind npm pins to immutable outputs of this build, independently of
+      # mutable GitHub release downloads.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
@@ -331,6 +341,16 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-artifacts
+      - name: Bind npm pins to this run's build artifacts
+        run: |
+          node scripts/update_release_pins.mjs --check "$RUNNER_TEMP/release-artifacts"
+          node scripts/update_release_pins.mjs "$RUNNER_TEMP/release-artifacts"
+          npm run pack:check
       - name: Publish to npm
         run: |
           test -n "$NODE_AUTH_TOKEN"

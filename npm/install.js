@@ -8,6 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const pkg = require('../package.json');
+const { releasePins } = require('./release-integrity.js');
 
 const archToTarget = {
   x64: 'x86_64',
@@ -36,6 +37,10 @@ function copyLocalBinary(source) {
 
 function download(url, destination, redirects = 5) {
   return new Promise((resolve, reject) => {
+    if (new URL(url).protocol !== 'https:') {
+      reject(new Error('release downloads and redirects must use HTTPS'));
+      return;
+    }
     const request = https.get(url, (response) => {
       if (
         response.statusCode >= 300 &&
@@ -44,8 +49,12 @@ function download(url, destination, redirects = 5) {
         redirects > 0
       ) {
         response.resume();
-        const nextUrl = new URL(response.headers.location, url).toString();
-        download(nextUrl, destination, redirects - 1).then(resolve, reject);
+        try {
+          const nextUrl = new URL(response.headers.location, url).toString();
+          download(nextUrl, destination, redirects - 1).then(resolve, reject);
+        } catch (error) {
+          reject(error);
+        }
         return;
       }
 
@@ -62,14 +71,6 @@ function download(url, destination, redirects = 5) {
     });
     request.on('error', reject);
   });
-}
-
-function parseSha256(text) {
-  const match = text.match(/\b[a-fA-F0-9]{64}\b/);
-  if (!match) {
-    throw new Error('sha256 file did not contain a 64-character hex digest');
-  }
-  return match[0].toLowerCase();
 }
 
 function sha256File(filePath) {
@@ -100,32 +101,30 @@ async function main() {
 
   const asset = `computer-use-linux-${targetArch}-unknown-linux-gnu`;
   const cosmicAsset = `computer-use-linux-cosmic-${targetArch}-unknown-linux-gnu`;
+  // The package, not the mutable download origin, supplies the expected hashes.
+  const pins = releasePins(pkg.version);
   const baseUrl =
     process.env.COMPUTER_USE_LINUX_DOWNLOAD_BASE ||
     `https://github.com/agent-sh/computer-use-linux/releases/download/v${pkg.version}`;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'computer-use-linux-'));
   const tmpBinary = path.join(tmpDir, asset);
-  const tmpSha = path.join(tmpDir, `${asset}.sha256`);
   const tmpCosmic = path.join(tmpDir, cosmicAsset);
-  const tmpCosmicSha = path.join(tmpDir, `${cosmicAsset}.sha256`);
 
   try {
     console.log(`[computer-use-linux] downloading ${asset} from ${baseUrl}`);
     await download(`${baseUrl}/${asset}`, tmpBinary);
-    await download(`${baseUrl}/${asset}.sha256`, tmpSha);
     await download(`${baseUrl}/${cosmicAsset}`, tmpCosmic);
-    await download(`${baseUrl}/${cosmicAsset}.sha256`, tmpCosmicSha);
 
-    const expected = parseSha256(fs.readFileSync(tmpSha, 'utf8'));
+    const expected = pins.get(asset);
     const actual = sha256File(tmpBinary);
     if (actual !== expected) {
-      fail(`sha256 mismatch for ${asset}: expected ${expected}, got ${actual}`);
+      throw new Error(`sha256 mismatch for ${asset}: expected ${expected}, got ${actual}`);
     }
 
-    const expectedCosmic = parseSha256(fs.readFileSync(tmpCosmicSha, 'utf8'));
+    const expectedCosmic = pins.get(cosmicAsset);
     const actualCosmic = sha256File(tmpCosmic);
     if (actualCosmic !== expectedCosmic) {
-      fail(`sha256 mismatch for ${cosmicAsset}: expected ${expectedCosmic}, got ${actualCosmic}`);
+      throw new Error(`sha256 mismatch for ${cosmicAsset}: expected ${expectedCosmic}, got ${actualCosmic}`);
     }
 
     fs.mkdirSync(binDir, { recursive: true });

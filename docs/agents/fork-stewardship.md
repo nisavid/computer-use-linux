@@ -38,6 +38,13 @@ The fork also carries development dependency integrity enforcement:
 - `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
   constraint.
 
+The fork also pins automatic npm/plugin release downloads independently of
+downloaded checksums. Version-bound manifests ship with each installer; the
+plugin checks cached binaries before reuse and requires curl for HTTPS-only
+downloads. The npm publication workflow generates its manifest from immutable
+build artifacts. `CONTRIBUTING.md` records the trusted-build update procedure
+for source-distributed plugin pins.
+
 The fork also uses zbus 6 and private AT-SPI bindings in `src/atspi.rs` and
 `src/atspi/`. The published AT-SPI wrappers require zbus 5 and its retired
 standalone wire-format crates. The private bindings preserve this application's

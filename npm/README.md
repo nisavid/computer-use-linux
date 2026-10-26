@@ -77,8 +77,10 @@ mcp_servers:
 ```
 
 The package downloads the matching Linux x86_64 or aarch64 binary from the
-GitHub release for this package version and verifies the `.sha256` asset before
-installing it. It also installs the matching `computer-use-linux-cosmic` helper
+GitHub release for this package version and verifies digests bundled in the npm
+package before installing it. Downloaded checksum files are not trusted. HTTPS
+mirrors must serve the same pinned bytes; HTTP bases and redirects are rejected.
+It also installs the matching `computer-use-linux-cosmic` helper
 used for COSMIC desktop window targeting.
 
 When installed through Pi, the package supplies native, dynamically loaded

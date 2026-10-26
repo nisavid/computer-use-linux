@@ -1,6 +1,6 @@
 #!/bin/sh
 # Plugin launcher for Claude Code and Codex. Downloads the pinned release
-# binaries on first use, verifies their published sha256, caches them per
+# binaries on first use, verifies their bundled sha256 pins, caches them per
 # version, then execs the server. stdout is left to the MCP stream; every
 # message goes to stderr.
 set -eu
@@ -33,19 +33,52 @@ case "$(uname -m)" in
 esac
 
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/computer-use-linux/plugin"
-cache_dir="$cache_root/v$version"
+# Older launchers can still be running while a host updates this plugin. Their
+# origin-verified writes must never replace files in the verified cache.
+cache_dir="$cache_root/verified-v$version"
 binary="$cache_dir/computer-use-linux"
 helper="$cache_dir/computer-use-linux-cosmic"
+pins="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/release-sha256.txt"
+
+pinned_digest() {
+  found=
+  seen=' '
+  count=0
+  while IFS= read -r record || [ -n "$record" ]; do
+    pin_version=${record%% *}
+    remainder=${record#* }
+    digest=${remainder%% *}
+    asset=${remainder#* }
+    if [ "$pin_version" != "$version" ] || [ "${#digest}" -ne 64 ]; then
+      say "invalid or version-mismatched release pins"
+      return 1
+    fi
+    case "$digest" in *[!a-f0-9]*) say "invalid release digest"; return 1 ;; esac
+    case "$asset" in
+      computer-use-linux-x86_64-unknown-linux-gnu|computer-use-linux-aarch64-unknown-linux-gnu|computer-use-linux-cosmic-x86_64-unknown-linux-gnu|computer-use-linux-cosmic-aarch64-unknown-linux-gnu) ;;
+      *) say "invalid release pin asset"; return 1 ;;
+    esac
+    case "$seen" in *" $asset "*) say "duplicate release pin for $asset"; return 1 ;; esac
+    seen="$seen$asset "
+    count=$((count + 1))
+    if [ "$asset" = "$1" ]; then
+      found=$digest
+    fi
+  done < "$pins"
+  [ "$count" -eq 4 ] && [ -n "$found" ] || { say "missing release pin for $1"; return 1; }
+  printf '%s\n' "$found"
+}
+
+expected_binary=$(pinned_digest "computer-use-linux-$target")
+expected_helper=$(pinned_digest "computer-use-linux-cosmic-$target")
 
 fetch() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 -o "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$2" "$1"
-  else
-    say "curl or wget is required to download the server binary"
+  case "$1" in [hH][tT][tT][pP][sS]://*) ;; *) say "release downloads must use HTTPS"; return 1 ;; esac
+  if ! command -v curl >/dev/null 2>&1; then
+    say "curl is required for HTTPS-only release downloads"
     return 1
   fi
+  curl --proto '=https' --proto-redir '=https' -fsSL --retry 2 -o "$2" "$1"
 }
 
 sha256() {
@@ -68,8 +101,10 @@ install_release() {
     asset="$name-$target"
     say "downloading $asset v$version"
     fetch "$base/$asset" "$tmp/$name"
-    fetch "$base/$asset.sha256" "$tmp/$name.sha256"
-    expected=$(grep -o -E '[0-9a-fA-F]{64}' "$tmp/$name.sha256" | head -n 1 | tr 'A-F' 'a-f')
+    case "$name" in
+      computer-use-linux) expected=$expected_binary ;;
+      computer-use-linux-cosmic) expected=$expected_helper ;;
+    esac
     actual=$(sha256 "$tmp/$name")
     if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
       say "sha256 mismatch for $asset: expected ${expected:-<none>}, got $actual"
@@ -91,12 +126,18 @@ if [ ! -x "$binary" ] || [ ! -x "$helper" ]; then
   install_release
 fi
 
+# Validate both files even on a cache hit before executing either.
+if [ "$(sha256 "$binary")" != "$expected_binary" ] || [ "$(sha256 "$helper")" != "$expected_helper" ]; then
+  say "sha256 mismatch in cached release; remove $cache_dir and retry"
+  exit 1
+fi
+
 # Claude Code and Codex update plugins independently, so another version may
 # still be in use. Mark this one live and drop versions unused for 30 days,
 # plus staging dirs left by a killed download.
 touch "$cache_dir"
 find "$cache_root" -mindepth 1 -maxdepth 1 \
-  \( \( -name 'v*' ! -path "$cache_dir" -mtime +30 \) -o \( -name '.download.*' -mmin +60 \) \) \
+  \( \( \( -name 'v*' -o -name 'verified-v*' \) ! -path "$cache_dir" -mtime +30 \) -o \( -name '.download.*' -mmin +60 \) \) \
   -exec rm -rf {} + 2>/dev/null || true
 
 if [ -z "${COMPUTER_USE_LINUX_COSMIC_HELPER:-}" ]; then
