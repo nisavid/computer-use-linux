@@ -19,6 +19,16 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  gnome-authorization:
+    name: GNOME authorization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y gjs dbus
+      - run: dbus-run-session -- gjs scripts/gnome_extension_dbus_test.js
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -224,6 +234,7 @@ jobs:
   release-binary:
     name: release artifact (${{ matrix.target }})
     needs:
+      - gnome-authorization
       - fmt
       - check
       - clippy
