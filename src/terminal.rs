@@ -21,7 +21,12 @@ pub struct TerminalWindowContext {
 pub struct TerminalProcess {
     pub pid: u32,
     pub command_name: String,
+    // Retain detailed metadata for internal selectors, never public output.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
     pub command_line: String,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
     pub cwd: Option<String>,
 }
 
@@ -444,6 +449,62 @@ mod tests {
             cwd: Some("/home/user".to_string()),
             tty_paths: tty.into_iter().map(ToOwned::to_owned).collect(),
         }
+    }
+
+    #[test]
+    fn enriched_windows_omit_private_metadata_and_preserve_targeting() {
+        let mut windows = vec![terminal_window(11, 100)];
+        let mut root = process(200, 100, 10, "zsh", Some("/dev/pts/0"));
+        root.command_line = "zsh --rcs sentinel-shell".into();
+        root.cwd = Some("/home/user/sentinel-root".into());
+        let mut active = process(201, 200, 11, "codex", Some("/dev/pts/0"));
+        active.command_line = "codex resume sentinel-token".into();
+        active.cwd = Some("/home/user/sentinel-project".into());
+        enrich_terminal_windows_with_processes(
+            &mut windows,
+            &[process(100, 1, 1, "ghostty", None), root, active],
+        );
+        let json = serde_json::to_value(&windows).unwrap();
+        assert!(!json.to_string().contains("sentinel"));
+        for (field, pid, name) in [
+            ("root_process", 200, "zsh"),
+            ("active_process", 201, "codex"),
+        ] {
+            assert_eq!(
+                json[0]["terminal"][field],
+                serde_json::json!({"pid": pid, "command_name": name})
+            );
+        }
+        assert_eq!(json[0]["terminal"]["tty"], "/dev/pts/0");
+        let matched = crate::windows::resolve_window_target(
+            &windows,
+            &crate::windows::WindowTarget {
+                terminal_command: Some("resume sentinel-token".into()),
+                terminal_cwd: Some("sentinel-project".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matched.window_id, 11);
+        let decoded: Vec<WindowInfo> = serde_json::from_value(json).unwrap();
+        let process = decoded[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .active_process
+            .as_ref()
+            .unwrap();
+        assert!(process.command_line.is_empty());
+        assert!(process.cwd.is_none());
+    }
+
+    #[test]
+    fn terminal_schema_omits_private_metadata() {
+        let schema = serde_json::to_value(schemars::schema_for!(TerminalProcess)).unwrap();
+        assert!(schema["properties"]["pid"].is_object());
+        assert!(schema["properties"]["command_name"].is_object());
+        assert!(!schema.to_string().contains("command_line"));
+        assert!(!schema.to_string().contains("cwd"));
     }
 
     #[test]
