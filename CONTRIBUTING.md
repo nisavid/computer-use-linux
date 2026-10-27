@@ -90,7 +90,12 @@ updated before distributing a new plugin version. The fork's release and
 publication restrictions still apply.
 
 Before uploading release assets, CI checks each architecture's build against
-the committed pins. Publication also checks all downloaded workflow artifacts
+the committed pins. Builds remap checkout and Cargo home paths; this reduces
+path-dependent output but does not promise reproducibility across toolchains
+or build environments. Public release creation waits for both architecture
+checks. Publication is restricted to `agent-sh/computer-use-linux`, matching
+the installers' default origin; this fork has no independent release channel.
+Publication also checks all downloaded workflow artifacts
 against those pins. A rebuild that changes bytes must receive updated reviewed
 pins before release; it cannot silently break source-distributed plugins.
 

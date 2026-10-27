@@ -259,6 +259,31 @@ test('pin generation hashes all four trusted local artifacts and mirrors the man
   assert.equal(release.requests.length, 0);
 });
 
+test('release workflow: all architecture checks precede public writes at the installer origin', async () => {
+  const workflow = await fs.readFile(path.join(root, '.github/workflows/ci.yml'), 'utf8');
+  const jobs = new Map([...workflow.matchAll(/^  ([a-z][a-z-]+):\n([\s\S]*?)(?=^  [a-z][a-z-]+:\n|(?![\s\S]))/gm)]
+    .map(([, name, body]) => [name, body]));
+  const build = jobs.get('release-binary');
+  const publish = jobs.get('publish-release');
+  assert.ok(build && publish, 'build and public release must be separate jobs');
+  assert.doesNotMatch(build, /action-gh-release|contents: write/);
+  assert.match(build, /update_release_pins\.mjs --check dist/);
+  assert.match(build, /target: x86_64-unknown-linux-gnu/);
+  assert.match(build, /target: aarch64-unknown-linux-gnu/);
+  assert.match(publish, /needs: \[release-binary\]/);
+  assert.match(publish, /actions\/download-artifact/);
+  assert.match(publish, /action-gh-release/);
+  for (const body of [build, publish]) {
+    assert.match(body, /if: startsWith\(github.ref, 'refs\/tags\/v'\) && github.repository == 'agent-sh\/computer-use-linux'/);
+  }
+  for (const name of ['publish-crate', 'publish-npm']) {
+    assert.match(jobs.get(name), /needs: \[publish-release\]/);
+    assert.doesNotMatch(jobs.get(name), /always\(\)/);
+  }
+  assert.match(build, /--remap-path-prefix=\$GITHUB_WORKSPACE=\/source/);
+  assert.match(build, /--remap-path-prefix=\$HOME\/\.cargo=\/cargo/);
+});
+
 for (const kind of ['npm', 'plugin']) {
   test(`${kind}: valid HTTPS install preserves helper handoff without fetching remote checksums`, async () => {
     const release = await fixture(kind);

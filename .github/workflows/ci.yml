@@ -237,10 +237,9 @@ jobs:
       - npm-wrapper
       - pi-extension
       - zod-schema
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Installer URLs retain the upstream identity; this fork has no release channel.
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'agent-sh/computer-use-linux'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -272,7 +271,11 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           EOF
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$GITHUB_WORKSPACE=/source --remap-path-prefix=$HOME/.cargo=/cargo"
+          cargo build --locked --release --target "$RELEASE_TARGET"
       - name: Stage artifact
         run: |
           mkdir -p dist
@@ -292,18 +295,29 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+  publish-release:
+    name: publish release
+    needs: [release-binary]
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'agent-sh/computer-use-linux'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # All matrix builds and pin checks must finish before the first public write.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            dist/${{ matrix.asset }}
-            dist/${{ matrix.asset }}.sha256
-            dist/computer-use-linux-cosmic-${{ matrix.target }}
-            dist/computer-use-linux-cosmic-${{ matrix.target }}.sha256
+          files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
 
   publish-crate:
     name: publish crate
-    needs: [release-binary]
+    needs: [publish-release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
@@ -328,7 +342,7 @@ jobs:
 
   publish-npm:
     name: publish npm
-    needs: [release-binary]
+    needs: [publish-release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
