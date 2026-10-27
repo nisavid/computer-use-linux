@@ -162,3 +162,18 @@ path = "src/atspi.rs"
 domain = "accessibility"
 portability_hint = "fork-specific"
 notes = "Private AT-SPI bindings using zbus 6, with protocol tests and role/state definitions in src/atspi/. The dependency graph no longer includes retired standalone zvariant or zbus_names crates."
+
+
+[[local_surfaces]]
+kind = "other"
+path = "src/server.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Process discovery exposes names rather than full argv."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/terminal.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Serialization and schemas omit raw argv and cwd; internal selector matching retains them."
