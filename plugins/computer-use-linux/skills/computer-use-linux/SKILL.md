@@ -144,6 +144,8 @@ Pi native tools skip this MCP `command` config; see [Pi setup](references/pi-set
 9. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
 10. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
 
+`type_text` accepts at most 1000 Unicode characters and 4000 UTF-8 bytes per request. Larger input is rejected before focus or input changes. Execution has a 60-second deadline, followed by at most six seconds of key-release and clipboard cleanup. A timeout can leave a typed prefix; inspect the target before retrying. Send larger text as separate bounded requests.
+
 Plain left element/index/selector `click` prefers native AT-SPI `click`,
 `press`, or `toggle` over toolkit bounds, avoiding coordinate
 conversion when available. This preference does not replace a coordinate click
