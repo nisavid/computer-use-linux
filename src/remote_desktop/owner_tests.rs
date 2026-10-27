@@ -424,3 +424,85 @@ fn portal_owner_confirmed_loss_permanently_revokes_the_capability() {
         assert!(!current.load(Ordering::Acquire));
     }
 }
+
+struct MockTypingPortal(
+    tokio::sync::mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
+);
+#[zbus::interface(name = "org.freedesktop.portal.RemoteDesktop")]
+impl MockTypingPortal {
+    async fn notify_keyboard_keysym(
+        &self,
+        _session: OwnedObjectPath,
+        _options: HashMap<String, OwnedVariant>,
+        _keysym: i32,
+        state: u32,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0.send((state, tx)).unwrap();
+        let _ = rx.await;
+    }
+}
+struct MockTypingSession(
+    tokio::sync::mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
+);
+#[zbus::interface(name = "org.freedesktop.portal.Session")]
+impl MockTypingSession {
+    async fn close(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0.send((2, tx)).unwrap();
+        let _ = rx.await;
+    }
+}
+#[tokio::test]
+async fn typing_cancellation_releases_keys_and_closes_before_idle() {
+    let bus = TestBus::start();
+    let service = bus.connect().await;
+    let client = bus.connect().await;
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let path =
+        OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/test/typing").unwrap();
+    service
+        .object_server()
+        .at(PORTAL_DESKTOP_PATH, MockTypingPortal(tx.clone()))
+        .await
+        .unwrap();
+    service
+        .object_server()
+        .at(path.clone(), MockTypingSession(tx))
+        .await
+        .unwrap();
+    service.request_name(PORTAL_DESKTOP_SERVICE).await.unwrap();
+    let session = PortalKeyboardSession {
+        connection: PortalConnection::new(client).await.unwrap(),
+        session_handle: path,
+        input_lock: Arc::new(AsyncMutex::new(())),
+        valid: Arc::new(AtomicBool::new(true)),
+    };
+    let operation_session = session.clone();
+    let task = tokio::spawn(async move {
+        type_text_with_keysyms(&operation_session, &[xkeysym::key::a as i32]).await
+    });
+    let (state, reply) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, KEY_PRESSED);
+    task.abort();
+    let _ = task.await;
+    reply.send(()).unwrap();
+    assert!(!session.is_valid());
+    let mut idle = std::pin::pin!(session.wait_for_input_idle());
+    for expected in [KEY_RELEASED, 2] {
+        let (state, reply) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, expected);
+        assert!(futures_util::poll!(idle.as_mut()).is_pending());
+        reply.send(()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), idle)
+        .await
+        .unwrap();
+    assert!(session.input_lock.try_lock().is_ok());
+}
