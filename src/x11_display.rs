@@ -13,12 +13,14 @@
 //! Callers must gate on [`is_native_x11_session`] first, so XWayland under a
 //! Wayland compositor is never used.
 
+use crate::screenshot::{MAX_SCREENSHOT_DECODED_BYTES, MAX_SCREENSHOT_SOURCE_PIXELS};
 use anyhow::{anyhow, bail, Context, Result};
 use std::{
     env, io,
     net::{IpAddr, SocketAddr, TcpStream},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use x11rb::connection::Connection;
@@ -82,6 +84,112 @@ where
 struct DeadlineStream {
     inner: DefaultStream,
     deadline: Instant,
+    incoming: Mutex<IncomingFrame>,
+}
+
+// Stage the length prefix before x11rb can allocate its packet buffer. Each
+// fresh connection also has an aggregate budget against queued packet floods.
+struct IncomingFrame {
+    setup: bool,
+    header: [u8; 8],
+    filled: usize,
+    sent: usize,
+    body: usize,
+    budget: u64,
+    max_body: u64,
+    failed: bool,
+}
+impl Default for IncomingFrame {
+    fn default() -> Self {
+        Self {
+            setup: true,
+            header: [0; 8],
+            filled: 0,
+            sent: 0,
+            body: 0,
+            budget: 1024 * 1024,
+            max_body: 1024 * 1024,
+            failed: false,
+        }
+    }
+}
+fn frame_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "X11 frame exceeds receive limits",
+    )
+}
+fn read_without_fds(stream: &DefaultStream, buf: &mut [u8]) -> io::Result<usize> {
+    let mut fds = Vec::new();
+    let count = stream.read(buf, &mut fds)?;
+    // All requests made by this client use ReplyWithoutFDs. Drop unsolicited
+    // descriptors before they can accumulate in x11rb's pending queue.
+    if !fds.is_empty() {
+        return Err(frame_error());
+    }
+    Ok(count)
+}
+impl IncomingFrame {
+    fn buffered(&self) -> bool {
+        self.failed || (self.filled == 8 && self.sent < 8)
+    }
+    fn read(&mut self, stream: &DefaultStream, buf: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(frame_error());
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.sent == 8 {
+            if self.body > 0 {
+                let count = buf.len().min(self.body);
+                let n = read_without_fds(stream, &mut buf[..count])?;
+                self.body -= n;
+                self.budget -= n as u64;
+                return Ok(n);
+            }
+            self.filled = 0;
+            self.sent = 0;
+        }
+        while self.filled < 8 {
+            let n = read_without_fds(stream, &mut self.header[self.filled..])?;
+            if n == 0 {
+                return if self.filled == 0 {
+                    Ok(0)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated X11 header",
+                    ))
+                };
+            }
+            self.filled += n;
+            self.budget = self.budget.checked_sub(n as u64).ok_or_else(frame_error)?;
+        }
+        if self.sent == 0 {
+            // x11rb negotiates the client's native byte order, independently
+            // of the image byte order used for pixel conversion.
+            let body = if self.setup {
+                self.setup = false;
+                u64::from(u16::from_ne_bytes(self.header[6..8].try_into().unwrap())) * 4
+            } else {
+                let extra = if self.header[0] == 1 || self.header[0] & 0x7f == 35 {
+                    u64::from(u32::from_ne_bytes(self.header[4..8].try_into().unwrap())) * 4
+                } else {
+                    0
+                };
+                extra + 24
+            };
+            if body > self.max_body || body > self.budget {
+                return Err(frame_error());
+            }
+            self.body = usize::try_from(body).map_err(|_| frame_error())?;
+        }
+        let n = buf.len().min(8 - self.sent);
+        buf[..n].copy_from_slice(&self.header[self.sent..self.sent + n]);
+        self.sent += n;
+        Ok(n)
+    }
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -121,11 +229,24 @@ fn poll_until(fd: RawFd, mode: PollMode, deadline: Instant) -> io::Result<()> {
 
 impl Stream for DeadlineStream {
     fn poll(&self, mode: PollMode) -> io::Result<()> {
+        remaining(self.deadline)?;
+        if mode.readable() && self.incoming.lock().unwrap().buffered() {
+            return Ok(());
+        }
         poll_until(self.inner.as_raw_fd(), mode, self.deadline)
     }
     fn read(&self, buf: &mut [u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
         remaining(self.deadline)?;
-        self.inner.read(buf, fds)
+        let _ = fds;
+        let mut incoming = self.incoming.lock().unwrap();
+        let result = incoming.read(&self.inner, buf);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::InvalidData)
+        {
+            incoming.failed = true;
+        }
+        result
     }
     fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
         remaining(self.deadline)?;
@@ -286,7 +407,11 @@ impl X11Display {
             .unwrap_or(None)
             .unwrap_or_default();
         let conn = RustConnection::connect_to_stream_with_auth_info(
-            DeadlineStream { inner, deadline },
+            DeadlineStream {
+                inner,
+                deadline,
+                incoming: Mutex::new(IncomingFrame::default()),
+            },
             screen,
             auth_name,
             auth_data,
@@ -315,11 +440,31 @@ impl X11Display {
         let setup = self.conn.setup();
         let screen = &setup.roots[self.screen];
         let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
+        let format = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == screen.root_depth)
+            .context("no pixmap format for root depth")?;
+        let (_, native, _) = image_sizes(
+            u32::from(width),
+            u32::from(height),
+            u32::from(format.bits_per_pixel),
+            u32::from(format.scanline_pad),
+        )?;
+        {
+            let mut incoming = self.conn.stream().incoming.lock().unwrap();
+            let wire = native.div_ceil(4) as u64 * 4;
+            incoming.max_body = wire + 24;
+            incoming.budget = wire + 1024 * 1024;
+        }
         let reply = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, width, height, !0)?
             .reply()
             .context("X server refused GetImage on the root window")?;
+        if reply.depth != screen.root_depth {
+            bail!("GetImage depth differs from root depth");
+        }
         let visual = screen
             .allowed_depths
             .iter()
@@ -440,24 +585,58 @@ struct ZPixmapLayout {
     blue_mask: u32,
 }
 
+// Compute native, padded, and RGB sizes before requesting or allocating pixels.
+fn image_sizes(width: u32, height: u32, bpp: u32, pad: u32) -> Result<(usize, usize, usize)> {
+    if width == 0 || height == 0 {
+        bail!("X11 root image has zero dimensions");
+    }
+    if !matches!(bpp, 16 | 24 | 32) || !matches!(pad, 8 | 16 | 32) {
+        bail!("unsupported X11 pixel layout");
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .context("X11 pixel overflow")?;
+    if pixels > MAX_SCREENSHOT_SOURCE_PIXELS {
+        bail!("X11 pixel source limit exceeded");
+    }
+    let row = u64::from(width)
+        .checked_mul(u64::from(bpp))
+        .context("X11 row overflow")?;
+    let stride = row
+        .div_ceil(u64::from(pad))
+        .checked_mul(u64::from(pad) / 8)
+        .context("X11 stride overflow")?;
+    let native = stride
+        .checked_mul(u64::from(height))
+        .context("X11 native size overflow")?;
+    let rgb = pixels.checked_mul(3).context("X11 RGB size overflow")?;
+    if native > MAX_SCREENSHOT_DECODED_BYTES || rgb > MAX_SCREENSHOT_DECODED_BYTES {
+        bail!("X11 decoded-byte limit exceeded");
+    }
+    Ok((
+        usize::try_from(stride)?,
+        usize::try_from(native)?,
+        usize::try_from(rgb)?,
+    ))
+}
+
 fn zpixmap_to_rgb(data: &[u8], width: u32, height: u32, layout: &ZPixmapLayout) -> Result<Vec<u8>> {
+    let (stride, needed, rgb_bytes) =
+        image_sizes(width, height, layout.bits_per_pixel, layout.scanline_pad)?;
     let bytes_per_pixel = match layout.bits_per_pixel {
         16 | 24 | 32 => (layout.bits_per_pixel / 8) as usize,
         other => bail!("{other}-bit ZPixmap pixels are not supported"),
     };
-    let pad = layout.scanline_pad.max(8);
-    let stride = ((width * layout.bits_per_pixel).div_ceil(pad) * pad / 8) as usize;
     let (width, height) = (width as usize, height as usize);
-    let needed = stride
-        .checked_mul(height)
-        .context("root image size overflowed")?;
-    if data.len() < needed {
+    if data.len() < needed || data.len() > needed.div_ceil(4) * 4 {
         bail!(
             "GetImage returned {} bytes; {width}x{height} at stride {stride} needs {needed}",
             data.len()
         );
     }
-    let mut rgb = Vec::with_capacity(width * height * 3);
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(rgb_bytes)
+        .context("failed to allocate X11 RGB image")?;
     for row in data[..needed].chunks_exact(stride) {
         for pixel in row[..width * bytes_per_pixel].chunks_exact(bytes_per_pixel) {
             let value = pixel.iter().enumerate().fold(0_u32, |acc, (index, &byte)| {
@@ -495,6 +674,219 @@ fn channel_to_u8(pixel: u32, mask: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_capture(width: u16, height: u16, oversized: bool) -> (Result<RootImage>, Vec<u8>) {
+        use std::io::{Read, Write};
+        use x11rb::protocol::xproto::{Depth, Format, Screen, Setup, Visualtype};
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut seq = 0_u16;
+            loop {
+                let mut header = [0; 4];
+                if server.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let len = usize::from(u16::from_ne_bytes([header[2], header[3]])) * 4;
+                let mut rest = vec![0; len - 4];
+                server.read_exact(&mut rest).unwrap();
+                requests.push(header[0]);
+                seq += 1;
+                let mut reply = [0; 32];
+                reply[0] = 1;
+                reply[2..4].copy_from_slice(&seq.to_ne_bytes());
+                match header[0] {
+                    98 => server.write_all(&reply).unwrap(),
+                    73 => {
+                        reply[1] = 24;
+                        reply[4..8]
+                            .copy_from_slice(&(if oversized { u32::MAX } else { 1 }).to_ne_bytes());
+                        reply[8..12].copy_from_slice(&2_u32.to_ne_bytes());
+                        if oversized {
+                            server.write_all(&reply[..8]).unwrap();
+                        } else {
+                            server.write_all(&reply).unwrap();
+                            server.write_all(&[0x56, 0x34, 0x12, 0]).unwrap();
+                        }
+                    }
+                    other => panic!("unexpected opcode {other}"),
+                }
+            }
+            requests
+        });
+        let setup = Setup {
+            resource_id_base: 0x02000000,
+            resource_id_mask: 0x001fffff,
+            maximum_request_length: u16::MAX,
+            image_byte_order: ImageOrder::LSB_FIRST,
+            pixmap_formats: vec![Format {
+                depth: 24,
+                bits_per_pixel: 32,
+                scanline_pad: 32,
+            }],
+            roots: vec![Screen {
+                root: 1,
+                root_depth: 24,
+                root_visual: 2,
+                width_in_pixels: width,
+                height_in_pixels: height,
+                allowed_depths: vec![Depth {
+                    depth: 24,
+                    visuals: vec![Visualtype {
+                        visual_id: 2,
+                        class: VisualClass::TRUE_COLOR,
+                        red_mask: 0xff0000,
+                        green_mask: 0xff00,
+                        blue_mask: 0xff,
+                        ..Visualtype::default()
+                    }],
+                }],
+                ..Screen::default()
+            }],
+            ..Setup::default()
+        };
+        let stream = test_stream(
+            client,
+            IncomingFrame {
+                setup: false,
+                ..IncomingFrame::default()
+            },
+        );
+        let display = X11Display {
+            conn: RustConnection::for_connected_stream(stream, setup).unwrap(),
+            root: 1,
+            screen: 0,
+        };
+        let result = display.capture_root();
+        drop(display);
+        (result, worker.join().unwrap())
+    }
+    fn test_stream(socket: UnixStream, incoming: IncomingFrame) -> DeadlineStream {
+        DeadlineStream {
+            inner: DefaultStream::from_unix_stream(socket).unwrap().0,
+            deadline: Instant::now() + Duration::from_secs(2),
+            incoming: Mutex::new(incoming),
+        }
+    }
+    #[test]
+    fn capture_limits_precede_request_and_reply_allocation() {
+        let (result, requests) = fixture_capture(u16::MAX, u16::MAX, false);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pixel source limit"));
+        assert!(requests.is_empty());
+        let (result, requests) = fixture_capture(1, 1, true);
+        assert!(format!("{:#}", result.err().unwrap()).contains("receive limits"));
+        assert!(requests.contains(&73));
+        let image = fixture_capture(1, 1, false).0.unwrap();
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.rgb, [0x12, 0x34, 0x56]);
+    }
+    #[test]
+    fn layout_sizes_are_checked_without_allocating() {
+        assert!(image_sizes(7680, 4320, 32, 32).is_ok());
+        assert_eq!(
+            image_sizes(16384, 8192, 32, 32).unwrap().1 as u64,
+            MAX_SCREENSHOT_DECODED_BYTES
+        );
+        for (w, h) in [(0, 1), (1, 0), (u32::MAX, u32::MAX), (16384, 8193)] {
+            assert!(image_sizes(w, h, 32, 32).is_err());
+        }
+        for pad in [0, 1, 9, 255, u32::MAX] {
+            assert!(image_sizes(1, 1, 16, pad).is_err());
+        }
+        assert!(zpixmap_to_rgb(&[0; 8], 1, 1, &BGRX).is_err());
+    }
+    #[test]
+    fn frame_guard_handles_fragmentation_floods_and_generic_events() {
+        use std::io::Write;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let stream = test_stream(
+            client,
+            IncomingFrame {
+                setup: false,
+                ..IncomingFrame::default()
+            },
+        );
+        let mut header = [0; 8];
+        header[0] = 0xa3;
+        header[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let mut out = [0; 32];
+        let mut fds = Vec::new();
+        server.write_all(&header[..3]).unwrap();
+        assert_eq!(
+            stream.read(&mut out, &mut fds).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        server.write_all(&header[3..]).unwrap();
+        assert_eq!(
+            stream.read(&mut out, &mut fds).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            stream.read(&mut out, &mut fds).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let stream = test_stream(
+            client,
+            IncomingFrame {
+                setup: false,
+                budget: 63,
+                ..IncomingFrame::default()
+            },
+        );
+        let mut packets = [0; 64];
+        packets[0] = 1;
+        packets[32] = 1;
+        server.write_all(&packets).unwrap();
+        assert_eq!(stream.read(&mut out, &mut fds).unwrap(), 8);
+        assert_eq!(stream.read(&mut out, &mut fds).unwrap(), 24);
+        assert!(stream.read(&mut out, &mut fds).is_err());
+    }
+    #[test]
+    fn descriptor_guard_covers_headers_and_bodies() {
+        use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use std::{io::Write, os::fd::AsFd};
+        for body in [false, true] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let stream = test_stream(
+                client,
+                IncomingFrame {
+                    setup: false,
+                    ..IncomingFrame::default()
+                },
+            );
+            let mut out = [0; 32];
+            let mut received = Vec::new();
+            let mut header = [0; 8];
+            header[0] = 1;
+            if body {
+                server.write_all(&header).unwrap();
+                assert_eq!(stream.read(&mut out, &mut received).unwrap(), 8);
+            }
+            let file = std::fs::File::open("/dev/null").unwrap();
+            let fds = [file.as_fd()];
+            let mut storage = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut ancillary = SendAncillaryBuffer::new(&mut storage);
+            assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+            let tail = [0; 24];
+            let bytes = if body { &tail[..] } else { &header[..] };
+            sendmsg(
+                &server,
+                &[io::IoSlice::new(bytes)],
+                &mut ancillary,
+                SendFlags::NOSIGNAL,
+            )
+            .unwrap();
+            assert_eq!(
+                stream.read(&mut out, &mut received).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(received.is_empty());
+        }
+    }
 
     #[test]
     fn stalled_servers_release_queries_and_runtime() {
@@ -502,7 +894,7 @@ mod tests {
         if env::var_os(CHILD).is_some() {
             use std::io::{Read, Write};
             use std::net::TcpListener;
-            use x11rb::protocol::xproto::{Screen, Setup};
+            use x11rb::protocol::xproto::{Format, Screen, Setup};
             use x11rb::reexports::x11rb_protocol::x11_utils::Serialize;
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -526,10 +918,16 @@ mod tests {
                             resource_id_base: 0x02000000,
                             resource_id_mask: 0x001fffff,
                             maximum_request_length: u16::MAX,
+                            pixmap_formats: vec![Format {
+                                depth: 24,
+                                bits_per_pixel: 32,
+                                scanline_pad: 32,
+                            }],
                             roots: vec![Screen {
                                 root: 1,
                                 width_in_pixels: 16,
                                 height_in_pixels: 16,
+                                root_depth: 24,
                                 ..Screen::default()
                             }],
                             ..Setup::default()

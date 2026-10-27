@@ -10,6 +10,10 @@
 
 The fork carries these runtime behavior changes:
 
+- `src/x11_display.rs`: pre-capture image budgets, bounded incoming X11 frames
+  and aggregate bytes, and rejection of unsolicited descriptors. Source pixel
+  and decoded-byte limits are shared through `src/screenshot.rs`/`src/lib.rs`.
+
 - `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
   require a unique match, and title selectors prefer an exact match before
   falling back to a substring. Regression coverage lives in

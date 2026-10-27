@@ -29,7 +29,10 @@ const PORTAL_SCREENSHOT_INTERFACE: &str = "org.freedesktop.portal.Screenshot";
 const PORTAL_REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const PORTAL_REQUEST_PATH_NAMESPACE: &str = "/org/freedesktop/portal/desktop/request";
 const MAX_SCREENSHOT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_SCREENSHOT_SOURCE_PIXELS: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_SCREENSHOT_SOURCE_PIXELS: u64 = 128 * 1024 * 1024;
+
+// Bound native decoded frames separately from encoded files and MCP payloads.
+pub(crate) const MAX_SCREENSHOT_DECODED_BYTES: u64 = MAX_SCREENSHOT_SOURCE_PIXELS * 4;
 
 pub const DEFAULT_SCREENSHOT_MAX_DIMENSION: u32 = 1920;
 pub const DEFAULT_SCREENSHOT_MAX_BYTES: usize = 2 * 1024 * 1024;

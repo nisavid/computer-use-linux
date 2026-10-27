@@ -48,7 +48,7 @@ pub mod diagnostics {
 pub mod screenshot {
     pub(crate) use crate::screenshot_impl::{
         capture_screenshot, prepare_screenshot_payload, ScreenshotCapture, ScreenshotOutputFormat,
-        ScreenshotPayloadOptions,
+        ScreenshotPayloadOptions, MAX_SCREENSHOT_DECODED_BYTES, MAX_SCREENSHOT_SOURCE_PIXELS,
     };
     pub use crate::screenshot_impl::{capture_screenshot_raw, RawScreenshotCapture};
 }
