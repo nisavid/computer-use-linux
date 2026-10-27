@@ -133,14 +133,30 @@ impl PortalConnection {
                 .await
         })
         .await;
-        if !matches!(owner, Ok(Ok(ref owner)) if owner == &self.owner) {
-            self.current.store(false, Ordering::Release);
-            bail!("could not revalidate the XDG desktop portal owner; create a new session");
-        }
+        validate_owner_observation(&self.current, &self.owner, owner)?;
         if !self.is_current() {
             bail!("XDG desktop portal owner changed; create a new session");
         }
         Ok(())
+    }
+}
+
+// A failed observation denies this operation; only proven loss revokes the capability.
+fn validate_owner_observation(
+    current: &AtomicBool,
+    expected: &OwnedUniqueName,
+    observation: std::result::Result<
+        zbus::fdo::Result<OwnedUniqueName>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<()> {
+    match observation {
+        Ok(Ok(ref owner)) if owner == expected => Ok(()),
+        Ok(Ok(_)) | Ok(Err(zbus::fdo::Error::NameHasNoOwner(_))) => {
+            current.store(false, Ordering::Release);
+            bail!("XDG desktop portal owner changed; create a new session");
+        }
+        _ => bail!("could not revalidate the XDG desktop portal owner; retry the operation"),
     }
 }
 

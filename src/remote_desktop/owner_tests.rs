@@ -384,3 +384,43 @@ async fn portal_owner_cleanup_guards_keep_the_original_destination() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn portal_owner_transient_lookup_failure_preserves_the_capability() {
+    let current = AtomicBool::new(true);
+    let expected = OwnedUniqueName::try_from(":1.42").unwrap();
+    let timeout = tokio::time::timeout(
+        Duration::ZERO,
+        std::future::pending::<zbus::fdo::Result<OwnedUniqueName>>(),
+    )
+    .await;
+    assert!(validate_owner_observation(&current, &expected, timeout).is_err());
+    assert!(current.load(Ordering::Acquire));
+    assert!(validate_owner_observation(
+        &current,
+        &expected,
+        Ok(Err(zbus::fdo::Error::Failed(
+            "temporary lookup failure".into()
+        )))
+    )
+    .is_err());
+    assert!(current.load(Ordering::Acquire));
+    assert!(validate_owner_observation(&current, &expected, Ok(Ok(expected.clone()))).is_ok());
+    assert!(current.load(Ordering::Acquire));
+}
+
+#[test]
+fn portal_owner_confirmed_loss_permanently_revokes_the_capability() {
+    let expected = OwnedUniqueName::try_from(":1.42").unwrap();
+    for observation in [
+        Ok(OwnedUniqueName::try_from(":1.43").unwrap()),
+        Err(zbus::fdo::Error::NameHasNoOwner("no portal owner".into())),
+    ] {
+        let current = AtomicBool::new(true);
+        assert!(validate_owner_observation(&current, &expected, Ok(observation)).is_err());
+        assert!(!current.load(Ordering::Acquire));
+        // Even a matching later observation never resets a revoked capability.
+        let _ = validate_owner_observation(&current, &expected, Ok(Ok(expected.clone())));
+        assert!(!current.load(Ordering::Acquire));
+    }
+}
