@@ -78,13 +78,21 @@ impl PortalConnection {
             let mut changes = dbus
                 .receive_name_owner_changed_with_args(&[(0, PORTAL_DESKTOP_SERVICE)])
                 .await?;
-            dbus.start_service_by_name(WellKnownName::try_from(PORTAL_DESKTOP_SERVICE)?, 0)
-                .await
-                .context("failed to activate the XDG desktop portal")?;
-            let owner = dbus
-                .get_name_owner(BusName::try_from(PORTAL_DESKTOP_SERVICE)?)
-                .await
-                .context("failed to resolve the XDG desktop portal owner")?;
+            let name = BusName::try_from(PORTAL_DESKTOP_SERVICE)?;
+            let owner = match dbus.get_name_owner(name.clone()).await {
+                Ok(owner) => owner,
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                    dbus.start_service_by_name(WellKnownName::try_from(PORTAL_DESKTOP_SERVICE)?, 0)
+                        .await
+                        .context("failed to activate the XDG desktop portal")?;
+                    dbus.get_name_owner(name)
+                        .await
+                        .context("failed to resolve the activated XDG desktop portal owner")?
+                }
+                Err(error) => {
+                    return Err(error).context("failed to resolve the XDG desktop portal owner")
+                }
+            };
             let current = Arc::new(AtomicBool::new(true));
             let watched_owner = owner.clone();
             let watched_current = Arc::clone(&current);
