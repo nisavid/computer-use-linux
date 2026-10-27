@@ -96,6 +96,7 @@ struct IncomingFrame {
     sent: usize,
     body: usize,
     budget: u64,
+    reply_budget: u64,
     max_body: u64,
     failed: bool,
 }
@@ -108,6 +109,7 @@ impl Default for IncomingFrame {
             sent: 0,
             body: 0,
             budget: 1024 * 1024,
+            reply_budget: 1024 * 1024,
             max_body: 1024 * 1024,
             failed: false,
         }
@@ -145,7 +147,6 @@ impl IncomingFrame {
                 let count = buf.len().min(self.body);
                 let n = read_without_fds(stream, &mut buf[..count])?;
                 self.body -= n;
-                self.budget -= n as u64;
                 return Ok(n);
             }
             self.filled = 0;
@@ -164,11 +165,11 @@ impl IncomingFrame {
                 };
             }
             self.filled += n;
-            self.budget = self.budget.checked_sub(n as u64).ok_or_else(frame_error)?;
         }
         if self.sent == 0 {
             // x11rb negotiates the client's native byte order, independently
             // of the image byte order used for pixel conversion.
+            let is_reply = !self.setup && self.header[0] == 1;
             let body = if self.setup {
                 self.setup = false;
                 u64::from(u16::from_ne_bytes(self.header[6..8].try_into().unwrap())) * 4
@@ -180,9 +181,18 @@ impl IncomingFrame {
                 };
                 extra + 24
             };
-            if body > self.max_body || body > self.budget {
+            if body > self.max_body {
                 return Err(frame_error());
             }
+            // Charge each complete frame once, including the staged prefix,
+            // before x11rb can allocate or queue it. Pixel replies and
+            // unsolicited events have independent cumulative allowances.
+            let budget = if is_reply {
+                &mut self.reply_budget
+            } else {
+                &mut self.budget
+            };
+            *budget = budget.checked_sub(body + 8).ok_or_else(frame_error)?;
             self.body = usize::try_from(body).map_err(|_| frame_error())?;
         }
         let n = buf.len().min(8 - self.sent);
@@ -455,7 +465,8 @@ impl X11Display {
             let mut incoming = self.conn.stream().incoming.lock().unwrap();
             let wire = native.div_ceil(4) as u64 * 4;
             incoming.max_body = wire + 24;
-            incoming.budget = wire + 1024 * 1024;
+            incoming.budget = 1024 * 1024;
+            incoming.reply_budget = wire + 32;
         }
         let reply = self
             .conn
@@ -834,6 +845,7 @@ mod tests {
             IncomingFrame {
                 setup: false,
                 budget: 63,
+                reply_budget: 63,
                 ..IncomingFrame::default()
             },
         );
@@ -845,6 +857,62 @@ mod tests {
         assert_eq!(stream.read(&mut out, &mut fds).unwrap(), 24);
         assert!(stream.read(&mut out, &mut fds).is_err());
     }
+    #[test]
+    fn reply_and_unsolicited_budgets_are_independent_and_include_headers() {
+        use std::io::Write;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let stream = test_stream(
+            client,
+            IncomingFrame {
+                setup: false,
+                budget: 32,
+                reply_budget: 36,
+                max_body: 28,
+                ..IncomingFrame::default()
+            },
+        );
+        let mut event = [0; 32];
+        event[0] = 2;
+        let mut reply = [0; 36];
+        reply[0] = 1;
+        reply[4..8].copy_from_slice(&1_u32.to_ne_bytes());
+        server.write_all(&event).unwrap();
+        server.write_all(&reply).unwrap();
+        let mut received = Vec::new();
+        while received.len() < 68 {
+            let mut buf = [0; 7];
+            let n = stream.read(&mut buf, &mut Vec::new()).unwrap();
+            received.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(received, [event.as_slice(), reply.as_slice()].concat());
+        let incoming = stream.incoming.lock().unwrap();
+        assert_eq!((incoming.budget, incoming.reply_budget), (0, 0));
+        drop(incoming);
+        // A large reply allowance must not permit a generic-event body.
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let stream = test_stream(
+            client,
+            IncomingFrame {
+                setup: false,
+                budget: 32,
+                reply_budget: MAX_SCREENSHOT_DECODED_BYTES + 32,
+                max_body: MAX_SCREENSHOT_DECODED_BYTES + 24,
+                ..IncomingFrame::default()
+            },
+        );
+        let mut generic = [0; 8];
+        generic[0] = 0xa3;
+        generic[4..8].copy_from_slice(&1024_u32.to_ne_bytes());
+        server.write_all(&generic).unwrap();
+        assert_eq!(
+            stream
+                .read(&mut [0; 32], &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn descriptor_guard_covers_headers_and_bodies() {
         use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};

@@ -154,7 +154,7 @@ kind = "other"
 path = "src/lib.rs"
 domain = "runtime"
 portability_hint = "fork-specific"
-notes = "Private AT-SPI transport module registration."
+notes = "Private AT-SPI transport module registration and shared screenshot source-pixel/decoded-byte limits."
 
 [[local_surfaces]]
 kind = "other"
@@ -177,3 +177,17 @@ path = "src/terminal.rs"
 domain = "runtime"
 portability_hint = "fork-specific"
 notes = "Serialization and schemas omit raw argv and cwd; internal selector matching retains them."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/x11_display.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Pre-capture image sizing, frame limits, independent reply/unsolicited-byte budgets, and rejection of unsolicited descriptors."
+
+[[local_surfaces]]
+kind = "other"
+path = "src/screenshot.rs"
+domain = "runtime"
+portability_hint = "fork-specific"
+notes = "Shared screenshot source-pixel and native decoded-byte limits."
