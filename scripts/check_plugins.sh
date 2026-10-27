@@ -1,8 +1,8 @@
 #!/bin/sh
 # Contract check for the Claude Code and Codex plugin under plugins/.
-# With --binary, also serves a fake release from that build and runs the MCP
-# safety check through the plugin launcher, covering download, sha256
-# verification, tamper rejection, and cache reuse.
+# With --binary, runs the HTTPS release-integrity fixtures and the MCP safety
+# check through a copied plugin, covering download, trusted pins, tampering,
+# cache reuse, and pruning without changing the shipped trust manifest.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -49,55 +49,10 @@ diff -r skills/computer-use-linux "$plugin/skills/computer-use-linux" >/dev/null
 sh -n "$launcher"
 [ -x "$launcher" ] || fail "launcher is not executable"
 
-if [ "${1:-}" != "--binary" ]; then
+if [ "$#" -eq 0 ]; then
   echo "plugin manifests ok: version $cargo_version"
   exit 0
 fi
-binary=$2
-helper="$(dirname -- "$binary")/computer-use-linux-cosmic"
-
-case "$(uname -m)" in
-  x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
-  aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
-  *) fail "unsupported CPU architecture: $(uname -m)" ;;
-esac
-
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
-mkdir "$tmp/release"
-cp "$binary" "$tmp/release/computer-use-linux-$target"
-cp "$helper" "$tmp/release/computer-use-linux-cosmic-$target"
-(cd "$tmp/release" && for asset in *; do sha256sum "$asset" >"$asset.sha256"; done)
-
-export XDG_CACHE_HOME="$tmp/cache"
-export COMPUTER_USE_LINUX_DOWNLOAD_BASE="file://$tmp/release"
-unset COMPUTER_USE_LINUX_BIN COMPUTER_USE_LINUX_COSMIC_HELPER
-
-good_sha=$(cat "$tmp/release/computer-use-linux-cosmic-$target.sha256")
-echo "0000000000000000000000000000000000000000000000000000000000000000  x" \
-  >"$tmp/release/computer-use-linux-cosmic-$target.sha256"
-if "$launcher" windows >/dev/null 2>"$tmp/tamper.err"; then
-  fail "launcher accepted a tampered sha256"
-fi
-grep -q 'sha256 mismatch' "$tmp/tamper.err" ||
-  fail "tampered download failed for another reason: $(cat "$tmp/tamper.err")"
-[ ! -e "$tmp/cache/computer-use-linux/plugin/v$cargo_version/computer-use-linux" ] ||
-  fail "tampered download reached the cache"
-echo "$good_sha" >"$tmp/release/computer-use-linux-cosmic-$target.sha256"
-
-scripts/mcp_safety_check.py --binary "$launcher"
-
-export COMPUTER_USE_LINUX_DOWNLOAD_BASE="file://$tmp/missing"
-scripts/mcp_safety_check.py --binary "$launcher" >/dev/null ||
-  fail "launcher did not reuse the cached binaries"
-stale="$tmp/cache/computer-use-linux/plugin/v0.0.0"
-recent="$tmp/cache/computer-use-linux/plugin/v0.0.1"
-staging="$tmp/cache/computer-use-linux/plugin/.download.killed"
-mkdir -p "$stale" "$recent" "$staging"
-touch -d '40 days ago' "$stale"
-touch -d '2 hours ago' "$staging"
-scripts/mcp_safety_check.py --binary "$launcher" >/dev/null
-[ ! -e "$stale" ] || fail "launcher kept a version unused for 40 days"
-[ -e "$recent" ] || fail "launcher pruned a recently used version"
-[ ! -e "$staging" ] || fail "launcher kept a stale download staging dir"
+[ "$#" -eq 2 ] && [ "$1" = "--binary" ] || fail "usage: scripts/check_plugins.sh [--binary PATH]"
+node scripts/release_integrity_test.mjs --binary "$2"
 echo "plugin launcher ok: download, tamper rejection, cache reuse, pruning"

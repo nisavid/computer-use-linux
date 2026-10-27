@@ -1,0 +1,4 @@
+0.7.10 3473152a5a450d11ec4f7cba0708a0c1b35753d5686e391c720cb001bae94521 computer-use-linux-aarch64-unknown-linux-gnu
+0.7.10 b436cf14a6bf131b24df66f78ea8ea1445b946e3adace82db737238c65c6a4c5 computer-use-linux-cosmic-aarch64-unknown-linux-gnu
+0.7.10 c9949d15a575b2472892bf001a4bb75eee26fec635531d9525dff2d5e4fcf68b computer-use-linux-cosmic-x86_64-unknown-linux-gnu
+0.7.10 e292e884dec1579b8caf958eb87c68ccf4d9e10f7caaf7c51b001f997b52a431 computer-use-linux-x86_64-unknown-linux-gnu

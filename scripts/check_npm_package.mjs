@@ -1,8 +1,21 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { releasePins } = require('../npm/release-integrity.js');
+releasePins(require('../package.json').version);
+if (readFileSync('npm/release-sha256.txt', 'utf8') !==
+    readFileSync('plugins/computer-use-linux/release-sha256.txt', 'utf8')) {
+	throw new Error('npm and plugin release pins differ');
+}
 
 const requiredFiles = [
+	"npm/install.js",
+	"npm/release-integrity.js",
+	"npm/release-sha256.txt",
 	"pi/extension/index.ts",
 	"pi/extension/generated-tools.ts",
 	"pi/extension/mcp-client.bundle.cjs",
