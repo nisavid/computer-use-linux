@@ -1719,7 +1719,7 @@ impl ComputerUseLinux {
             finish_typing_cleanup(cleanup),
         )
         .await;
-        result.unwrap_or_else(|message| Json(typing_error(message)))
+        typing_output(result)
     }
 
     #[tool(
@@ -5210,6 +5210,34 @@ async fn finish_typing_cleanup(
     }
 }
 
+/// Keep non-idempotent input completion separate from cleanup status.
+struct TypingOutcome<T> {
+    operation: std::result::Result<T, String>,
+    cleanup: std::result::Result<(), String>,
+}
+
+/// Preserve the action's result and context, appending cleanup failures as warnings.
+fn typing_output(
+    result: std::result::Result<TypingOutcome<Json<ActionOutput>>, String>,
+) -> Json<ActionOutput> {
+    match result {
+        Ok(outcome) => {
+            let Json(output) = outcome
+                .operation
+                .unwrap_or_else(|message| Json(typing_error(message)));
+            Json(with_notes(
+                output,
+                outcome
+                    .cleanup
+                    .err()
+                    .map(|error| format!("Warning: {error}; inspect the target before retrying.")),
+            ))
+        }
+        Err(message) => Json(typing_error(message)),
+    }
+}
+
+/// Retain serialization through cleanup even if the caller drops the future.
 async fn run_bounded_typing_input<T, F, C>(
     guard: tokio::sync::OwnedMutexGuard<()>,
     deadline: Instant,
@@ -5217,7 +5245,7 @@ async fn run_bounded_typing_input<T, F, C>(
     cleanup: C,
 ) -> (
     Option<tokio::sync::OwnedMutexGuard<()>>,
-    std::result::Result<T, String>,
+    std::result::Result<TypingOutcome<T>, String>,
 )
 where
     T: Send + 'static,
@@ -5225,13 +5253,15 @@ where
     C: Future<Output = std::result::Result<(), String>> + Send + 'static,
 {
     run_cancellation_safe_input(guard, async move {
-        let result = timeout_at(deadline, operation).await.unwrap_or_else(|_| Err("type_text exceeded its 60-second execution deadline; input may be partial, inspect before retrying".to_string()));
-        match (result, cleanup.await) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(cleanup_error)) => Err(format!("{error}; {cleanup_error}")),
-        }
-    }).await
+        let operation = timeout_at(deadline, operation).await.unwrap_or_else(|_| {
+            Err("type_text exceeded its 60-second execution deadline; input may be partial, inspect before retrying".to_string())
+        });
+        Ok(TypingOutcome {
+            operation,
+            cleanup: cleanup.await,
+        })
+    })
+    .await
 }
 
 async fn run_cancellation_safe_input<T, F>(
@@ -8311,8 +8341,99 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(result.unwrap(), "literal é🦀");
+        let outcome = result.unwrap();
+        assert_eq!(outcome.operation.unwrap(), "literal é🦀");
+        assert!(outcome.cleanup.is_ok());
         rx.await.unwrap();
+        drop(guard);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn typing_cleanup_warning_preserves_action_outcome_and_context() {
+        for ok in [true, false] {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::clone(&lock).lock_owned().await;
+            let received = serde_json::json!({"text": "literal é🦀", "window_id": 42});
+            let original = ActionOutput {
+                ok,
+                implemented: true,
+                action: "type_text".to_string(),
+                message: "Backend result. Focus and landing feedback.".to_string(),
+                received: Some(received.clone()),
+            };
+            let (guard, result) = run_bounded_typing_input(
+                guard,
+                Instant::now() + TYPE_TEXT_TIMEOUT,
+                async move { Ok(Json(original)) },
+                async { Err("clipboard restore failed".to_string()) },
+            )
+            .await;
+            let Json(output) = typing_output(result);
+            assert_eq!(output.ok, ok);
+            assert_eq!(output.received, Some(received));
+            assert!(output.implemented);
+            assert_eq!(output.action, "type_text");
+            assert!(output
+                .message
+                .starts_with("Backend result. Focus and landing feedback."));
+            assert!(output.message.contains("Warning: clipboard restore failed"));
+            assert!(output
+                .message
+                .contains("inspect the target before retrying"));
+            assert!(!output.message.contains("deadline"));
+            drop(guard);
+            assert!(lock.try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_operation_error_is_distinct_from_timeout_and_cleanup() {
+        for cleanup_fails in [true, false] {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::clone(&lock).lock_owned().await;
+            let (_, result) = run_bounded_typing_input(
+                guard,
+                Instant::now() + TYPE_TEXT_TIMEOUT,
+                async { Err::<Json<ActionOutput>, _>("backend failed".to_string()) },
+                async move {
+                    if cleanup_fails {
+                        Err("release failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            let Json(output) = typing_output(result);
+            assert!(!output.ok);
+            assert!(output.message.starts_with("backend failed"));
+            assert_eq!(
+                output.message.contains("Warning: release failed"),
+                cleanup_fails
+            );
+            assert!(!output.message.contains("deadline"));
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_timeout_preserves_timeout_and_cleanup_warning() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let (guard, result) = run_bounded_typing_input(
+            guard,
+            Instant::now(),
+            std::future::pending::<std::result::Result<Json<ActionOutput>, String>>(),
+            async { Err("portal release timed out".to_string()) },
+        )
+        .await;
+        let Json(output) = typing_output(result);
+        assert!(!output.ok);
+        assert!(output
+            .message
+            .starts_with("type_text exceeded its 60-second execution deadline"));
+        assert!(output.message.contains("input may be partial"));
+        assert!(output.message.contains("Warning: portal release timed out"));
         drop(guard);
         assert!(lock.try_lock().is_ok());
     }
