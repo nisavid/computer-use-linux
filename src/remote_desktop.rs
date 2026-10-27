@@ -17,7 +17,11 @@ use std::{
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use xkeysym::Keysym;
-use zbus::{proxy::SignalStream, Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
+use zbus::{
+    names::{BusName, OwnedUniqueName, WellKnownName},
+    proxy::SignalStream,
+    Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant,
+};
 
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -52,9 +56,89 @@ const BTN_EXTRA: i32 = 0x114;
 const BTN_FORWARD: i32 = 0x115;
 const BTN_BACK: i32 = 0x116;
 
+/// A capability belongs to one unique bus principal, including its cleanup copies.
+#[derive(Clone)]
+struct PortalConnection {
+    bus: Connection,
+    owner: OwnedUniqueName,
+    current: Arc<AtomicBool>,
+    _monitor: Arc<PortalOwnerMonitor>,
+}
+struct PortalOwnerMonitor(tokio::task::JoinHandle<()>);
+impl Drop for PortalOwnerMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl PortalConnection {
+    async fn new(bus: Connection) -> Result<Self> {
+        tokio::time::timeout(PORTAL_CALL_TIMEOUT, async {
+            let dbus = zbus::fdo::DBusProxy::new(&bus).await?;
+            // Subscribe before resolution; release/reacquire must never revive a capability.
+            let mut changes = dbus
+                .receive_name_owner_changed_with_args(&[(0, PORTAL_DESKTOP_SERVICE)])
+                .await?;
+            dbus.start_service_by_name(WellKnownName::try_from(PORTAL_DESKTOP_SERVICE)?, 0)
+                .await
+                .context("failed to activate the XDG desktop portal")?;
+            let owner = dbus
+                .get_name_owner(BusName::try_from(PORTAL_DESKTOP_SERVICE)?)
+                .await
+                .context("failed to resolve the XDG desktop portal owner")?;
+            let current = Arc::new(AtomicBool::new(true));
+            let watched_owner = owner.clone();
+            let watched_current = Arc::clone(&current);
+            let monitor = tokio::spawn(async move {
+                while let Some(change) = changes.next().await {
+                    let Ok(args) = change.args() else {
+                        break;
+                    };
+                    if args.old_owner().as_ref() == Some(watched_owner.inner()) {
+                        break;
+                    }
+                }
+                // Loss of monitoring also revokes the capability.
+                watched_current.store(false, Ordering::Release);
+            });
+            Ok(Self {
+                bus,
+                owner,
+                current,
+                _monitor: Arc::new(PortalOwnerMonitor(monitor)),
+            })
+        })
+        .await
+        .context("resolving the XDG desktop portal owner timed out")?
+    }
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::Acquire)
+    }
+    async fn ensure_current(&self) -> Result<()> {
+        if !self.is_current() {
+            bail!("XDG desktop portal owner changed; create a new session");
+        }
+        // Cover monitor scheduling lag. Unique destinations prevent a routing race.
+        let owner = tokio::time::timeout(PORTAL_CALL_TIMEOUT, async {
+            zbus::fdo::DBusProxy::new(&self.bus)
+                .await?
+                .get_name_owner(BusName::try_from(PORTAL_DESKTOP_SERVICE)?)
+                .await
+        })
+        .await;
+        if !matches!(owner, Ok(Ok(ref owner)) if owner == &self.owner) {
+            self.current.store(false, Ordering::Release);
+            bail!("could not revalidate the XDG desktop portal owner; create a new session");
+        }
+        if !self.is_current() {
+            bail!("XDG desktop portal owner changed; create a new session");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct PortalPointerSession {
-    connection: Connection,
+    connection: PortalConnection,
     session_handle: OwnedObjectPath,
     streams: Vec<PortalStream>,
     desktop_layout: Option<Vec<LogicalMonitor>>,
@@ -64,7 +148,7 @@ pub struct PortalPointerSession {
 
 #[derive(Clone)]
 pub struct PortalKeyboardSession {
-    connection: Connection,
+    connection: PortalConnection,
     session_handle: OwnedObjectPath,
     input_lock: Arc<AsyncMutex<()>>,
     valid: Arc<AtomicBool>,
@@ -98,7 +182,7 @@ pub enum PortalKey {
 }
 
 struct PointerReleaseGuard {
-    connection: Connection,
+    connection: PortalConnection,
     session_handle: OwnedObjectPath,
     button: Option<i32>,
     input_guard: Option<OwnedMutexGuard<()>>,
@@ -106,7 +190,7 @@ struct PointerReleaseGuard {
 }
 
 struct KeyboardReleaseGuard {
-    connection: Connection,
+    connection: PortalConnection,
     session_handle: OwnedObjectPath,
     pressed: Vec<PortalKey>,
     input_guard: Option<OwnedMutexGuard<()>>,
@@ -114,7 +198,7 @@ struct KeyboardReleaseGuard {
 }
 
 struct PortalSessionCleanup {
-    connection: Connection,
+    connection: PortalConnection,
     session_handle: OwnedObjectPath,
     armed: bool,
 }
@@ -144,6 +228,7 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     let connection = Connection::session()
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
+    let connection = PortalConnection::new(connection).await?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Pointer).await;
     let session_handle = create_remote_desktop_session(&connection).await?;
@@ -170,10 +255,11 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     let desktop_layout = logical_desktop_layout().await;
     let mut streams = streams;
     if env_token_contains("XDG_CURRENT_DESKTOP", "gnome")
-        && mutter_stage_views_scaled(&connection).await
+        && mutter_stage_views_scaled(&connection.bus).await
     {
         assign_stream_pixel_scales(&mut streams, desktop_layout.as_deref());
     }
+    connection.ensure_current().await?;
     cleanup.disarm();
 
     Ok(PortalPointerSession {
@@ -192,6 +278,7 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
     let connection = Connection::session()
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
+    let connection = PortalConnection::new(connection).await?;
     let persistence = remote_desktop_persistence(&connection).await;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Keyboard).await;
     let session_handle = create_remote_desktop_session(&connection).await?;
@@ -205,6 +292,7 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
     if devices & DEVICE_KEYBOARD == 0 {
         bail!("remote desktop portal session started without keyboard access");
     }
+    connection.ensure_current().await?;
     cleanup.disarm();
 
     Ok(PortalKeyboardSession {
@@ -530,6 +618,7 @@ pub async fn click(
     let (stream_id, x, y) = session.map_absolute_point(x, y)?;
     notify_pointer_motion_absolute(&proxy, &session.session_handle, stream_id, x, y).await?;
     for _ in 0..click_count.max(1) {
+        session.ensure_valid()?;
         release_guard.arm(button.evdev_code());
         notify_pointer_button(
             &proxy,
@@ -685,6 +774,7 @@ pub async fn drag(
     )
     .await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
+    session.ensure_valid()?;
     notify_pointer_motion_absolute(&proxy, &session.session_handle, end_stream, end_x, end_y)
         .await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
@@ -708,6 +798,7 @@ pub async fn type_text_with_keysyms(
     let proxy = remote_desktop_proxy(&session.connection).await?;
     let mut release_guard = KeyboardReleaseGuard::new(session, input_guard);
     for keysym in keysyms {
+        session.ensure_valid()?;
         release_guard.push(PortalKey::Keysym(*keysym));
         notify_keyboard_keysym(&proxy, &session.session_handle, *keysym, KEY_PRESSED).await?;
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -740,9 +831,11 @@ pub async fn press_key_chord(
     let proxy = remote_desktop_proxy(&session.connection).await?;
     let mut release_guard = KeyboardReleaseGuard::new(session, input_guard);
     for modifier in modifiers {
+        session.ensure_valid()?;
         release_guard.push(*modifier);
         notify_keyboard_key(&proxy, &session.session_handle, *modifier, KEY_PRESSED).await?;
     }
+    session.ensure_valid()?;
     release_guard.push(key);
     notify_keyboard_key(&proxy, &session.session_handle, key, KEY_PRESSED).await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
@@ -787,7 +880,7 @@ impl Drop for PointerReleaseGuard {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(RELEASE_TIMEOUT, async {
-                    if let Ok(proxy) = remote_desktop_proxy(&connection).await {
+                    if let Ok(proxy) = pinned_remote_desktop_proxy(&connection).await {
                         let _ = notify_pointer_button(
                             &proxy,
                             &session_handle,
@@ -830,7 +923,7 @@ impl KeyboardReleaseGuard {
 }
 
 impl PortalSessionCleanup {
-    fn new(connection: Connection, session_handle: OwnedObjectPath) -> Self {
+    fn new(connection: PortalConnection, session_handle: OwnedObjectPath) -> Self {
         Self {
             connection,
             session_handle,
@@ -875,7 +968,7 @@ impl Drop for KeyboardReleaseGuard {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(RELEASE_TIMEOUT, async {
-                    if let Ok(proxy) = remote_desktop_proxy(&connection).await {
+                    if let Ok(proxy) = pinned_remote_desktop_proxy(&connection).await {
                         for key in pressed.into_iter().rev() {
                             let _ = notify_keyboard_key(&proxy, &session_handle, key, KEY_RELEASED)
                                 .await;
@@ -896,7 +989,7 @@ impl Drop for KeyboardReleaseGuard {
 
 impl PortalPointerSession {
     pub(crate) fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
+        self.valid.load(Ordering::Acquire) && self.connection.is_current()
     }
 
     pub(crate) fn invalidate_and_close(&self) {
@@ -962,7 +1055,7 @@ impl PortalPointerSession {
 
 impl PortalKeyboardSession {
     pub(crate) fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
+        self.valid.load(Ordering::Acquire) && self.connection.is_current()
     }
 
     pub(crate) fn invalidate_and_close(&self) {
@@ -1313,7 +1406,7 @@ fn parse_restore_token(results: &HashMap<String, OwnedVariant>) -> ParsedRestore
     }
 }
 
-async fn remote_desktop_persistence(connection: &Connection) -> RemoteDesktopPersistence {
+async fn remote_desktop_persistence(connection: &PortalConnection) -> RemoteDesktopPersistence {
     if std::env::var(PERSIST_REMOTE_DESKTOP_ENV).ok().as_deref() != Some("1") {
         return RemoteDesktopPersistence::Off;
     }
@@ -1334,7 +1427,7 @@ async fn remote_desktop_persistence(connection: &Connection) -> RemoteDesktopPer
     }
 }
 
-async fn remote_desktop_interface_version(connection: &Connection) -> Result<u32> {
+async fn remote_desktop_interface_version(connection: &PortalConnection) -> Result<u32> {
     let proxy = remote_desktop_proxy(connection).await?;
     tokio::time::timeout(PORTAL_CALL_TIMEOUT, proxy.get_property::<u32>("version"))
         .await
@@ -1630,7 +1723,7 @@ fn remove_token_file(path: &Path) -> io::Result<()> {
     }
 }
 
-async fn create_remote_desktop_session(connection: &Connection) -> Result<OwnedObjectPath> {
+async fn create_remote_desktop_session(connection: &PortalConnection) -> Result<OwnedObjectPath> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
     let (request_path, mut response_stream) =
         portal_request_stream(connection, "rd_create").await?;
@@ -1670,7 +1763,7 @@ async fn create_remote_desktop_session(connection: &Connection) -> Result<OwnedO
 }
 
 async fn select_pointer_devices(
-    connection: &Connection,
+    connection: &PortalConnection,
     session: &OwnedObjectPath,
     permit: Option<&RestorePermit>,
 ) -> Result<()> {
@@ -1678,7 +1771,7 @@ async fn select_pointer_devices(
 }
 
 async fn select_keyboard_devices(
-    connection: &Connection,
+    connection: &PortalConnection,
     session: &OwnedObjectPath,
     permit: Option<&RestorePermit>,
 ) -> Result<()> {
@@ -1693,7 +1786,7 @@ async fn select_keyboard_devices(
 }
 
 async fn select_devices(
-    connection: &Connection,
+    connection: &PortalConnection,
     session: &OwnedObjectPath,
     device_types: u32,
     request_prefix: &str,
@@ -1742,7 +1835,10 @@ fn insert_screencast_source_options<'a>(
     options.insert("cursor_mode", Variant::from(CURSOR_MODE_HIDDEN));
 }
 
-async fn select_monitor_sources(connection: &Connection, session: &OwnedObjectPath) -> Result<()> {
+async fn select_monitor_sources(
+    connection: &PortalConnection,
+    session: &OwnedObjectPath,
+) -> Result<()> {
     let screencast_proxy = screencast_proxy(connection).await?;
     let (request_path, mut response_stream) =
         portal_request_stream(connection, "rd_sources").await?;
@@ -1768,7 +1864,7 @@ async fn select_monitor_sources(connection: &Connection, session: &OwnedObjectPa
 }
 
 async fn start_remote_desktop_session(
-    connection: &Connection,
+    connection: &PortalConnection,
     session: &OwnedObjectPath,
 ) -> Result<(u32, Vec<PortalStream>, ParsedRestoreToken)> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
@@ -1910,10 +2006,10 @@ async fn notify_keyboard_keycode(
     Ok(())
 }
 
-async fn close_portal_session(connection: &Connection, session: &OwnedObjectPath) {
+async fn close_portal_session(connection: &PortalConnection, session: &OwnedObjectPath) {
     if let Ok(proxy) = Proxy::new(
-        connection,
-        PORTAL_DESKTOP_SERVICE,
+        &connection.bus,
+        connection.owner.as_str(),
         session.as_str(),
         PORTAL_SESSION_INTERFACE,
     )
@@ -1923,7 +2019,11 @@ async fn close_portal_session(connection: &Connection, session: &OwnedObjectPath
     }
 }
 
-fn invalidate_and_close(valid: &AtomicBool, connection: &Connection, session: &OwnedObjectPath) {
+fn invalidate_and_close(
+    valid: &AtomicBool,
+    connection: &PortalConnection,
+    session: &OwnedObjectPath,
+) {
     if !valid.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -1938,10 +2038,15 @@ fn invalidate_and_close(valid: &AtomicBool, connection: &Connection, session: &O
     }
 }
 
-async fn remote_desktop_proxy(connection: &Connection) -> Result<Proxy<'_>> {
+async fn remote_desktop_proxy(connection: &PortalConnection) -> Result<Proxy<'_>> {
+    connection.ensure_current().await?;
+    pinned_remote_desktop_proxy(connection).await
+}
+
+async fn pinned_remote_desktop_proxy(connection: &PortalConnection) -> Result<Proxy<'_>> {
     Proxy::new(
-        connection,
-        PORTAL_DESKTOP_SERVICE,
+        &connection.bus,
+        connection.owner.as_str(),
         PORTAL_DESKTOP_PATH,
         PORTAL_REMOTE_DESKTOP_INTERFACE,
     )
@@ -1949,10 +2054,11 @@ async fn remote_desktop_proxy(connection: &Connection) -> Result<Proxy<'_>> {
     .context("failed to create RemoteDesktop portal proxy")
 }
 
-async fn screencast_proxy(connection: &Connection) -> Result<Proxy<'_>> {
+async fn screencast_proxy(connection: &PortalConnection) -> Result<Proxy<'_>> {
+    connection.ensure_current().await?;
     Proxy::new(
-        connection,
-        PORTAL_DESKTOP_SERVICE,
+        &connection.bus,
+        connection.owner.as_str(),
         PORTAL_DESKTOP_PATH,
         PORTAL_SCREENCAST_INTERFACE,
     )
@@ -1961,17 +2067,18 @@ async fn screencast_proxy(connection: &Connection) -> Result<Proxy<'_>> {
 }
 
 async fn portal_request_stream<'a>(
-    connection: &'a Connection,
+    connection: &'a PortalConnection,
     prefix: &str,
 ) -> Result<(String, SignalStream<'a>)> {
     let unique_name = connection
+        .bus
         .unique_name()
         .context("session bus connection has no unique name")?;
     let token = request_token(prefix);
     let request_path = request_path(unique_name.as_str(), &token);
     let request_proxy = Proxy::new(
-        connection,
-        PORTAL_DESKTOP_SERVICE,
+        &connection.bus,
+        connection.owner.as_str(),
         request_path.as_str(),
         PORTAL_REQUEST_INTERFACE,
     )
@@ -1985,15 +2092,15 @@ async fn portal_request_stream<'a>(
 }
 
 async fn await_portal_response(
-    connection: &Connection,
+    connection: &PortalConnection,
     handle: OwnedObjectPath,
     expected_request_path: &str,
     response_stream: &mut SignalStream<'_>,
 ) -> Result<(u32, HashMap<String, OwnedVariant>)> {
     if handle.as_str() != expected_request_path {
         *response_stream = Proxy::new(
-            connection,
-            PORTAL_DESKTOP_SERVICE,
+            &connection.bus,
+            connection.owner.as_str(),
             handle.as_str(),
             PORTAL_REQUEST_INTERFACE,
         )
@@ -2008,6 +2115,7 @@ async fn await_portal_response(
         .await
         .context("timed out waiting for portal response")?
         .context("portal response stream ended")?;
+    connection.ensure_current().await?;
     response
         .body()
         .deserialize()
@@ -2135,6 +2243,10 @@ fn request_token(prefix: &str) -> String {
     })
     .collect()
 }
+
+#[cfg(test)]
+#[path = "remote_desktop/owner_tests.rs"]
+mod owner_tests;
 
 #[cfg(test)]
 mod tests {
