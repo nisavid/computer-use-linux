@@ -268,11 +268,11 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
         restore_token,
     );
     if devices & DEVICE_POINTER == 0 {
-        commit_restore_permit(permit, restore_token).await;
+        let _ = commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without pointer access");
     }
     if streams.is_empty() {
-        commit_restore_permit(permit, restore_token).await;
+        let _ = commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without any monitor streams");
     }
 
@@ -283,8 +283,13 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     {
         assign_stream_pixel_scales(&mut streams, desktop_layout.as_deref());
     }
-    let owner_check = connection.ensure_current().await;
-    finish_restore_permit(permit, restore_token, owner_check, connection.is_current()).await?;
+    finish_restore_permit(
+        permit,
+        restore_token,
+        connection.ensure_current(),
+        || connection.is_current(),
+    )
+    .await?;
     cleanup.disarm();
 
     Ok(PortalPointerSession {
@@ -313,11 +318,16 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
         start_remote_desktop_session(&connection, &session_handle).await?;
     let restore_token = restore_token_to_keep(devices & DEVICE_KEYBOARD != 0, restore_token);
     if devices & DEVICE_KEYBOARD == 0 {
-        commit_restore_permit(permit, restore_token).await;
+        let _ = commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without keyboard access");
     }
-    let owner_check = connection.ensure_current().await;
-    finish_restore_permit(permit, restore_token, owner_check, connection.is_current()).await?;
+    finish_restore_permit(
+        permit,
+        restore_token,
+        connection.ensure_current(),
+        || connection.is_current(),
+    )
+    .await?;
     cleanup.disarm();
 
     Ok(PortalKeyboardSession {
@@ -1380,7 +1390,12 @@ impl RestorePermit {
         self.restore_token.as_deref()
     }
 
+    #[cfg(test)]
     fn commit(self, parsed: ParsedRestoreToken) -> io::Result<()> {
+        self.write(parsed)
+    }
+
+    fn write(&self, parsed: ParsedRestoreToken) -> io::Result<()> {
         let token = match parsed {
             ParsedRestoreToken::Usable(token) if acceptable_restore_token(&token) => Some(token),
             _ => None,
@@ -1481,39 +1496,59 @@ async fn claim_restore_permit(
     }
 }
 
-// Publish a new token only after setup's final owner observation succeeds.
-async fn finish_restore_permit(
+// Keep the token lock across validation, writing, and the post-write revocation check.
+async fn finish_restore_permit<F, C>(
     permit: Option<RestorePermit>,
     parsed: ParsedRestoreToken,
-    owner_check: Result<()>,
-    owner_current: bool,
-) -> Result<()> {
-    if let Err(error) = owner_check {
-        if !owner_current {
-            commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
+    owner_check: F,
+    owner_current: C,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    C: Fn() -> bool,
+{
+    if let Err(error) = owner_check.await {
+        if !owner_current() {
+            let _ = commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
         }
         return Err(error);
     }
-    if !owner_current {
-        commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
+    if !owner_current() {
+        let _ = commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
         bail!("XDG desktop portal owner changed; create a new session");
     }
-    commit_restore_permit(permit, parsed).await;
+    let permit = commit_restore_permit(permit, parsed).await;
+    if !owner_current() {
+        let _ = commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
+        bail!("XDG desktop portal owner changed; create a new session");
+    }
     Ok(())
 }
 
-async fn commit_restore_permit(permit: Option<RestorePermit>, parsed: ParsedRestoreToken) {
-    let Some(permit) = permit else {
-        return;
-    };
+async fn commit_restore_permit(
+    permit: Option<RestorePermit>,
+    parsed: ParsedRestoreToken,
+) -> Option<RestorePermit> {
+    let permit = permit?;
     if matches!(parsed, ParsedRestoreToken::Rejected) {
         warn_rejected_restore_token_once();
     }
-    let joined = tokio::task::spawn_blocking(move || permit.commit(parsed)).await;
+    let joined = tokio::task::spawn_blocking(move || {
+        let result = permit.write(parsed);
+        (permit, result)
+    })
+    .await;
     match joined {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn_persist_commit_once(&error),
-        Err(error) => warn_persist_commit_once(&io::Error::other(error)),
+        Ok((permit, result)) => {
+            if let Err(error) = result {
+                warn_persist_commit_once(&error);
+            }
+            Some(permit)
+        }
+        Err(error) => {
+            warn_persist_commit_once(&io::Error::other(error));
+            None
+        }
     }
 }
 
@@ -3148,8 +3183,8 @@ mod tests {
             assert!(finish_restore_permit(
                 Some(permit),
                 ParsedRestoreToken::Usable("unverified-token".to_string()),
-                Err(anyhow::anyhow!("transient lookup error")),
-                true,
+                async { Err(anyhow::anyhow!("transient lookup error")) },
+                || true,
             )
             .await
             .is_err());
@@ -3159,8 +3194,8 @@ mod tests {
             assert!(finish_restore_permit(
                 Some(permit),
                 ParsedRestoreToken::Usable("revoked-token".to_string()),
-                Err(anyhow::anyhow!("owner revoked")),
-                false,
+                async { Err(anyhow::anyhow!("owner revoked")) },
+                || false,
             )
             .await
             .is_err());
@@ -3170,8 +3205,8 @@ mod tests {
             assert!(finish_restore_permit(
                 Some(permit),
                 ParsedRestoreToken::Usable("revoked-token".to_string()),
-                Ok(()),
-                false,
+                async { Ok(()) },
+                || false,
             )
             .await
             .is_err());
@@ -3181,12 +3216,54 @@ mod tests {
             finish_restore_permit(
                 Some(permit),
                 ParsedRestoreToken::Usable("verified-token".to_string()),
-                Ok(()),
-                true,
+                async { Ok(()) },
+                || true,
             )
             .await
             .unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "verified-token");
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_restore_commit_checks_before_write_and_clears_after_revocation() {
+        for kind in [PortalDeviceKind::Pointer, PortalDeviceKind::Keyboard] {
+            let dir = TempState::new();
+            RestorePermit::acquire_in(&dir.path, kind)
+                .unwrap()
+                .commit(ParsedRestoreToken::Usable("existing-token".to_string()))
+                .unwrap();
+            let path = dir.path.join(kind.token_file_name());
+            let permit = RestorePermit::acquire_in(&dir.path, kind).unwrap();
+            let observations = std::sync::atomic::AtomicUsize::new(0);
+            let result = finish_restore_permit(
+                Some(permit),
+                ParsedRestoreToken::Usable("new-token".to_string()),
+                async {
+                    // The actual final owner check is polled before any new token is written.
+                    assert_eq!(fs::read_to_string(&path).unwrap(), "existing-token");
+                    Ok(())
+                },
+                || {
+                    let index = observations.fetch_add(1, Ordering::SeqCst);
+                    let expected = if index == 0 {
+                        "existing-token"
+                    } else {
+                        "new-token"
+                    };
+                    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+                    // The permit is retained across both checks and the blocking write.
+                    assert!(
+                        RestorePermit::acquire_in_for(&dir.path, kind, Duration::ZERO).is_err()
+                    );
+                    index == 0
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(observations.load(Ordering::SeqCst), 2);
+            assert!(!path.exists());
+            assert!(RestorePermit::acquire_in(&dir.path, kind).is_ok());
         }
     }
 
