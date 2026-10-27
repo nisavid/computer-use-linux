@@ -13,6 +13,7 @@ The fork carries these runtime behavior changes:
 - `src/remote_desktop.rs`: session setup, input, responses, and cleanup are
   pinned to a unique portal owner. Ownership loss permanently revokes cached
   capabilities. Private-bus regressions live in `src/remote_desktop/owner_tests.rs`.
+- `src/server.rs` and `src/terminal.rs`: discovery serialization omits process arguments and terminal working directories while internal filtering and selectors retain them. Pi catalog hashes reflect the minimized schemas.
 
 - `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
   require a unique match, and title selectors prefer an exact match before
