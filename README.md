@@ -102,6 +102,8 @@ AT-SPI discovery has a three-second total deadline and skips providers whose sum
 
 ### MCP safety contract
 
+Process discovery returns names and PIDs: `list_apps.command` contains the process name without arguments. Terminal responses omit command lines and working directories; those details stay internal for `terminal_command` and `terminal_cwd` matching. This also applies to CLI `windows` output.
+
 `computer-use-linux` is not a read-only data source. It can observe the local desktop and, when a mutating tool is called, can change real application state. The `tools/list` response includes MCP `ToolAnnotations` so hosts can surface this distinction before invocation:
 
 | Class | Tools | Contract |

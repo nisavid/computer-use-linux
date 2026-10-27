@@ -11,6 +11,8 @@ desktop actions.
 
 `type_text` accepts at most 1000 Unicode characters and 4000 UTF-8 bytes per request. Larger input is rejected before focus or input changes. Execution has a 60-second deadline, followed by at most six seconds of key-release and clipboard cleanup. A timeout can leave a typed prefix; inspect the target before retrying. Send larger text as separate bounded requests.
 
+Discovery responses expose process names and PIDs without process arguments or terminal working directories. Detailed metadata stays internal for terminal selectors.
+
 Plain left `click` by element index or selector prefers a native AT-SPI
 `click`, `press`, or `toggle` action over toolkit bounds,
 avoiding pointer-coordinate conversion when that action is available. Explicit
