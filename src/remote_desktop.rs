@@ -283,12 +283,9 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     {
         assign_stream_pixel_scales(&mut streams, desktop_layout.as_deref());
     }
-    finish_restore_permit(
-        permit,
-        restore_token,
-        connection.ensure_current(),
-        || connection.is_current(),
-    )
+    finish_restore_permit(permit, restore_token, connection.ensure_current(), || {
+        connection.is_current()
+    })
     .await?;
     cleanup.disarm();
 
@@ -321,12 +318,9 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
         let _ = commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without keyboard access");
     }
-    finish_restore_permit(
-        permit,
-        restore_token,
-        connection.ensure_current(),
-        || connection.is_current(),
-    )
+    finish_restore_permit(permit, restore_token, connection.ensure_current(), || {
+        connection.is_current()
+    })
     .await?;
     cleanup.disarm();
 
