@@ -5933,7 +5933,6 @@ fn list_process_apps() -> Vec<AppCandidate> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_process_line)
-        .filter(|app| looks_like_desktop_app(&app.name, &app.command))
         .take(50)
         .collect()
 }
@@ -5943,8 +5942,16 @@ fn parse_process_line(line: &str) -> Option<AppCandidate> {
     let mut parts = trimmed.splitn(3, char::is_whitespace);
     let pid = parts.next()?.parse().ok()?;
     let name = parts.next()?.to_string();
-    let command = parts.next().unwrap_or("").trim().to_string();
-    Some(AppCandidate { name, pid, command })
+    let command_line = parts.next().unwrap_or("").trim();
+    // Filter wrapped desktop apps using argv, then discard sensitive arguments.
+    if !looks_like_desktop_app(&name, command_line) {
+        return None;
+    }
+    Some(AppCandidate {
+        command: name.clone(),
+        name,
+        pid,
+    })
 }
 
 fn looks_like_desktop_app(name: &str, command: &str) -> bool {
@@ -5976,6 +5983,41 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn process_discovery_omits_arguments_and_preserves_matching() {
+        for arguments in [
+            "python3 /opt/electron/app.py --token=sentinel-token",
+            "python3 firefox https://user:sentinel-password@example.test/private",
+            "python3 codex /home/user/sentinel-project",
+        ] {
+            let candidate = parse_process_line(&format!("123 python3 {arguments}")).unwrap();
+            let output = ListAppsOutput {
+                apps: vec![candidate],
+                accessible_apps: Vec::new(),
+                accessibility_error: None,
+                note: String::new(),
+            };
+            let json = serde_json::to_value(output).unwrap();
+            assert_eq!(
+                json["apps"][0],
+                serde_json::json!({"name": "python3", "pid": 123, "command": "python3"})
+            );
+            assert!(!json.to_string().contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn process_discovery_keeps_normal_apps_and_rejects_other_candidates() {
+        assert_eq!(
+            parse_process_line("123 firefox /usr/bin/firefox")
+                .unwrap()
+                .command,
+            "firefox"
+        );
+        assert!(parse_process_line("123 sleep sleep 30").is_none());
+        assert!(parse_process_line("invalid firefox firefox").is_none());
+    }
 
     /// Restores an environment variable when a test ends, including on panic.
     struct EnvVarGuard {

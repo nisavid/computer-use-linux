@@ -10,6 +10,8 @@
 
 The fork carries these runtime behavior changes:
 
+- `src/server.rs` and `src/terminal.rs`: discovery serialization omits process arguments and terminal working directories while internal filtering and selectors retain them. Pi catalog hashes reflect the minimized schemas.
+
 - `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
   require a unique match, and title selectors prefer an exact match before
   falling back to a substring. Regression coverage lives in

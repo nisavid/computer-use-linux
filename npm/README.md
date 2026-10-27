@@ -9,6 +9,8 @@ mutating and can change real application state. The MCP tool list includes
 `ToolAnnotations` so hosts can distinguish read-only observation from mutating
 desktop actions.
 
+Discovery responses expose process names and PIDs without process arguments or terminal working directories. Detailed metadata stays internal for terminal selectors.
+
 Plain left `click` by element index or selector prefers a native AT-SPI
 `click`, `press`, or `toggle` action over toolkit bounds,
 avoiding pointer-coordinate conversion when that action is available. Explicit
