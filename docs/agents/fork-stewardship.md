@@ -10,6 +10,9 @@
 
 The fork carries these runtime behavior changes:
 
+- `src/remote_desktop.rs`: session setup, input, responses, and cleanup are
+  pinned to a unique portal owner. Ownership loss permanently revokes cached
+  capabilities. Private-bus regressions live in `src/remote_desktop/owner_tests.rs`.
 - `src/x11_display.rs`: pre-capture image budgets, bounded incoming X11 frames
   and independent reply/unsolicited-event byte budgets, and rejection of
   unsolicited descriptors. Source pixel and decoded-byte limits are shared through `src/screenshot.rs`/`src/lib.rs`.
