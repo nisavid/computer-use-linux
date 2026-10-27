@@ -31,8 +31,13 @@ pub fn probe_extension() -> BackendProbe {
             };
         }
     };
-    let method = format!("{GNOME_SHELL_EXTENSION_SERVICE}.ListWindows");
-    let check = gdbus_call_check(&owner, GNOME_SHELL_EXTENSION_OBJECT_PATH, &method, &[]);
+    // Passive diagnostics never request consent or disclose private windows.
+    let check = gdbus_introspect_contains(
+        &owner,
+        GNOME_SHELL_EXTENSION_OBJECT_PATH,
+        GNOME_SHELL_EXTENSION_SERVICE,
+        "Authorize",
+    );
     BackendProbe {
         id: GNOME_SHELL_EXTENSION_BACKEND,
         ok: check.ok,
@@ -128,9 +133,7 @@ pub(crate) async fn focus_app(app_id: &str) -> Result<()> {
 async fn call_extension_json(method: &str) -> Result<String> {
     hydrate_session_bus_env();
 
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = extension_connection().await?;
     let proxy = verified_extension_proxy(&connection).await?;
     let json: String = proxy.call(method, &()).await.with_context(|| {
         format!("computer-use-linux GNOME Shell extension {method} call failed")
@@ -165,9 +168,7 @@ fn map_unknown_method(error: zbus::Error) -> anyhow::Error {
 pub async fn extension_monitor_layout() -> Result<Vec<MonitorInfo>> {
     hydrate_session_bus_env();
 
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = extension_connection().await?;
     let proxy = verified_extension_proxy(&connection).await?;
     let json: String = proxy
         .call("GetMonitorLayout", &())
@@ -196,9 +197,7 @@ async fn extension_window_op<B: serde::Serialize + zbus::DynamicType>(
 ) -> Result<String> {
     hydrate_session_bus_env();
 
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = extension_connection().await?;
     let proxy = verified_extension_proxy(&connection).await?;
     let (ok, message): (bool, String) = proxy
         .call(method, body)
@@ -217,9 +216,7 @@ async fn extension_window_op<B: serde::Serialize + zbus::DynamicType>(
 pub(crate) async fn activate_extension_window(window_id: u64) -> Result<()> {
     hydrate_session_bus_env();
 
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = extension_connection().await?;
     let proxy = verified_extension_proxy(&connection).await?;
     let (ok, message): (bool, String) = proxy
         .call("ActivateWindow", &(window_id))
@@ -236,16 +233,46 @@ pub(crate) async fn activate_extension_window(window_id: u64) -> Result<()> {
     }
 }
 
+static EXTENSION_CONNECTION: tokio::sync::Mutex<Option<(tokio::runtime::Id, zbus::Connection)>> =
+    tokio::sync::Mutex::const_new(None);
+static EXTENSION_AUTHORIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn extension_connection() -> Result<zbus::Connection> {
+    let runtime = tokio::runtime::Handle::current().id();
+    let mut stored = EXTENSION_CONNECTION.lock().await;
+    if let Some((id, connection)) = stored.as_ref() {
+        if *id == runtime && !connection.is_closed() {
+            return Ok(connection.clone());
+        }
+    }
+    let connection = zbus::Connection::session()
+        .await
+        .context("failed to connect to session bus")?;
+    *stored = Some((runtime, connection.clone()));
+    Ok(connection)
+}
+
 async fn verified_extension_proxy(connection: &zbus::Connection) -> Result<Proxy<'_>> {
     let owner = verified_extension_owner(connection).await?;
-    Proxy::new(
+    let proxy = Proxy::new(
         connection,
         owner,
         GNOME_SHELL_EXTENSION_OBJECT_PATH,
         GNOME_SHELL_EXTENSION_SERVICE,
     )
     .await
-    .context("failed to create verified computer-use-linux GNOME Shell extension proxy")
+    .context("failed to create verified computer-use-linux GNOME Shell extension proxy")?;
+    // Recheck with the extension after reload; serialize concurrent requests.
+    let _guard = EXTENSION_AUTHORIZATION.lock().await;
+    let allowed: bool = proxy
+        .call("Authorize", &())
+        .await
+        .map_err(map_unknown_method)
+        .context("GNOME Shell window-control authorization failed")?;
+    if !allowed {
+        bail!("GNOME Shell window-control permission denied or expired; restart this client and approve the dialog within 20 seconds");
+    }
+    Ok(proxy)
 }
 
 async fn verified_extension_owner(connection: &zbus::Connection) -> Result<OwnedUniqueName> {

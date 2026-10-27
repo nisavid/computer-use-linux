@@ -463,7 +463,7 @@ Computer-use tooling is, by definition, a privilege-escalation surface. The thre
 - **The screencast portal asks for permission once per session.** Granting it lets the calling MCP host capture the screen for the rest of the session. If you don't want that, decline the portal dialog and use `get_app_state` with `include_screenshot: false`.
 - **Persisted remote control is opt-in.** `COMPUTER_USE_LINUX_PERSIST_REMOTE_DESKTOP=1` stores the portal's single-use restore token in the user state directory, mode `0600`. A same-user process that can read that file can restore remote control without a new prompt until the desktop revokes the grant. Leave the variable unset to keep a prompt on every new process.
 - **AT-SPI exposes window contents to any client on your session bus.** Enabling the AT-SPI bridge (`setup_accessibility`) is a prerequisite for this binary; it's also what screen readers use, and it shares the same trust boundary.
-- **The GNOME Shell extension** is loaded only into your user's GNOME Shell, runs in the Shell's JS sandbox, and exposes a single DBus interface on the user session bus. It does not request any extra permissions.
+- **The GNOME Shell extension** is loaded only into your user's GNOME Shell, runs in the Shell's JS sandbox, and exposes a single DBus interface on the user session bus. It requires explicit desktop consent per unique D-Bus connection before window or monitor access. Grants end on disconnect or extension reload.
 - **No network.** This binary opens no TCP/UDP listener, makes no outbound Internet connections, and ships no telemetry. It does use local session transports such as DBus and the per-user `ydotoold` Unix socket.
 - **Mutating tools are explicit.** The MCP tool list annotates read-only versus mutating tools, and CI fails if the published tool annotations drift from the table above. Treat those annotations as hints; the host is still responsible for user approval and policy.
 
@@ -579,3 +579,13 @@ Then bump `Cargo.toml` and `package.json` together, update `CHANGELOG.md`, and p
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### GNOME window-control consent
+
+The optional extension asks for desktop approval within 20 seconds on the first
+window request from each client connection. A long-lived MCP server reuses its
+connection; each new CLI process requests approval. Denial lasts until that
+connection closes. Restart the client to ask again. The dialog identifies a
+bus-reported process ID, not a trusted application: approve only requests you
+initiated. `doctor` checks interface availability without prompting. After an
+extension update, log out and back in to replace the loaded code.

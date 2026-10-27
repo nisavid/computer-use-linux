@@ -3,9 +3,12 @@ import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import Clutter from 'gi://Clutter';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Dialog from 'resource:///org/gnome/shell/ui/dialog.js';
+import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 
 const SERVICE_NAME = 'dev.avifenesh.ComputerUseLinux.WindowControl';
 const OBJECT_PATH = '/dev/avifenesh/ComputerUseLinux/WindowControl';
@@ -14,6 +17,7 @@ const BACKEND = 'gnome-shell-extension';
 const WINDOW_CONTROL_XML = `
 <node>
   <interface name="${SERVICE_NAME}">
+    <method name="Authorize"><arg name="allowed" type="b" direction="out"/></method>
     <method name="ListWindows">
       <arg name="json" type="s" direction="out"/>
     </method>
@@ -47,6 +51,9 @@ const WindowControlDBus = GObject.registerClass(
 class WindowControlDBus extends GObject.Object {
     constructor() {
         super();
+        this._clients = new Map();
+        this._pendingAuthorization = null;
+        this._destroyed = false;
 
         this._dbusObject = Gio.DBusExportedObject.wrapJSObject(
             WINDOW_CONTROL_XML, this);
@@ -59,6 +66,9 @@ class WindowControlDBus extends GObject.Object {
     }
 
     destroy() {
+        this._destroyed = true;
+        for (const client of this._clients.values())
+            this._forgetClient(client);
         if (this._nameId) {
             Gio.DBus.session.unown_name(this._nameId);
             this._nameId = 0;
@@ -70,10 +80,14 @@ class WindowControlDBus extends GObject.Object {
     }
 
     ListWindowsAsync(_params, invocation) {
+        if (!this._requireAuthorized(invocation))
+            return;
         this._returnJson(invocation, this._listWindows());
     }
 
     ActivateWindowAsync([windowId], invocation) {
+        if (!this._requireAuthorized(invocation))
+            return;
         const requestedId = Number(windowId);
         const window = this._listMetaWindows().find(
             candidate => Number(candidate.get_id()) === requestedId);
@@ -132,6 +146,8 @@ class WindowControlDBus extends GObject.Object {
     }
 
     GetMonitorLayoutAsync(_params, invocation) {
+        if (!this._requireAuthorized(invocation))
+            return;
         const monitors = Main.layoutManager.monitors.map(monitor => ({
             index: monitor.index,
             x: monitor.x,
@@ -145,6 +161,8 @@ class WindowControlDBus extends GObject.Object {
     }
 
     _withWindow(windowId, invocation, action) {
+        if (!this._requireAuthorized(invocation))
+            return;
         const requestedId = Number(windowId);
         const window = this._listMetaWindows().find(
             candidate => Number(candidate.get_id()) === requestedId);
@@ -175,6 +193,113 @@ class WindowControlDBus extends GObject.Object {
         invocation.return_value(new GLib.Variant('(s)', [
             JSON.stringify(value),
         ]));
+    }
+
+    // Public bus names are not credentials. Grant only the bus-assigned sender.
+    AuthorizeAsync(_params, invocation) {
+        const sender = invocation.get_sender();
+        if (this._destroyed || !sender?.startsWith(':')) {
+            this._deny(invocation);
+            return;
+        }
+        const existing = this._clients.get(sender);
+        if (existing && !existing.invocation) {
+            invocation.return_value(new GLib.Variant('(b)', [existing.allowed]));
+            return;
+        }
+        if (this._pendingAuthorization || this._clients.size >= 64) {
+            this._deny(invocation);
+            return;
+        }
+        const client = {sender, invocation, allowed: false, watchId: 0,
+            timeoutId: 0, dialog: null, dialogOpened: false,
+            cancellable: new Gio.Cancellable()};
+        this._clients.set(sender, client);
+        this._pendingAuthorization = client;
+        client.timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 20, () => {
+            client.timeoutId = 0;
+            this._finishAuthorization(client, false);
+            return GLib.SOURCE_REMOVE;
+        });
+        client.watchId = Gio.bus_watch_name_on_connection(
+            Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE,
+            () => this._identifyClient(client), () => this._forgetClient(client));
+    }
+
+    _identifyClient(client) {
+        if (this._pendingAuthorization !== client)
+            return;
+        Gio.DBus.session.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+            'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+            new GLib.Variant('(s)', [client.sender]), new GLib.VariantType('(u)'),
+            Gio.DBusCallFlags.NONE, 1000, client.cancellable, (connection, result) => {
+                if (this._pendingAuthorization !== client)
+                    return;
+                try {
+                    const [pid] = connection.call_finish(result).deepUnpack();
+                    if (!Number.isInteger(pid) || pid <= 0)
+                        throw new Error('Invalid process ID');
+                    this._showAuthorization(client, pid);
+                } catch (_error) {
+                    this._finishAuthorization(client, false);
+                }
+            });
+    }
+
+    _showAuthorization(client, pid) {
+        const dialog = new ModalDialog.ModalDialog();
+        client.dialog = dialog;
+        dialog.contentLayout.add_child(new Dialog.MessageDialogContent({
+            title: 'Allow desktop window control?',
+            description: `Local process ${pid} (connection ${client.sender}) requests window titles, monitor layout, focus, movement, and resizing. Allow only if you just requested desktop automation. Approval lasts until this connection closes or the extension reloads.`,
+        }));
+        dialog.addButton({label: 'Deny', key: Clutter.KEY_Escape, default: true,
+            action: () => this._finishAuthorization(client, false)});
+        dialog.addButton({label: 'Allow',
+            action: () => this._finishAuthorization(client, true)});
+        client.dialogOpened = dialog.open();
+        if (!client.dialogOpened)
+            this._finishAuthorization(client, false);
+    }
+
+    _finishAuthorization(client, allowed) {
+        if (this._pendingAuthorization !== client)
+            return;
+        this._pendingAuthorization = null;
+        client.allowed = allowed && !this._destroyed && this._clients.get(client.sender) === client;
+        if (client.timeoutId)
+            GLib.source_remove(client.timeoutId);
+        client.timeoutId = 0;
+        client.cancellable.cancel();
+        if (client.dialogOpened)
+            client.dialog.close();
+        else
+            client.dialog?.destroy();
+        client.dialog = null;
+        const invocation = client.invocation;
+        client.invocation = null;
+        invocation.return_value(new GLib.Variant('(b)', [client.allowed]));
+    }
+
+    _forgetClient(client) {
+        this._finishAuthorization(client, false);
+        client.allowed = false;
+        this._clients.delete(client.sender);
+        if (client.watchId)
+            Gio.bus_unwatch_name(client.watchId);
+        client.watchId = 0;
+    }
+
+    _requireAuthorized(invocation) {
+        if (!this._destroyed && this._clients.get(invocation.get_sender())?.allowed)
+            return true;
+        this._deny(invocation);
+        return false;
+    }
+
+    _deny(invocation) {
+        invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+            'Desktop window control requires approval through Authorize on this connection');
     }
 
     _listWindows() {

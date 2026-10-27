@@ -1,0 +1,102 @@
+const {Gio, GLib, GObject} = imports.gi;
+const ByteArray = imports.byteArray;
+const Meta = {WindowType: {DESKTOP: 9}, WindowClientType: {WAYLAND: 1, X11: 2}};
+const Shell = {WindowTracker: {get_default: () => ({get_window_app: () => null})}};
+const Clutter = {KEY_Escape: 0xff1b};
+const Main = {overview: {visible: false}, activateWindow() {}, layoutManager: {monitors: [], primaryIndex: 0}};
+let effects = 0;
+const window = {get_id: () => 7, get_frame_rect: () => ({x: 0, y: 0, width: 10, height: 10}), move_frame() { effects++; }, move_resize_frame() { effects++; }};
+Main.activateWindow = () => effects++;
+const global = {get_window_actors: () => [{meta_window: window}], get_current_time: () => 0, display: {}};
+const dialogs = [];
+const ModalDialog = {ModalDialog: class {
+    constructor() { this.buttons = []; this.contentLayout = {add_child() {}}; dialogs.push(this); }
+    addButton(button) { this.buttons.push(button); }
+    open() { return true; }
+    close() { this.closed = true; }
+}};
+const Dialog = {MessageDialogContent: class {}};
+const Extension = class {};
+let [loaded, bytes] = GLib.file_get_contents((ARGV[0] || 'gnome-shell-extension/computer-use-linux@avifenesh.dev/extension.js'));
+if (!loaded) throw new Error('cannot read extension');
+let source = ByteArray.toString(bytes).replace(/^import .*;\n/gm, '').replace('export default class ', 'class ');
+eval(source + '\nglobalThis.TestServer = WindowControlDBus;');
+const SERVICE = 'dev.avifenesh.ComputerUseLinux.WindowControl';
+const PATH = '/dev/avifenesh/ComputerUseLinux/WindowControl';
+const server = new globalThis.TestServer();
+const loop = new GLib.MainLoop(null, false);
+let failure = null;
+function check(value, description) { if (!value) throw new Error(description); print('PASS ' + description); }
+function pause(ms) { return new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {resolve(); return GLib.SOURCE_REMOVE;})); }
+async function until(predicate, description) {
+    for (let i=0; i<200; i++) { if (predicate()) return; await pause(5); }
+    throw new Error('Timed out: ' + description);
+}
+function call(client, method, signature='()', args=[], reply='(s)') {
+    return new Promise((resolve, reject) => client.call(SERVICE, PATH, SERVICE, method,
+        new GLib.Variant(signature, args), new GLib.VariantType(reply), Gio.DBusCallFlags.NONE, 1000, null,
+        (connection, result) => { try {resolve(connection.call_finish(result).deepUnpack());} catch (error) {reject(error);} }));
+}
+function connect() { return Gio.DBusConnection.new_for_address_sync(GLib.getenv('DBUS_SESSION_BUS_ADDRESS'), Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, null, null); }
+async function denied(client, method='ListWindows') {
+    try {await call(client, method); throw new Error('unexpected operation success');}
+    catch (error) {check(error.message.includes('AccessDenied'), method + ' returns real AccessDenied');}
+}
+async function run() {
+    const first = connect();
+    const second = connect();
+    await pause(20);
+    await denied(first);
+    for (const [method, signature, args, reply] of [
+        ['ActivateWindow', '(t)', [7], '(bs)'],
+        ['MoveWindow', '(tii)', [7, 1, 2], '(bs)'],
+        ['ResizeWindow', '(tii)', [7, 10, 20], '(bs)'],
+        ['GetMonitorLayout', '()', [], '(s)'],
+    ]) {
+        let rejected = false;
+        try { await call(first, method, signature, args, reply); }
+        catch (error) { rejected = error.message.includes('AccessDenied'); }
+        check(rejected, method + ' denies before operations');
+    }
+    const authorization = call(first, 'Authorize', '()', [], '(b)');
+    const unix = GLib.getenv('DBUS_SESSION_BUS_ADDRESS').startsWith('unix:');
+    if (unix) {
+        await until(() => dialogs.length === 1, 'real bus PID lookup and dialog');
+        dialogs.pop().buttons.find(button => button.label === 'Deny').action();
+    }
+    const [allowed] = await authorization;
+    check(allowed === false, 'denial or unavailable identity never grants access');
+    check(dialogs.length === 0, 'failed identity lookup never opens modal');
+    const firstName = first.get_unique_name();
+    check(server._clients.has(firstName), 'denial is retained for current unique name');
+    first.close_sync(null);
+    await until(() => !server._clients.has(firstName), 'real disconnect name watcher');
+    check(!server._clients.has(firstName), 'real name disappearance removes denied client');
+    if (!unix) server._identifyClient = client => server._showAuthorization(client, 1234);
+    const pending = call(second, 'Authorize', '()', [], '(b)');
+    await until(() => dialogs.length === 1, 'consent dialog stub');
+    await denied(second);
+    dialogs[0].buttons.find(button => button.label === 'Allow').action();
+    const [ok] = await pending;
+    check(ok === true, 'real Authorize invocation receives (b)');
+    const [windows] = await call(second, 'ListWindows');
+    check(JSON.parse(windows).length === 1, 'approved peer receives real ListWindows (s)');
+    for (const [method, signature, args, reply] of [
+        ['ActivateWindow', '(t)', [7], '(bs)'], ['MoveWindow', '(tii)', [7, 1, 2], '(bs)'],
+        ['ResizeWindow', '(tii)', [7, 10, 20], '(bs)'], ['GetMonitorLayout', '()', [], '(s)'],
+    ]) { const result = await call(second, method, signature, args, reply); check(method === 'GetMonitorLayout' || result[0] === true, method + ' approved control'); }
+    check(effects === 3, 'all approved window operations retain side effects');
+    const third = connect();
+    await denied(third);
+    const secondName = second.get_unique_name();
+    second.close_sync(null);
+    await until(() => !server._clients.has(secondName), 'grant removal');
+    check(!server._clients.has(secondName), 'real name disappearance removes approved client');
+    server.destroy();
+    check(server._clients.size === 0, 'destroy releases retained clients');
+    third.close_sync(null);
+}
+run().catch(error => {failure = error; logError(error);}).finally(() => loop.quit());
+GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => { failure = new Error('test deadline'); loop.quit(); return GLib.SOURCE_REMOVE; });
+loop.run();
+if (failure) imports.system.exit(1);
