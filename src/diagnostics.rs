@@ -444,10 +444,12 @@ fn hydrate_desktop_env_from_process_tree() {
 }
 
 fn hydrate_desktop_env_from_systemd_user() {
-    let Ok(output) = Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .output()
-    else {
+    // Backend selection must not block an input worker indefinitely.
+    let Ok(output) = crate::command_runner::output_blocking_with_timeout(
+        Command::new("systemctl").args(["--user", "show-environment"]),
+        "read systemd user environment",
+        std::time::Duration::from_secs(2),
+    ) else {
         return;
     };
     if !output.status.success() {
@@ -1056,12 +1058,9 @@ fn ydotool_socket_check() -> Check {
 }
 
 fn user_id() -> Option<String> {
-    let output = Command::new("id").arg("-u").output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
+    // Match `id -u` without spawning a potentially stalled helper while an
+    // input deadline is being polled. geteuid has no failure case on Linux.
+    Some(unsafe { libc::geteuid() }.to_string())
 }
 
 fn command_path_check(command: &str) -> Check {

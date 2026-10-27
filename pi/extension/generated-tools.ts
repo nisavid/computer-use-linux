@@ -8,8 +8,8 @@ export interface GeneratedMcpToolDefinition {
 }
 
 export const GENERATED_SERVER_VERSION = "0.7.10";
-export const GENERATED_TOOL_CATALOG_HASH = "2493ef737d1fe64c458f763d439f4d6a000bd5b0afdcddf6c1b9866c73d0cdf9";
-export const GENERATED_SHELL_TOOL_CATALOG_HASH = "e60ef0edb63112f36d64b47b6fc23a934876b38e3b7a55f99d3521fc35459b67";
+export const GENERATED_TOOL_CATALOG_HASH = "2454391e3438ee40e7c0fec2ae3d9877d9ce398151a4e9a9fddf12e6d93ee8bd";
+export const GENERATED_SHELL_TOOL_CATALOG_HASH = "77ac4f065ac23a36444e17a1fce642959fd22e3176ce5f2c871c47f04dc86638";
 export const GENERATED_MCP_TOOLS =
 [
   {
@@ -1199,7 +1199,7 @@ export const GENERATED_MCP_TOOLS =
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Type literal text using keyboard input, optionally after focusing a target window or terminal selector.",
+    "description": "Type literal text (maximum 1000 Unicode characters / 4000 UTF-8 bytes), optionally after focusing a target. Execution has a 60-second deadline plus bounded cleanup. Failures may leave a typed prefix; inspect before retrying.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1241,6 +1241,8 @@ export const GENERATED_MCP_TOOLS =
           ]
         },
         "text": {
+          "description": "At most 1000 Unicode characters and 4000 UTF-8 bytes.",
+          "maxLength": 1000,
           "type": "string"
         },
         "title": {
