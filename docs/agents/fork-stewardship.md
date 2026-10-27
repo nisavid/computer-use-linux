@@ -10,6 +10,12 @@
 
 The fork carries these runtime behavior changes:
 
+- The GNOME Shell window-control extension requires explicit desktop consent per
+  unique D-Bus connection before window or monitor access. Grants are revoked on
+  disconnect or reload; the Rust client retains its verified connection per
+  Tokio runtime. The installer refreshes enabled extension files and requests a
+  session reload. `scripts/gnome_extension_dbus_test.js` covers the bus boundary.
+
 - `src/server.rs` and `src/terminal.rs`: discovery serialization omits process arguments and terminal working directories while internal filtering and selectors retain them. Pi catalog hashes reflect the minimized schemas.
 
 - `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
