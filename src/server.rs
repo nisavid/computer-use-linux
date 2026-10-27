@@ -45,12 +45,16 @@ use std::{
 };
 use tokio::{
     process::Command as TokioCommand,
-    time::{sleep, timeout},
+    time::{sleep, timeout, timeout_at, Instant},
 };
 use xkeysym::key as xkey;
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
 const INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const TYPE_TEXT_MAX_CHARS: usize = 1000;
+const TYPE_TEXT_MAX_BYTES: usize = 4000;
+const TYPE_TEXT_TIMEOUT: Duration = Duration::from_secs(60);
+const TYPE_TEXT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SCROLL_PAGES: f64 = 100.0;
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1684,7 +1688,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "type_text",
-        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector.",
+        description = "Type literal text (maximum 1000 Unicode characters / 4000 UTF-8 bytes), optionally after focusing a target. Execution has a 60-second deadline plus bounded cleanup. Failures may leave a typed prefix; inspect before retrying.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1696,187 +1700,26 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
-        let received = Some(serde_json::json!(params.clone()));
+        if let Err(message) = validate_type_text(&params.text) {
+            return Json(typing_error(message));
+        }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        let window_target = params.window_target();
-        let focus = match self.focus_target_for_input(&window_target).await {
-            Ok(focus) => focus,
-            Err(message) => {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "type_text".to_string(),
-                    message,
-                    received,
-                });
-            }
-        };
-        if self.should_prefer_kde_clipboard_text_backend() {
-            match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
-                    let kde_focus = if window_target.has_target() {
-                        match self.focus_target_for_input(&window_target).await {
-                            Ok(focus) => focus,
-                            Err(message) => {
-                                return Json(ActionOutput {
-                                    ok: false,
-                                    implemented: true,
-                                    action: "type_text".to_string(),
-                                    message,
-                                    received,
-                                });
-                            }
-                        }
-                    } else {
-                        focus.clone()
-                    };
-                    let paste_shortcut =
-                        kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
-                    let _clipboard_guard = self.kde_clipboard_lock.lock().await;
-                    match run_kde_clipboard_paste_text(&session, &params.text, paste_shortcut).await
-                    {
-                        Ok(message) => {
-                            let notes = self.input_landing_notes(kde_focus.as_ref(), true).await;
-                            return Json(with_notes(
-                                successful_action_with_focus(
-                                    "type_text",
-                                    &message,
-                                    received,
-                                    kde_focus,
-                                ),
-                                notes,
-                            ));
-                        }
-                        Err(error) => {
-                            if error.clear_portal_keyboard_session {
-                                self.clear_portal_keyboard_session(&session);
-                            }
-                            if !error.can_fallback_to_ydotool {
-                                return Json(action_result_with_focus(
-                                    "type_text",
-                                    Err(error.message),
-                                    received,
-                                    kde_focus,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => {}
-            }
-        }
-        if self.should_prefer_portal_keyboard_backend().await {
-            if let Ok(keysyms) = keysyms_for_text(&params.text) {
-                match self.ensure_portal_keyboard_session().await {
-                    Ok(Some(session)) => match type_text_with_keysyms(&session, &keysyms).await {
-                        Ok(()) => {
-                            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                            return Json(with_notes(
-                                successful_action_with_focus(
-                                    "type_text",
-                                    "Action sent through the remote desktop portal.",
-                                    received,
-                                    focus,
-                                ),
-                                notes,
-                            ));
-                        }
-                        Err(error) => {
-                            self.clear_portal_keyboard_session(&session);
-                            return Json(action_result_with_focus(
-                                "type_text",
-                                Err(format!("{error:#}")),
-                                received,
-                                focus,
-                            ));
-                        }
-                    },
-                    Ok(None) => {}
-                    Err(_) => {}
-                }
-            }
-        }
-        // X11: xdotool type resolves keysyms against the live XKB layout.
-        // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
-        // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
-        if self.should_prefer_xdotool_keyboard() {
-            let delay_ms = xdotool_type_delay_ms();
-            let args = xdotool_type_args_with_delay(&params.text, delay_ms);
-            let command_timeout = xdotool_type_timeout(&params.text, delay_ms);
-            let text = params.text.clone();
-            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_xdotool_or_fallback_with_timeout(
-                    Path::new("xdotool"),
-                    &args,
-                    command_timeout,
-                    || run_ydotool_type_text(&text),
-                )
-                .await
-            })
-            .await;
-            let _input_guard = input_guard;
-            let used_xdotool = result
-                .as_ref()
-                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Xdotool);
-            let mut output = action_result_with_focus(
-                "type_text",
-                result.map(|result| vec![result.output]),
-                received,
-                focus.clone(),
-            );
-            if used_xdotool {
-                output.message = "Action sent through xdotool (X11 XTEST).".to_string();
-            }
-            if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                output = with_notes(output, notes);
-            }
-            return Json(output);
-        }
-        if self.should_prefer_wtype_keyboard() {
-            let text = params.text.clone();
-            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, || {
-                    run_ydotool_type_text(&text)
-                })
-                .await
-            })
-            .await;
-            let _input_guard = input_guard;
-            let used_wtype = result
-                .as_ref()
-                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Wtype);
-            let mut output = action_result_with_focus(
-                "type_text",
-                result.map(|result| vec![result.output]),
-                received,
-                focus.clone(),
-            );
-            if used_wtype {
-                output.message =
-                    "Action sent through wtype (Wayland virtual-keyboard protocol).".to_string();
-            }
-            if output.ok && focus.is_some() {
-                let notes = self.input_landing_notes(focus.as_ref(), true).await;
-                output = with_notes(output, notes);
-            }
-            return Json(output);
-        }
-        let text = params.text.clone();
-        let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-            run_ydotool_type_text(&text)
-                .await
-                .map(|output| vec![output])
-        })
+        let deadline = Instant::now() + TYPE_TEXT_TIMEOUT;
+        let server = self.clone();
+        let cleanup = Arc::new(Mutex::new(TypingCleanup::default()));
+        let operation_cleanup = Arc::clone(&cleanup);
+        let (_input_guard, result) = run_bounded_typing_input(
+            input_guard,
+            deadline,
+            async move {
+                Ok(server
+                    .type_text_inner(params, deadline, operation_cleanup)
+                    .await)
+            },
+            finish_typing_cleanup(cleanup),
+        )
         .await;
-        let _input_guard = input_guard;
-        let mut output = action_result_with_focus("type_text", result, received, focus.clone());
-        if output.ok && focus.is_some() {
-            let notes = self.input_landing_notes(focus.as_ref(), true).await;
-            output = with_notes(output, notes);
-        }
-        Json(output)
+        typing_output(result)
     }
 
     #[tool(
@@ -2877,6 +2720,8 @@ struct PressKeyParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct TypeTextParams {
+    /// At most 1000 Unicode characters and 4000 UTF-8 bytes.
+    #[schemars(length(max = TYPE_TEXT_MAX_CHARS))]
     text: String,
     #[serde(default)]
     window_id: Option<u64>,
@@ -3087,6 +2932,214 @@ impl ComputerUseLinux {
                 *cached = None;
             }
         }
+    }
+
+    async fn type_text_inner(
+        &self,
+        params: TypeTextParams,
+        deadline: Instant,
+        cleanup: Arc<Mutex<TypingCleanup>>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let window_target = params.window_target();
+        let focus = match self.focus_target_for_input(&window_target).await {
+            Ok(focus) => focus,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "type_text".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
+        if self.should_prefer_kde_clipboard_text_backend() {
+            match self.ensure_portal_keyboard_session().await {
+                Ok(Some(session)) => {
+                    cleanup.lock().unwrap().session = Some(session.clone());
+                    let kde_focus = if window_target.has_target() {
+                        match self.focus_target_for_input(&window_target).await {
+                            Ok(focus) => focus,
+                            Err(message) => {
+                                return Json(ActionOutput {
+                                    ok: false,
+                                    implemented: true,
+                                    action: "type_text".to_string(),
+                                    message,
+                                    received,
+                                });
+                            }
+                        }
+                    } else {
+                        focus.clone()
+                    };
+                    let paste_shortcut =
+                        kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
+                    let _clipboard_guard = self.kde_clipboard_lock.lock().await;
+                    match run_kde_clipboard_paste_text(
+                        &session,
+                        &params.text,
+                        paste_shortcut,
+                        &cleanup,
+                    )
+                    .await
+                    {
+                        Ok(message) => {
+                            let notes = self.input_landing_notes(kde_focus.as_ref(), true).await;
+                            return Json(with_notes(
+                                successful_action_with_focus(
+                                    "type_text",
+                                    &message,
+                                    received,
+                                    kde_focus,
+                                ),
+                                notes,
+                            ));
+                        }
+                        Err(error) => {
+                            if error.clear_portal_keyboard_session {
+                                self.clear_portal_keyboard_session(&session);
+                            }
+                            if !error.can_fallback_to_ydotool {
+                                return Json(action_result_with_focus(
+                                    "type_text",
+                                    Err(error.message),
+                                    received,
+                                    kde_focus,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+        if self.should_prefer_portal_keyboard_backend().await {
+            if let Ok(keysyms) = keysyms_for_text(&params.text) {
+                match self.ensure_portal_keyboard_session().await {
+                    Ok(Some(session)) => {
+                        cleanup.lock().unwrap().session = Some(session.clone());
+                        match type_text_with_keysyms(&session, &keysyms).await {
+                            Ok(()) => {
+                                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                                return Json(with_notes(
+                                    successful_action_with_focus(
+                                        "type_text",
+                                        "Action sent through the remote desktop portal.",
+                                        received,
+                                        focus,
+                                    ),
+                                    notes,
+                                ));
+                            }
+                            Err(error) => {
+                                self.clear_portal_keyboard_session(&session);
+                                return Json(action_result_with_focus(
+                                    "type_text",
+                                    Err(format!("{error:#}")),
+                                    received,
+                                    focus,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+        // X11: xdotool type resolves keysyms against the live XKB layout.
+        // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
+        // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
+        if self.should_prefer_xdotool_keyboard() {
+            let delay_ms = xdotool_type_delay_ms();
+            let args = xdotool_type_args_with_delay(&params.text, delay_ms);
+            let command_timeout = match typing_command_timeout(
+                deadline,
+                xdotool_type_timeout(&params.text, delay_ms),
+            ) {
+                Ok(value) => value,
+                Err(message) => {
+                    return Json(action_result_with_focus(
+                        "type_text",
+                        Err(message),
+                        received,
+                        focus,
+                    ))
+                }
+            };
+            let text = params.text.clone();
+            let result = async {
+                run_xdotool_or_fallback_with_timeout(
+                    Path::new("xdotool"),
+                    &args,
+                    command_timeout,
+                    || run_ydotool_type_text(&text, deadline),
+                )
+                .await
+            }
+            .await;
+            let used_xdotool = result
+                .as_ref()
+                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Xdotool);
+            let mut output = action_result_with_focus(
+                "type_text",
+                result.map(|result| vec![result.output]),
+                received,
+                focus.clone(),
+            );
+            if used_xdotool {
+                output.message = "Action sent through xdotool (X11 XTEST).".to_string();
+            }
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
+        if self.should_prefer_wtype_keyboard() {
+            let text = params.text.clone();
+            let result = async {
+                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, deadline, || {
+                    run_ydotool_type_text(&text, deadline)
+                })
+                .await
+            }
+            .await;
+            let used_wtype = result
+                .as_ref()
+                .is_ok_and(|result| result.backend == KeyboardCommandBackend::Wtype);
+            let mut output = action_result_with_focus(
+                "type_text",
+                result.map(|result| vec![result.output]),
+                received,
+                focus.clone(),
+            );
+            if used_wtype {
+                output.message =
+                    "Action sent through wtype (Wayland virtual-keyboard protocol).".to_string();
+            }
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
+        let text = params.text.clone();
+        let result = async {
+            run_ydotool_type_text(&text, deadline)
+                .await
+                .map(|output| vec![output])
+        }
+        .await;
+        let mut output = action_result_with_focus("type_text", result, received, focus.clone());
+        if output.ok && focus.is_some() {
+            let notes = self.input_landing_notes(focus.as_ref(), true).await;
+            output = with_notes(output, notes);
+        }
+        Json(output)
     }
 
     fn cached_portal_keyboard_session(&self) -> Option<PortalKeyboardSession> {
@@ -5084,6 +5137,133 @@ async fn run_ydotool_drag(
     }
 }
 
+fn typing_error(message: String) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: "type_text".to_string(),
+        message,
+        received: None,
+    }
+}
+
+fn validate_type_text(text: &str) -> std::result::Result<(), String> {
+    if text.len() > TYPE_TEXT_MAX_BYTES || text.chars().count() > TYPE_TEXT_MAX_CHARS {
+        Err(format!("text exceeds the {TYPE_TEXT_MAX_CHARS}-character / {TYPE_TEXT_MAX_BYTES}-byte limit; send smaller requests"))
+    } else {
+        Ok(())
+    }
+}
+
+fn typing_command_timeout(
+    deadline: Instant,
+    preferred: Duration,
+) -> std::result::Result<Duration, String> {
+    // Reserve command_runner's one-second reap and bounded busy-file retries.
+    deadline
+        .saturating_duration_since(Instant::now())
+        .checked_sub(Duration::from_secs(2))
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(preferred))
+        .ok_or_else(|| {
+            "typing deadline reached; input may be partial, inspect before retrying".to_string()
+        })
+}
+
+#[derive(Default)]
+struct TypingCleanup {
+    session: Option<PortalKeyboardSession>,
+    clipboard: Option<String>,
+}
+
+async fn finish_typing_cleanup(
+    cleanup: Arc<Mutex<TypingCleanup>>,
+) -> std::result::Result<(), String> {
+    let TypingCleanup { session, clipboard } = std::mem::take(&mut *cleanup.lock().unwrap());
+    let mut errors = Vec::new();
+    if let Some(session) = session {
+        // Retain the exact session even when error handling evicts its cache.
+        if timeout(TYPE_TEXT_CLEANUP_TIMEOUT, session.wait_for_input_idle())
+            .await
+            .is_err()
+        {
+            session.invalidate_and_close();
+            errors.push("portal release cleanup timed out");
+        }
+    }
+    if let Some(previous) = clipboard {
+        if !matches!(
+            timeout(
+                TYPE_TEXT_CLEANUP_TIMEOUT,
+                kde_set_clipboard_contents(&previous)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            errors.push("previous KDE clipboard contents could not be restored");
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Keep non-idempotent input completion separate from cleanup status.
+struct TypingOutcome<T> {
+    operation: std::result::Result<T, String>,
+    cleanup: std::result::Result<(), String>,
+}
+
+/// Preserve the action's result and context, appending cleanup failures as warnings.
+fn typing_output(
+    result: std::result::Result<TypingOutcome<Json<ActionOutput>>, String>,
+) -> Json<ActionOutput> {
+    match result {
+        Ok(outcome) => {
+            let Json(output) = outcome
+                .operation
+                .unwrap_or_else(|message| Json(typing_error(message)));
+            Json(with_notes(
+                output,
+                outcome
+                    .cleanup
+                    .err()
+                    .map(|error| format!("Warning: {error}; inspect the target before retrying.")),
+            ))
+        }
+        Err(message) => Json(typing_error(message)),
+    }
+}
+
+/// Retain serialization through cleanup even if the caller drops the future.
+async fn run_bounded_typing_input<T, F, C>(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    deadline: Instant,
+    operation: F,
+    cleanup: C,
+) -> (
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+    std::result::Result<TypingOutcome<T>, String>,
+)
+where
+    T: Send + 'static,
+    F: Future<Output = std::result::Result<T, String>> + Send + 'static,
+    C: Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    run_cancellation_safe_input(guard, async move {
+        let operation = timeout_at(deadline, operation).await.unwrap_or_else(|_| {
+            Err("type_text exceeded its 60-second execution deadline; input may be partial, inspect before retrying".to_string())
+        });
+        Ok(TypingOutcome {
+            operation,
+            cleanup: cleanup.await,
+        })
+    })
+    .await
+}
+
 async fn run_cancellation_safe_input<T, F>(
     input_guard: tokio::sync::OwnedMutexGuard<()>,
     operation: F,
@@ -5124,7 +5304,10 @@ async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
     }
 }
 
-async fn run_ydotool_type_text(text: &str) -> std::result::Result<Output, String> {
+async fn run_ydotool_type_text(
+    text: &str,
+    deadline: Instant,
+) -> std::result::Result<Output, String> {
     let support = ydotool::ensure_supported_async().await?;
     let socket = ydotool::socket_path_for_command()?;
     let mut command = TokioCommand::new(&support.executable);
@@ -5133,7 +5316,7 @@ async fn run_ydotool_type_text(text: &str) -> std::result::Result<Output, String
     let output = crate::command_runner::output_with_stdin(
         command,
         "run ydotool type",
-        ydotool_type_timeout(text),
+        typing_command_timeout(deadline, ydotool_type_timeout(text))?,
         text.as_bytes().to_vec(),
     )
     .await
@@ -5201,10 +5384,12 @@ async fn run_kde_clipboard_paste_text(
     session: &PortalKeyboardSession,
     text: &str,
     paste_shortcut: KdeClipboardPasteShortcut,
+    cleanup: &Arc<Mutex<TypingCleanup>>,
 ) -> std::result::Result<String, KdeClipboardPasteError> {
     let previous = kde_clipboard_contents()
         .await
         .map_err(KdeClipboardPasteError::before_text_input)?;
+    cleanup.lock().unwrap().clipboard = Some(previous.clone());
     kde_set_clipboard_contents(text)
         .await
         .map_err(KdeClipboardPasteError::before_text_input)?;
@@ -5216,6 +5401,9 @@ async fn run_kde_clipboard_paste_text(
 
     sleep(kde_clipboard_restore_delay(text)).await;
     let restore_result = kde_set_clipboard_contents(&previous).await;
+    if restore_result.is_ok() {
+        cleanup.lock().unwrap().clipboard = None;
+    }
 
     match (paste_result, restore_result) {
         (Ok(_), Ok(_)) => Ok("Action pasted through KDE clipboard integration.".to_string()),
@@ -5484,6 +5672,7 @@ where
 async fn run_wtype_type_text_or_fallback<F, Fut>(
     program: &Path,
     text: &str,
+    deadline: Instant,
     fallback: F,
 ) -> std::result::Result<KeyboardCommandResult, String>
 where
@@ -5509,7 +5698,7 @@ where
     let output = crate::command_runner::output_with_stdin(
         command,
         "run wtype",
-        ydotool_type_timeout(text),
+        typing_command_timeout(deadline, ydotool_type_timeout(text))?,
         text.as_bytes().to_vec(),
     )
     .await
@@ -7946,9 +8135,12 @@ mod tests {
             .expect("make fake wtype executable");
         let text = "Zwölf Yaks aßen Öl über München";
 
-        let result = run_wtype_type_text_or_fallback(&wtype, text, || async {
-            panic!("available wtype must not fall back")
-        })
+        let result = run_wtype_type_text_or_fallback(
+            &wtype,
+            text,
+            Instant::now() + TYPE_TEXT_TIMEOUT,
+            || async { panic!("available wtype must not fall back") },
+        )
         .await
         .expect("wtype should succeed");
 
@@ -7962,6 +8154,7 @@ mod tests {
         let result = run_wtype_type_text_or_fallback(
             Path::new("/definitely/missing/wtype"),
             "text",
+            Instant::now() + TYPE_TEXT_TIMEOUT,
             || async {
                 TokioCommand::new("sh")
                     .args(["-c", "exit 0"])
@@ -7990,13 +8183,18 @@ mod tests {
         std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
             .expect("make fake wtype executable");
 
-        let result = run_wtype_type_text_or_fallback(&wtype, "text", || async {
-            std::fs::write(&fallback_marker, "ran").unwrap();
-            TokioCommand::new("true")
-                .output()
-                .await
-                .map_err(|error| error.to_string())
-        })
+        let result = run_wtype_type_text_or_fallback(
+            &wtype,
+            "text",
+            Instant::now() + TYPE_TEXT_TIMEOUT,
+            || async {
+                std::fs::write(&fallback_marker, "ran").unwrap();
+                TokioCommand::new("true")
+                    .output()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
         .await;
 
         assert!(result.is_err());
@@ -8055,6 +8253,189 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(dir);
         panic!("cancelled xdotool child {pid} was not killed");
+    }
+
+    #[test]
+    fn typing_limits_bound_decoded_unicode_and_schema() {
+        for text in ["x".repeat(1000), "🦀".repeat(1000), String::new()] {
+            assert!(validate_type_text(&text).is_ok());
+        }
+        for text in ["x".repeat(1001), "é".repeat(1001), "🦀".repeat(1001)] {
+            assert!(validate_type_text(&text).is_err());
+        }
+        let escaped = format!(r#"{{"text":"{}"}}"#, r"\u0061".repeat(1001));
+        let p: TypeTextParams = serde_json::from_str(&escaped).unwrap();
+        assert!(validate_type_text(&p.text).is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(TypeTextParams)).unwrap();
+        assert_eq!(schema["properties"]["text"]["maxLength"], 1000);
+        assert!(typing_command_timeout(Instant::now(), Duration::MAX).is_err());
+        assert!(
+            typing_command_timeout(Instant::now() + TYPE_TEXT_TIMEOUT, Duration::MAX).unwrap()
+                <= Duration::from_secs(58)
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_rejects_before_lock_and_focus() {
+        let server = ComputerUseLinux::default();
+        let _guard = server.input_operation_lock.lock().await;
+        let params = serde_json::from_value(
+            serde_json::json!({"text":"🦀".repeat(1001), "pid":4294967295u32}),
+        )
+        .unwrap();
+        let Json(result) = timeout(
+            Duration::from_millis(100),
+            server.type_text(Parameters(params)),
+        )
+        .await
+        .unwrap();
+        assert!(!result.ok);
+        assert!(result.received.is_none());
+        assert!(result.message.contains("limit"));
+    }
+
+    #[tokio::test]
+    async fn typing_deadline_survives_caller_cancel_and_waits_for_cleanup() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (clean_tx, clean_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_bounded_typing_input(
+            guard,
+            Instant::now() + Duration::from_millis(50),
+            async move {
+                let _ = start_tx.send(());
+                std::future::pending::<std::result::Result<(), String>>().await
+            },
+            async move {
+                let _ = clean_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            },
+        ));
+        start_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        timeout(Duration::from_secs(1), clean_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        let _next = timeout(Duration::from_secs(1), lock.lock()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typing_preserves_success_and_cleanup() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (guard, result) = run_bounded_typing_input(
+            guard,
+            Instant::now() + TYPE_TEXT_TIMEOUT,
+            async { Ok::<_, String>("literal é🦀") },
+            async move {
+                tx.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .await;
+        let outcome = result.unwrap();
+        assert_eq!(outcome.operation.unwrap(), "literal é🦀");
+        assert!(outcome.cleanup.is_ok());
+        rx.await.unwrap();
+        drop(guard);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn typing_cleanup_warning_preserves_action_outcome_and_context() {
+        for ok in [true, false] {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::clone(&lock).lock_owned().await;
+            let received = serde_json::json!({"text": "literal é🦀", "window_id": 42});
+            let original = ActionOutput {
+                ok,
+                implemented: true,
+                action: "type_text".to_string(),
+                message: "Backend result. Focus and landing feedback.".to_string(),
+                received: Some(received.clone()),
+            };
+            let (guard, result) = run_bounded_typing_input(
+                guard,
+                Instant::now() + TYPE_TEXT_TIMEOUT,
+                async move { Ok(Json(original)) },
+                async { Err("clipboard restore failed".to_string()) },
+            )
+            .await;
+            let Json(output) = typing_output(result);
+            assert_eq!(output.ok, ok);
+            assert_eq!(output.received, Some(received));
+            assert!(output.implemented);
+            assert_eq!(output.action, "type_text");
+            assert!(output
+                .message
+                .starts_with("Backend result. Focus and landing feedback."));
+            assert!(output.message.contains("Warning: clipboard restore failed"));
+            assert!(output
+                .message
+                .contains("inspect the target before retrying"));
+            assert!(!output.message.contains("deadline"));
+            drop(guard);
+            assert!(lock.try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_operation_error_is_distinct_from_timeout_and_cleanup() {
+        for cleanup_fails in [true, false] {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::clone(&lock).lock_owned().await;
+            let (_, result) = run_bounded_typing_input(
+                guard,
+                Instant::now() + TYPE_TEXT_TIMEOUT,
+                async { Err::<Json<ActionOutput>, _>("backend failed".to_string()) },
+                async move {
+                    if cleanup_fails {
+                        Err("release failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            let Json(output) = typing_output(result);
+            assert!(!output.ok);
+            assert!(output.message.starts_with("backend failed"));
+            assert_eq!(
+                output.message.contains("Warning: release failed"),
+                cleanup_fails
+            );
+            assert!(!output.message.contains("deadline"));
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_timeout_preserves_timeout_and_cleanup_warning() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&lock).lock_owned().await;
+        let (guard, result) = run_bounded_typing_input(
+            guard,
+            Instant::now(),
+            std::future::pending::<std::result::Result<Json<ActionOutput>, String>>(),
+            async { Err("portal release timed out".to_string()) },
+        )
+        .await;
+        let Json(output) = typing_output(result);
+        assert!(!output.ok);
+        assert!(output
+            .message
+            .starts_with("type_text exceeded its 60-second execution deadline"));
+        assert!(output.message.contains("input may be partial"));
+        assert!(output.message.contains("Warning: portal release timed out"));
+        drop(guard);
+        assert!(lock.try_lock().is_ok());
     }
 
     #[tokio::test]
