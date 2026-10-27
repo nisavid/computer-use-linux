@@ -309,25 +309,100 @@ async fn portal_owner_release_and_reacquire_never_revives_a_session() {
 }
 #[tokio::test]
 async fn portal_owner_response_streams_reject_other_senders_on_both_paths() {
-    tokio::time::timeout(Duration::from_secs(10),async {
-        let bus=TestBus::start(); let original=Portal::start(&bus).await;
-        original.connection.request_name(PORTAL_DESKTOP_SERVICE).await.unwrap();
-        let attacker=bus.connect().await;
-        let connection=PortalConnection::new(bus.connect().await).await.unwrap();
-        for returned in [false,true] {
-            let (predicted,mut stream)=portal_request_stream(&connection,"owner_test").await.unwrap();
-            let handle=OwnedObjectPath::try_from(if returned { format!("{predicted}_returned") } else { predicted.clone() }).unwrap();
-            let send=async { loop {
-                let results:HashMap<String,OwnedVariant>=HashMap::new();
-                attacker.emit_signal(None::<&str>,handle.as_str(),PORTAL_REQUEST_INTERFACE,"Response",&(7_u32,&results)).await.unwrap();
-                original.connection.emit_signal(None::<&str>,handle.as_str(),PORTAL_REQUEST_INTERFACE,"Response",&(0_u32,results)).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            } };
-            let receive=await_portal_response(&connection,handle.clone(),&predicted,&mut stream);
-            tokio::select! { response=receive => assert_eq!(response.unwrap().0,0), ()=send => unreachable!() }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let bus = TestBus::start();
+        let original = Portal::start(&bus).await;
+        original
+            .connection
+            .request_name(PORTAL_DESKTOP_SERVICE)
+            .await
+            .unwrap();
+        let attacker = bus.connect().await;
+        let connection = PortalConnection::new(bus.connect().await).await.unwrap();
+        for returned in [false, true] {
+            let (predicted, mut stream) = portal_request_stream(&connection, "owner_test")
+                .await
+                .unwrap();
+            let handle = OwnedObjectPath::try_from(if returned {
+                format!("{predicted}_returned")
+            } else {
+                predicted.clone()
+            })
+            .unwrap();
+            // Install the exact production subscription before either sender emits.
+            subscribe_returned_portal_response(&connection, &handle, &predicted, &mut stream)
+                .await
+                .unwrap();
+            let results: HashMap<String, OwnedVariant> = HashMap::new();
+            attacker
+                .emit_signal(
+                    None::<&str>,
+                    handle.as_str(),
+                    PORTAL_REQUEST_INTERFACE,
+                    "Response",
+                    &(7_u32, &results),
+                )
+                .await
+                .unwrap();
+            // A daemon round trip orders the forged signal before the legitimate one.
+            zbus::fdo::DBusProxy::new(&attacker)
+                .await
+                .unwrap()
+                .get_id()
+                .await
+                .unwrap();
+            original
+                .connection
+                .emit_signal(
+                    None::<&str>,
+                    handle.as_str(),
+                    PORTAL_REQUEST_INTERFACE,
+                    "Response",
+                    &(0_u32, results),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                receive_portal_response(&connection, &mut stream)
+                    .await
+                    .unwrap()
+                    .0,
+                0
+            );
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
+
+#[tokio::test]
+async fn persistence_keeps_version_failure_fallback_but_rejects_revoked_owners() {
+    let bus = TestBus::start();
+    let original = Portal::start(&bus).await;
+    original
+        .connection
+        .request_name(PORTAL_DESKTOP_SERVICE)
+        .await
+        .unwrap();
+    let connection = PortalConnection::new(bus.connect().await).await.unwrap();
+    // This mock has no usable version property: the historical fallback stays Off.
+    assert!(matches!(
+        remote_desktop_persistence_if_requested(&connection, true)
+            .await
+            .unwrap(),
+        RemoteDesktopPersistence::Off
+    ));
+    original
+        .connection
+        .release_name(PORTAL_DESKTOP_SERVICE)
+        .await
+        .unwrap();
+    wait_until(|| !connection.is_current()).await;
+    assert!(remote_desktop_persistence_if_requested(&connection, true)
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn portal_owner_cleanup_guards_keep_the_original_destination() {
     tokio::time::timeout(Duration::from_secs(10), async {

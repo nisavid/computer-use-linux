@@ -253,7 +253,7 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
     let connection = PortalConnection::new(connection).await?;
-    let persistence = remote_desktop_persistence(&connection).await;
+    let persistence = remote_desktop_persistence(&connection).await?;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Pointer).await;
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
@@ -306,7 +306,7 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
     let connection = PortalConnection::new(connection).await?;
-    let persistence = remote_desktop_persistence(&connection).await;
+    let persistence = remote_desktop_persistence(&connection).await?;
     let permit = claim_restore_permit(&persistence, PortalDeviceKind::Keyboard).await;
     let session_handle = create_remote_desktop_session(&connection).await?;
     let mut cleanup = PortalSessionCleanup::new(connection.clone(), session_handle.clone());
@@ -1445,11 +1445,26 @@ fn parse_restore_token(results: &HashMap<String, OwnedVariant>) -> ParsedRestore
     }
 }
 
-async fn remote_desktop_persistence(connection: &PortalConnection) -> RemoteDesktopPersistence {
-    if std::env::var(PERSIST_REMOTE_DESKTOP_ENV).ok().as_deref() != Some("1") {
-        return RemoteDesktopPersistence::Off;
+async fn remote_desktop_persistence(
+    connection: &PortalConnection,
+) -> Result<RemoteDesktopPersistence> {
+    remote_desktop_persistence_if_requested(
+        connection,
+        std::env::var(PERSIST_REMOTE_DESKTOP_ENV).ok().as_deref() == Some("1"),
+    )
+    .await
+}
+
+async fn remote_desktop_persistence_if_requested(
+    connection: &PortalConnection,
+    requested: bool,
+) -> Result<RemoteDesktopPersistence> {
+    if !requested {
+        return Ok(RemoteDesktopPersistence::Off);
     }
-    match remote_desktop_interface_version(connection).await {
+    // An uncertain owner is a retryable setup failure, not a persistence downgrade.
+    connection.ensure_current().await?;
+    Ok(match remote_desktop_interface_version(connection).await {
         Ok(version) if version >= REMOTE_DESKTOP_PERSIST_VERSION => RemoteDesktopPersistence::On,
         Ok(version) => {
             warn_persist_disabled_once(&format!(
@@ -1463,11 +1478,12 @@ async fn remote_desktop_persistence(connection: &PortalConnection) -> RemoteDesk
             ));
             RemoteDesktopPersistence::Off
         }
-    }
+    })
 }
 
 async fn remote_desktop_interface_version(connection: &PortalConnection) -> Result<u32> {
-    let proxy = remote_desktop_proxy(connection).await?;
+    // The caller validated ownership outside the version-property fallback.
+    let proxy = pinned_remote_desktop_proxy(connection).await?;
     tokio::time::timeout(PORTAL_CALL_TIMEOUT, proxy.get_property::<u32>("version"))
         .await
         .context("RemoteDesktop version property timed out")?
@@ -2171,12 +2187,12 @@ async fn portal_request_stream<'a>(
     Ok((request_path, response_stream))
 }
 
-async fn await_portal_response(
-    connection: &PortalConnection,
-    handle: OwnedObjectPath,
+async fn subscribe_returned_portal_response<'a>(
+    connection: &'a PortalConnection,
+    handle: &OwnedObjectPath,
     expected_request_path: &str,
-    response_stream: &mut SignalStream<'_>,
-) -> Result<(u32, HashMap<String, OwnedVariant>)> {
+    response_stream: &mut SignalStream<'a>,
+) -> Result<()> {
     if handle.as_str() != expected_request_path {
         *response_stream = Proxy::new(
             &connection.bus,
@@ -2190,7 +2206,24 @@ async fn await_portal_response(
         .await
         .context("failed to subscribe to returned portal response")?;
     }
+    Ok(())
+}
 
+async fn await_portal_response<'a>(
+    connection: &'a PortalConnection,
+    handle: OwnedObjectPath,
+    expected_request_path: &str,
+    response_stream: &mut SignalStream<'a>,
+) -> Result<(u32, HashMap<String, OwnedVariant>)> {
+    subscribe_returned_portal_response(connection, &handle, expected_request_path, response_stream)
+        .await?;
+    receive_portal_response(connection, response_stream).await
+}
+
+async fn receive_portal_response(
+    connection: &PortalConnection,
+    response_stream: &mut SignalStream<'_>,
+) -> Result<(u32, HashMap<String, OwnedVariant>)> {
     let response = tokio::time::timeout(REQUEST_TIMEOUT, response_stream.next())
         .await
         .context("timed out waiting for portal response")?
@@ -3259,6 +3292,31 @@ mod tests {
             assert!(!path.exists());
             assert!(RestorePermit::acquire_in(&dir.path, kind).is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn persistence_owner_lookup_errors_propagate_without_revocation() {
+        let (_service, client) = crate::atspi_transport::test_mutation_connection_pair()
+            .await
+            .unwrap();
+        // This peer fixture has no D-Bus daemon object, so GetNameOwner returns
+        // a generic lookup error without proving that the portal owner was lost.
+        let connection = PortalConnection {
+            bus: (*client).clone(),
+            owner: OwnedUniqueName::try_from(":1.999").unwrap(),
+            current: Arc::new(AtomicBool::new(true)),
+            _monitor: Arc::new(PortalOwnerMonitor(tokio::spawn(std::future::pending()))),
+        };
+        assert!(remote_desktop_persistence_if_requested(&connection, true)
+            .await
+            .is_err());
+        assert!(connection.is_current());
+        assert!(matches!(
+            remote_desktop_persistence_if_requested(&connection, false)
+                .await
+                .unwrap(),
+            RemoteDesktopPersistence::Off
+        ));
     }
 
     #[test]
