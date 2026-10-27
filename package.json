@@ -40,6 +40,8 @@
     "npm/README.md",
     "npm/bin/computer-use-linux.js",
     "npm/install.js",
+    "npm/release-integrity.js",
+    "npm/release-sha256.txt",
     "pi/extension/index.ts",
     "pi/extension/generated-tools.ts",
     "pi/extension/mcp-client.bundle.cjs",
