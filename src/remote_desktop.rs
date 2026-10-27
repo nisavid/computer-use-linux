@@ -267,12 +267,12 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
         devices & DEVICE_POINTER != 0 && !streams.is_empty(),
         restore_token,
     );
-    commit_restore_permit(permit, restore_token).await;
-
     if devices & DEVICE_POINTER == 0 {
+        commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without pointer access");
     }
     if streams.is_empty() {
+        commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without any monitor streams");
     }
 
@@ -283,7 +283,8 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
     {
         assign_stream_pixel_scales(&mut streams, desktop_layout.as_deref());
     }
-    connection.ensure_current().await?;
+    let owner_check = connection.ensure_current().await;
+    finish_restore_permit(permit, restore_token, owner_check, connection.is_current()).await?;
     cleanup.disarm();
 
     Ok(PortalPointerSession {
@@ -311,12 +312,12 @@ pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
     let (devices, _, restore_token) =
         start_remote_desktop_session(&connection, &session_handle).await?;
     let restore_token = restore_token_to_keep(devices & DEVICE_KEYBOARD != 0, restore_token);
-    commit_restore_permit(permit, restore_token).await;
-
     if devices & DEVICE_KEYBOARD == 0 {
+        commit_restore_permit(permit, restore_token).await;
         bail!("remote desktop portal session started without keyboard access");
     }
-    connection.ensure_current().await?;
+    let owner_check = connection.ensure_current().await;
+    finish_restore_permit(permit, restore_token, owner_check, connection.is_current()).await?;
     cleanup.disarm();
 
     Ok(PortalKeyboardSession {
@@ -1478,6 +1479,27 @@ async fn claim_restore_permit(
             None
         }
     }
+}
+
+// Publish a new token only after setup's final owner observation succeeds.
+async fn finish_restore_permit(
+    permit: Option<RestorePermit>,
+    parsed: ParsedRestoreToken,
+    owner_check: Result<()>,
+    owner_current: bool,
+) -> Result<()> {
+    if let Err(error) = owner_check {
+        if !owner_current {
+            commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
+        }
+        return Err(error);
+    }
+    if !owner_current {
+        commit_restore_permit(permit, ParsedRestoreToken::Absent).await;
+        bail!("XDG desktop portal owner changed; create a new session");
+    }
+    commit_restore_permit(permit, parsed).await;
+    Ok(())
 }
 
 async fn commit_restore_permit(permit: Option<RestorePermit>, parsed: ParsedRestoreToken) {
@@ -3111,6 +3133,61 @@ mod tests {
         assert_eq!(keyboard.token(), Some("keyboard-token"));
         keyboard.commit(ParsedRestoreToken::Rejected).unwrap();
         assert!(!keyboard_path.exists());
+    }
+
+    #[tokio::test]
+    async fn final_owner_check_controls_restore_token_commit() {
+        for kind in [PortalDeviceKind::Pointer, PortalDeviceKind::Keyboard] {
+            let dir = TempState::new();
+            RestorePermit::acquire_in(&dir.path, kind)
+                .unwrap()
+                .commit(ParsedRestoreToken::Usable("existing-token".to_string()))
+                .unwrap();
+            let path = dir.path.join(kind.token_file_name());
+            let permit = RestorePermit::acquire_in(&dir.path, kind).unwrap();
+            assert!(finish_restore_permit(
+                Some(permit),
+                ParsedRestoreToken::Usable("unverified-token".to_string()),
+                Err(anyhow::anyhow!("transient lookup error")),
+                true,
+            )
+            .await
+            .is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "existing-token");
+
+            let permit = RestorePermit::acquire_in(&dir.path, kind).unwrap();
+            assert!(finish_restore_permit(
+                Some(permit),
+                ParsedRestoreToken::Usable("revoked-token".to_string()),
+                Err(anyhow::anyhow!("owner revoked")),
+                false,
+            )
+            .await
+            .is_err());
+            assert!(!path.exists());
+
+            let permit = RestorePermit::acquire_in(&dir.path, kind).unwrap();
+            assert!(finish_restore_permit(
+                Some(permit),
+                ParsedRestoreToken::Usable("revoked-token".to_string()),
+                Ok(()),
+                false,
+            )
+            .await
+            .is_err());
+            assert!(!path.exists());
+
+            let permit = RestorePermit::acquire_in(&dir.path, kind).unwrap();
+            finish_restore_permit(
+                Some(permit),
+                ParsedRestoreToken::Usable("verified-token".to_string()),
+                Ok(()),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "verified-token");
+        }
     }
 
     #[test]
