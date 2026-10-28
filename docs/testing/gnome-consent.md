@@ -26,3 +26,5 @@ Inspect `gnome-live-artifacts/assertions.log` and screenshots. A script's presen
 ## Coverage limits
 
 This qualifies GNOME 46 modal and compositor behavior on X11. It does not qualify every supported GNOME version, Wayland, a physical monitor/GPU, or installation into an existing user's desktop. Test those surfaces separately when they are part of a release's acceptance scope. An environment that blocks AF_UNIX socket creation cannot run this test, even inside a nested container.
+
+The separate GJS/D-Bus fixture also keeps 64 denied connections open and verifies that a new sender can request approval after the five-second cooldown. Eviction only removes repeat-prompt suppression; protected operations still require explicit approval. Approved connections are never evicted by denial-cache pressure. An evicted sender can receive a fresh grant only through explicit Allow, and disconnect churn cannot reset the cooldown once the denial cache has filled.

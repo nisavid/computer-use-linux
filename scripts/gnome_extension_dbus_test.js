@@ -93,8 +93,52 @@ async function run() {
         ['ResizeWindow', '(tii)', [7, 10, 20], '(bs)'], ['GetMonitorLayout', '()', [], '(s)'],
     ]) { const result = await call(second, method, signature, args, reply); check(method === 'GetMonitorLayout' || result[0] === true, method + ' approved control'); }
     check(effects === 3, 'all approved window operations retain side effects');
+    // Denied peers must not permanently reserve approval slots.
+    // Use actual private-bus connections; only this fixture's UI is stubbed.
+    const rejectedPeers = [];
+    for (let i = 0; i < 64; i++) {
+        const peer = connect();
+        rejectedPeers.push(peer);
+        const request = call(peer, 'Authorize', '()', [], '(b)');
+        await until(() => dialogs.length === 2, 'pressure-test denial dialog');
+        dialogs.pop().buttons.find(button => button.label === 'Deny').action();
+        check((await request)[0] === false, 'pressure-test peer remains denied');
+    }
+    const replacement = connect();
+    let throttled = false;
+    try { await call(replacement, 'Authorize', '()', [], '(b)'); }
+    catch (error) { throttled = error.message.includes('AccessDenied'); }
+    check(throttled, 'cache pressure throttles repeated prompt creation');
+    await pause(5100);
+    const replacementRequest = call(replacement, 'Authorize', '()', [], '(b)');
+    await until(() => dialogs.length === 2, 'new sender can request consent at cache pressure');
+    dialogs.pop().buttons.find(button => button.label === 'Deny').action();
+    check((await replacementRequest)[0] === false, 'new sender denial is returned');
+    check(!server._clients.has(rejectedPeers[0].get_unique_name()), 'oldest denial is evicted');
+    await denied(rejectedPeers[0]);
+    check(server._clients.get(second.get_unique_name())?.allowed === true,
+        'denial pressure preserves an approved sender');
+    check([...server._clients.values()].filter(client => !client.allowed).length === 64,
+        'denial suppression stays bounded');
+    await pause(5100);
+    const recovered = call(rejectedPeers[0], 'Authorize', '()', [], '(b)');
+    await until(() => dialogs.length === 2, 'evicted sender can request fresh approval');
+    dialogs.pop().buttons.find(button => button.label === 'Allow').action();
+    check((await recovered)[0] === true, 'explicit Allow succeeds after denial-cache pressure');
+    check(JSON.parse((await call(rejectedPeers[0], 'ListWindows'))[0]).length === 1,
+        'recovered sender receives protected data only after explicit Allow');
+    replacement.close_sync(null);
+    for (const peer of rejectedPeers)
+        peer.close_sync(null);
+    await until(() => server._clients.size === 1, 'pressure-test disconnect cleanup');
+
     const third = connect();
     await denied(third);
+    let churnThrottled = false;
+    try { await call(third, 'Authorize', '()', [], '(b)'); }
+    catch (error) { churnThrottled = error.message.includes('AccessDenied'); }
+    check(churnThrottled, 'disconnect churn cannot reset the prompt cooldown');
+    await pause(5100);
     const secondName = second.get_unique_name();
     second.close_sync(null);
     await until(() => !server._clients.has(secondName), 'grant removal');
@@ -116,6 +160,6 @@ async function run() {
     third.close_sync(null);
 }
 run().catch(error => {failure = error; logError(error);}).finally(() => loop.quit());
-GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => { failure = new Error('test deadline'); loop.quit(); return GLib.SOURCE_REMOVE; });
+GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => { failure = new Error('test deadline'); loop.quit(); return GLib.SOURCE_REMOVE; });
 loop.run();
 if (failure) imports.system.exit(1);

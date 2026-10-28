@@ -100,8 +100,12 @@ that executable instead.
 
 The optional extension asks for desktop approval within 20 seconds on the first
 window request from each client connection. A long-lived MCP server reuses its
-connection; each new CLI process requests approval. Denial lasts until that
-connection closes. Restart the client to ask again. The dialog identifies a
+connection; each new CLI process requests approval. Denial is cached for up to 64
+live connections; a new denial beyond that bound evicts the oldest. Restart the
+client to ask again. Once the denial cache fills, new prompts are limited to
+one every five seconds until extension reload; retry after that cooldown.
+Denied connections do not consume the separate 64-approved-client limit.
+The dialog identifies a
 bus-reported process ID, not a trusted application: approve only requests you
 initiated. `doctor` checks interface availability without prompting. After an
 extension update, log out and back in to replace the loaded code.

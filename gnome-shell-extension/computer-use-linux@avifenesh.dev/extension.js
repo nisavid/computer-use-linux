@@ -53,6 +53,8 @@ class WindowControlDBus extends GObject.Object {
         super();
         this._clients = new Map();
         this._pendingAuthorization = null;
+        this._lastPromptUsec = 0;
+        this._promptRateLimited = false;
         this._destroyed = false;
 
         this._dbusObject = Gio.DBusExportedObject.wrapJSObject(
@@ -207,10 +209,17 @@ class WindowControlDBus extends GObject.Object {
             invocation.return_value(new GLib.Variant('(b)', [existing.allowed]));
             return;
         }
-        if (this._pendingAuthorization || this._clients.size >= 64) {
+        const clients = [...this._clients.values()];
+        const approved = clients.filter(client => client.allowed).length;
+        const now = GLib.get_monotonic_time();
+        // Denials suppress repeat prompts without owning approval capacity.
+        // After cache pressure, keep a cooldown even if senders disconnect.
+        if (this._pendingAuthorization || approved >= 64 ||
+            (this._promptRateLimited && now - this._lastPromptUsec < 5_000_000)) {
             this._deny(invocation);
             return;
         }
+        this._lastPromptUsec = now;
         const client = {sender, invocation, allowed: false, watchId: 0,
             timeoutId: 0, dialog: null, dialogOpened: false,
             cancellable: new Gio.Cancellable()};
@@ -279,6 +288,14 @@ class WindowControlDBus extends GObject.Object {
         const invocation = client.invocation;
         client.invocation = null;
         invocation.return_value(new GLib.Variant('(b)', [client.allowed]));
+        // Keep at most 64 denied senders. Eviction never creates a grant;
+        // it only permits a later request to ask for consent again.
+        const denied = [...this._clients.values()].filter(
+            candidate => !candidate.allowed && !candidate.invocation);
+        if (denied.length >= 64)
+            this._promptRateLimited = true;
+        for (const expired of denied.slice(0, Math.max(0, denied.length - 64)))
+            this._forgetClient(expired);
     }
 
     _forgetClient(client) {
