@@ -12,7 +12,7 @@ Install the packages as the container administrator:
 
 ```sh
 apt-get update
-apt-get install --no-install-recommends -y gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr python3-gi python3-pil gir1.2-gtk-3.0 libgl1-mesa-dri
+apt-get install --no-install-recommends -y gnome-shell dbus-x11 xvfb xauth xfonts-base xterm xdotool scrot tesseract-ocr python3-gi python3-pil gir1.2-gtk-3.0 libgl1-mesa-dri
 ```
 
 Then, as an ordinary test user in the checkout:

@@ -175,7 +175,8 @@ def main():
     print('GNOME extension owner is ready', flush=True)
     # Do not let a long-lived window retain the assertions pipe to tee.
     TEST_WINDOW = subprocess.Popen(
-        ['xterm', '-T', TITLE, '-geometry', '80x24+40+80'],
+        ['xterm', '-T', TITLE, '-geometry', '80x24+40+80',
+         '-e', '/bin/sh', '-c', 'exec sleep 300'],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Close the initial overview if the distro starts in overview mode.
     subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Escape'], check=True)

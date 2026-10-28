@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Usage: scripts/gnome_shell_live_test.sh [repository-root]
 # For Ubuntu 24.04 GNOME 46, in an isolated hosted runner or disposable container.
-# Packages: gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr
+# Packages: gnome-shell dbus-x11 xvfb xauth xfonts-base xterm xdotool scrot tesseract-ocr
 #           python3-gi python3-pil gir1.2-gtk-3.0 libgl1-mesa-dri
 # Run only in a disposable VM/container; use private XDG state, bus and display.
 repo_root="${1:-$(pwd)}"
