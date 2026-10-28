@@ -612,6 +612,7 @@ install_gnome_extension() {
         log_warn "could not enable ${EXT_UUID} yet — GNOME Shell may not have rescanned"
         log_info "log out and back in, then run:"
         log_info "  gnome-extensions enable ${EXT_UUID}"
+        return 1
     fi
 }
 
