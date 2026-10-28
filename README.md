@@ -477,6 +477,16 @@ Computer-use tooling is, by definition, a privilege-escalation surface. The thre
 
 If you're running this on a shared workstation, set `ydotoold`'s socket permissions to `0600` (the default) and audit which processes on your user can `connect()` to it.
 
+### GNOME window-control consent
+
+The optional extension asks for desktop approval within 20 seconds on the first
+window request from each client connection. A long-lived MCP server reuses its
+connection; each new CLI process requests approval. Denial lasts until that
+connection closes. Restart the client to ask again. The dialog identifies a
+bus-reported process ID, not a trusted application: approve only requests you
+initiated. `doctor` checks interface availability without prompting. After an
+extension update, log out and back in to replace the loaded code.
+
 ## Troubleshooting
 
 To receive an explicit completion cue, start the MCP server with
@@ -587,13 +597,3 @@ Then bump `Cargo.toml` and `package.json` together, update `CHANGELOG.md`, and p
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-### GNOME window-control consent
-
-The optional extension asks for desktop approval within 20 seconds on the first
-window request from each client connection. A long-lived MCP server reuses its
-connection; each new CLI process requests approval. Denial lasts until that
-connection closes. Restart the client to ask again. The dialog identifies a
-bus-reported process ID, not a trusted application: approve only requests you
-initiated. `doctor` checks interface availability without prompting. After an
-extension update, log out and back in to replace the loaded code.

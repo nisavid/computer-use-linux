@@ -45,7 +45,14 @@ async function denied(client, method='ListWindows') {
 async function run() {
     const first = connect();
     const second = connect();
-    await pause(20);
+    let ready = false;
+    const readinessWatch = Gio.bus_watch_name_on_connection(first, SERVICE,
+        Gio.BusNameWatcherFlags.NONE, () => { ready = true; }, null);
+    try {
+        await until(() => ready, 'extension owns its bus name');
+    } finally {
+        Gio.bus_unwatch_name(readinessWatch);
+    }
     await denied(first);
     for (const [method, signature, args, reply] of [
         ['ActivateWindow', '(t)', [7], '(bs)'],
@@ -92,8 +99,20 @@ async function run() {
     second.close_sync(null);
     await until(() => !server._clients.has(secondName), 'grant removal');
     check(!server._clients.has(secondName), 'real name disappearance removes approved client');
+    const interrupted = call(third, 'Authorize', '()', [], '(b)');
+    await until(() => dialogs.length === 2, 'pending authorization before destroy');
+    const thirdName = third.get_unique_name();
+    const dialog = dialogs[1];
+    check(server._clients.get(thirdName)?.invocation !== null &&
+        server._clients.get(thirdName)?.dialog === dialog,
+        'destroy starts with a tracked pending request and open dialog');
     server.destroy();
+    const [interruptedAllowed] = await interrupted;
+    check(interruptedAllowed === false, 'destroy denies pending authorization');
+    check(dialog.closed === true, 'destroy closes pending consent dialog');
     check(server._clients.size === 0, 'destroy releases retained clients');
+    dialog.buttons.find(button => button.label === 'Allow').action();
+    check(server._clients.size === 0, 'stale consent cannot restore a destroyed grant');
     third.close_sync(null);
 }
 run().catch(error => {failure = error; logError(error);}).finally(() => loop.quit());

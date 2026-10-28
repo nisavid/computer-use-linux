@@ -233,22 +233,44 @@ pub(crate) async fn activate_extension_window(window_id: u64) -> Result<()> {
     }
 }
 
-static EXTENSION_CONNECTION: tokio::sync::Mutex<Option<(tokio::runtime::Id, zbus::Connection)>> =
-    tokio::sync::Mutex::const_new(None);
+struct ExtensionConnection {
+    runtime: tokio::runtime::Id,
+    connection: zbus::Connection,
+    lifetime: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ExtensionConnection {
+    fn drop(&mut self) {
+        self.lifetime.abort();
+    }
+}
+
+static EXTENSION_CONNECTIONS: tokio::sync::Mutex<Vec<ExtensionConnection>> =
+    tokio::sync::Mutex::const_new(Vec::new());
 static EXTENSION_AUTHORIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn extension_connection() -> Result<zbus::Connection> {
+    retained_extension_connection(&EXTENSION_CONNECTIONS, zbus::Connection::session()).await
+}
+
+async fn retained_extension_connection(
+    cache: &tokio::sync::Mutex<Vec<ExtensionConnection>>,
+    connect: impl std::future::Future<Output = zbus::Result<zbus::Connection>>,
+) -> Result<zbus::Connection> {
     let runtime = tokio::runtime::Handle::current().id();
-    let mut stored = EXTENSION_CONNECTION.lock().await;
-    if let Some((id, connection)) = stored.as_ref() {
-        if *id == runtime && !connection.is_closed() {
-            return Ok(connection.clone());
-        }
+    let mut stored = cache.lock().await;
+    // A stopped runtime cannot drive its connection, even if the bus has not
+    // yet observed a close. Its pending lifetime task is cancelled at shutdown.
+    stored.retain(|entry| !entry.lifetime.is_finished() && !entry.connection.is_closed());
+    if let Some(entry) = stored.iter().find(|entry| entry.runtime == runtime) {
+        return Ok(entry.connection.clone());
     }
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
-    *stored = Some((runtime, connection.clone()));
+    let connection = connect.await.context("failed to connect to session bus")?;
+    stored.push(ExtensionConnection {
+        runtime,
+        connection: connection.clone(),
+        lifetime: tokio::spawn(std::future::pending()),
+    });
     Ok(connection)
 }
 
@@ -487,6 +509,141 @@ fn run_probe_command(mut command: Command) -> ProbeCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PrivateBus {
+        child: std::process::Child,
+        address: String,
+        config_path: std::path::PathBuf,
+    }
+
+    impl PrivateBus {
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::process::Stdio;
+
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let config_path = std::env::temp_dir().join(format!(
+                "computer-use-linux-gnome-cache-{}-{}.conf",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            // The cache only needs unique sender identity, not Unix credentials.
+            // A private loopback bus also works in socket-restricted test runners.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config_path)
+                .unwrap()
+                .write_all(
+                    br#"<busconfig><type>session</type>
+                    <listen>tcp:host=127.0.0.1,port=0,family=ipv4</listen>
+                    <auth>ANONYMOUS</auth><allow_anonymous/>
+                    <policy context="default"><allow own="*"/>
+                    <allow send_destination="*"/><allow receive_sender="*"/>
+                    </policy></busconfig>"#,
+                )
+                .unwrap();
+            let mut child = Command::new("dbus-daemon")
+                .args([
+                    "--nofork",
+                    "--nopidfile",
+                    "--print-address=1",
+                    "--config-file",
+                ])
+                .arg(&config_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("runtime cache regression requires dbus-daemon");
+            let mut address = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            if address.trim().is_empty() {
+                let output = child.wait_with_output().unwrap();
+                let _ = std::fs::remove_file(&config_path);
+                panic!(
+                    "private D-Bus startup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Self {
+                child,
+                address: address.trim().to_owned(),
+                config_path,
+            }
+        }
+
+        async fn connect(
+            &self,
+            cache: &tokio::sync::Mutex<Vec<ExtensionConnection>>,
+        ) -> zbus::Connection {
+            retained_extension_connection(
+                cache,
+                zbus::connection::Builder::address(self.address.as_str())
+                    .auth_mechanism(zbus::connection::AuthMechanism::Anonymous)
+                    .build(),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.config_path);
+        }
+    }
+
+    #[test]
+    fn extension_connections_survive_runtime_switches_and_prune_unusable_entries() {
+        let bus = PrivateBus::start();
+        let cache = tokio::sync::Mutex::new(Vec::new());
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let first = runtime();
+        let second = runtime();
+        let first_connection = first.block_on(bus.connect(&cache));
+        let second_connection = second.block_on(bus.connect(&cache));
+        let first_name = first_connection.unique_name().unwrap().to_owned();
+        let second_name = second_connection.unique_name().unwrap().to_owned();
+        assert_ne!(first_name, second_name);
+        drop(first_connection);
+        drop(second_connection);
+        // No caller retains a connection: the cache alone preserves each grant's sender.
+        assert_eq!(
+            first.block_on(bus.connect(&cache)).unique_name(),
+            Some(&first_name)
+        );
+        assert_eq!(
+            second.block_on(bus.connect(&cache)).unique_name(),
+            Some(&second_name)
+        );
+        first.block_on(async {
+            bus.connect(&cache).await.close().await.unwrap();
+        });
+        let replacement = first.block_on(bus.connect(&cache));
+        assert_ne!(replacement.unique_name(), Some(&first_name));
+        assert_eq!(second.block_on(async { cache.lock().await.len() }), 2);
+        drop(replacement);
+        drop(first);
+        assert_eq!(
+            second.block_on(bus.connect(&cache)).unique_name(),
+            Some(&second_name)
+        );
+        assert_eq!(second.block_on(async { cache.lock().await.len() }), 1);
+    }
 
     #[test]
     fn extension_owner_must_match_shell_owner() {

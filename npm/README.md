@@ -96,7 +96,7 @@ If you already built or installed the binary yourself, set
 `COMPUTER_USE_LINUX_BIN=/path/to/computer-use-linux` to make the wrapper use
 that executable instead.
 
-### GNOME window-control consent
+## GNOME window-control consent
 
 The optional extension asks for desktop approval within 20 seconds on the first
 window request from each client connection. A long-lived MCP server reuses its

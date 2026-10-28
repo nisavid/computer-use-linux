@@ -19,6 +19,27 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  gnome-shell-live:
+    name: GNOME Shell live consent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install real GNOME Shell and virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr python3-gi gir1.2-gtk-3.0 libgl1-mesa-dri
+      - name: Exercise actual consent UI
+        run: bash scripts/gnome_shell_live_test.sh "$GITHUB_WORKSPACE"
+      - name: Preserve Shell logs, screenshots, and test assertions
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gnome-shell-live
+          path: gnome-live-artifacts/
+
   gnome-authorization:
     name: GNOME authorization
     runs-on: ubuntu-latest
@@ -236,6 +257,7 @@ jobs:
     name: release artifact (${{ matrix.target }})
     needs:
       - gnome-authorization
+      - gnome-shell-live
       - fmt
       - check
       - clippy
