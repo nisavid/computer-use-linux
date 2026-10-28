@@ -591,12 +591,7 @@ install_gnome_extension() {
         return 0
     fi
 
-    # Already installed & enabled? Nothing to do.
-    if gnome-extensions list --enabled 2>/dev/null | grep -qx "${EXT_UUID}"; then
-        log_ok "extension ${EXT_UUID} already enabled"
-        return 0
-    fi
-
+    # Refresh enabled extensions too: loaded old code remains unsafe until reload.
     local pack_dir
     pack_dir="$(mktemp -d)"
     ( cd "${pack_dir}" && gnome-extensions pack "${EXT_SRC_DIR}" ) ||
@@ -608,6 +603,7 @@ install_gnome_extension() {
 
     gnome-extensions install --force "${zipfile}" || { log_fail "gnome-extensions install failed"; rm -rf "${pack_dir}"; return 1; }
     log_ok "extension installed (${zipfile##*/})"
+    log_info "Log out and back in to reload the installed authorization code."
     rm -rf "${pack_dir}"
 
     if gnome-extensions enable "${EXT_UUID}" 2>/dev/null; then
@@ -616,6 +612,7 @@ install_gnome_extension() {
         log_warn "could not enable ${EXT_UUID} yet — GNOME Shell may not have rescanned"
         log_info "log out and back in, then run:"
         log_info "  gnome-extensions enable ${EXT_UUID}"
+        return 1
     fi
 }
 

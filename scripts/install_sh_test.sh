@@ -324,6 +324,33 @@ test_doctor_raw_fallback_rejects_missing_install_prerequisite() (
     assert_contains "${output}" "doctor did not report ready" || return 1
 )
 
+test_gnome_extension_enable_status() (
+    # shellcheck source=../install.sh
+    source "${INSTALLER}"
+    export XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland
+    gnome-extensions() {
+        case "$1" in
+            pack) touch fixture.shell-extension.zip ;;
+            install) return 0 ;;
+            enable) return "${enable_status}" ;;
+            *) return 1 ;;
+        esac
+    }
+    local enable_status status output
+    for enable_status in 0 1; do
+        status=0
+        output="$(install_gnome_extension)" || status=$?
+        assert_eq "${status}" "${enable_status}" || return 1
+        assert_contains "${output}" "Log out and back in to reload" || return 1
+        if [[ "${enable_status}" -eq 0 ]]; then
+            assert_contains "${output}" "extension enabled" || return 1
+        else
+            assert_contains "${output}" "could not enable" || return 1
+            assert_contains "${output}" "gnome-extensions enable ${EXT_UUID}" || return 1
+        fi
+    done
+)
+
 run_test() {
     local name="$1" test_fn="$2"
     if "${test_fn}"; then
@@ -349,3 +376,5 @@ run_test "doctor accepts platform capability blockers" test_doctor_accepts_platf
 run_test "doctor rejects missing install prerequisites" test_doctor_rejects_missing_install_prerequisite
 run_test "doctor raw fallback accepts platform capability blockers" test_doctor_raw_fallback_accepts_platform_capability_blockers
 run_test "doctor raw fallback rejects missing install prerequisites" test_doctor_raw_fallback_rejects_missing_install_prerequisite
+
+run_test "GNOME enable propagates success and failure" test_gnome_extension_enable_status

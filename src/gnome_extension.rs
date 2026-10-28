@@ -81,6 +81,8 @@ pub async fn setup_window_targeting_report() -> WindowTargetingSetupReport {
     } else if windows_error.is_none() {
         "computer-use-linux GNOME Shell extension is active and window targeting is available."
             .to_string()
+    } else if windows_error.as_deref().is_some_and(permission_denied) && !requires_shell_reload {
+        "GNOME Shell window access was not approved. Restart this client and approve the desktop dialog within 20 seconds.".to_string()
     } else {
         "computer-use-linux GNOME Shell extension files were installed and enable was requested, but GNOME Shell is not serving the window-control DBus API yet. Log out and back in, then retry setup_window_targeting."
             .to_string()
@@ -141,7 +143,12 @@ fn setup_requires_shell_reload(
     extension_was_enabled: Option<bool>,
     changed_files: bool,
 ) -> bool {
-    windows_error.is_some() || extension_was_enabled != Some(false) && changed_files
+    windows_error.is_some_and(|error| !permission_denied(error))
+        || extension_was_enabled != Some(false) && changed_files
+}
+
+fn permission_denied(error: &str) -> bool {
+    error.contains("AccessDenied") || error.contains("window-control permission denied")
 }
 
 fn shell_reload_message(extension_was_enabled: Option<bool>) -> &'static str {
@@ -407,6 +414,17 @@ mod tests {
         assert!(!setup_requires_shell_reload(None, Some(true), false));
         assert!(!setup_requires_shell_reload(None, Some(false), true));
         assert!(setup_requires_shell_reload(None, None, true));
+    }
+
+    #[test]
+    fn denied_consent_does_not_require_reload_without_changed_code() {
+        let denied = "GNOME Shell window-control permission denied".to_string();
+        assert!(!setup_requires_shell_reload(
+            Some(&denied),
+            Some(true),
+            false
+        ));
+        assert!(setup_requires_shell_reload(Some(&denied), Some(true), true));
     }
 
     #[test]

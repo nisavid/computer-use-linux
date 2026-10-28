@@ -10,6 +10,12 @@
 
 The fork carries these runtime behavior changes:
 
+- The GNOME Shell window-control extension requires explicit desktop consent per
+  unique D-Bus connection before window or monitor access. Grants are revoked on
+  disconnect or reload; the Rust client retains its verified connection per
+  Tokio runtime. The installer refreshes enabled extension files and requests a
+  session reload. `scripts/gnome_extension_dbus_test.js` covers the bus boundary.
+
 - `src/remote_desktop.rs`: session setup, input, responses, and cleanup are
   pinned to a unique portal owner. Ownership loss permanently revokes cached
   capabilities. Private-bus regressions live in `src/remote_desktop/owner_tests.rs`.
