@@ -531,22 +531,32 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-            // The cache only needs unique sender identity, not Unix credentials.
-            // A private loopback bus also works in socket-restricted test runners.
+            // Use the production Unix transport when available. Restricted
+            // runners can still verify sender retention on a private TCP bus.
+            let probe_path = config_path.with_extension("socket");
+            let unix = match std::os::unix::net::UnixListener::bind(&probe_path) {
+                Ok(listener) => {
+                    drop(listener);
+                    std::fs::remove_file(&probe_path).unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+            let transport = if unix {
+                "<listen>unix:tmpdir=/tmp</listen><auth>EXTERNAL</auth>"
+            } else {
+                "<listen>tcp:host=127.0.0.1,port=0,family=ipv4</listen><auth>ANONYMOUS</auth><allow_anonymous/>"
+            };
+            let config = format!(
+                "<busconfig><type>session</type>{transport}<policy context=\"default\"><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>"
+            );
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&config_path)
                 .unwrap()
-                .write_all(
-                    br#"<busconfig><type>session</type>
-                    <listen>tcp:host=127.0.0.1,port=0,family=ipv4</listen>
-                    <auth>ANONYMOUS</auth><allow_anonymous/>
-                    <policy context="default"><allow own="*"/>
-                    <allow send_destination="*"/><allow receive_sender="*"/>
-                    </policy></busconfig>"#,
-                )
+                .write_all(config.as_bytes())
                 .unwrap();
             let mut child = Command::new("dbus-daemon")
                 .args([
@@ -557,7 +567,7 @@ mod tests {
                 ])
                 .arg(&config_path)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .expect("runtime cache regression requires dbus-daemon");
             let mut address = String::new();
@@ -583,10 +593,15 @@ mod tests {
             &self,
             cache: &tokio::sync::Mutex<Vec<ExtensionConnection>>,
         ) -> zbus::Connection {
+            let mechanism = if self.address.starts_with("unix:") {
+                zbus::connection::AuthMechanism::External
+            } else {
+                zbus::connection::AuthMechanism::Anonymous
+            };
             retained_extension_connection(
                 cache,
                 zbus::connection::Builder::address(self.address.as_str())
-                    .auth_mechanism(zbus::connection::AuthMechanism::Anonymous)
+                    .auth_mechanism(mechanism)
                     .build(),
             )
             .await

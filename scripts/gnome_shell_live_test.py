@@ -13,6 +13,8 @@ from pathlib import Path
 import subprocess
 import time
 
+from PIL import Image
+
 import gi
 gi.require_version('Gio', '2.0')
 from gi.repository import Gio, GLib
@@ -23,6 +25,7 @@ UUID = 'computer-use-linux@avifenesh.dev'
 ARTIFACTS = Path(os.environ['GNOME_LIVE_ARTIFACTS'])
 TITLE = 'CUL live consent test window'
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+TEST_WINDOW = None
 METHODS = [
     ('ListWindows', '()', (), '(s)'),
     ('ActivateWindow', '(t)', (1,), '(bs)'),
@@ -88,7 +91,12 @@ def screenshot(name):
 def buttons(name):
     """Locate both real rendered button labels, never assume click coordinates."""
     path = screenshot(name)
-    result = subprocess.run(['tesseract', str(path), 'stdout', 'tsv'],
+    # Shell's white-on-gray modal is otherwise classified as an image by OCR.
+    # Preserve the screenshot; isolate its bright text without moving pixels.
+    ocr_path = ARTIFACTS / (name + '-ocr.png')
+    with Image.open(path) as captured:
+        captured.convert('L').point(lambda value: 0 if value > 180 else 255).save(ocr_path)
+    result = subprocess.run(['tesseract', str(ocr_path), 'stdout', '--psm', '6', 'tsv'],
                             check=True, capture_output=True, text=True)
     (ARTIFACTS / (name + '.tsv')).write_text(result.stdout)
     words = list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))
@@ -160,11 +168,15 @@ def controls(connection):
 
 
 def main():
+    global TEST_WINDOW
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     observer = connect()
     until(lambda: has_owner(observer), 'unmodified extension exported in real Shell', 60)
     print('GNOME extension owner is ready', flush=True)
-    subprocess.Popen(['xterm', '-T', TITLE, '-geometry', '80x24+40+80'])
+    # Do not let a long-lived window retain the assertions pipe to tee.
+    TEST_WINDOW = subprocess.Popen(
+        ['xterm', '-T', TITLE, '-geometry', '80x24+40+80'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Close the initial overview if the distro starts in overview mode.
     subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Escape'], check=True)
     client = connect()
@@ -229,4 +241,11 @@ if __name__ == '__main__':
         screenshot('failure')
         raise
     finally:
+        if TEST_WINDOW is not None:
+            TEST_WINDOW.terminate()
+            try:
+                TEST_WINDOW.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                TEST_WINDOW.kill()
+                TEST_WINDOW.wait()
         POOL.shutdown(wait=False, cancel_futures=True)

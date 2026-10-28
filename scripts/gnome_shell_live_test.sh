@@ -4,7 +4,7 @@ set -euo pipefail
 # Usage: scripts/gnome_shell_live_test.sh [repository-root]
 # For Ubuntu 24.04 GNOME 46, in an isolated hosted runner or disposable container.
 # Packages: gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr
-#           python3-gi gir1.2-gtk-3.0 libgl1-mesa-dri
+#           python3-gi python3-pil gir1.2-gtk-3.0 libgl1-mesa-dri
 # Run only in a disposable VM/container; use private XDG state, bus and display.
 repo_root="${1:-$(pwd)}"
 repo_root="$(realpath "$repo_root")"
@@ -33,7 +33,7 @@ sha256sum "$repo_root/gnome-shell-extension/$uuid/extension.js" \
 gnome-shell --version > "$GNOME_LIVE_ARTIFACTS/gnome-version.txt"
 
 export GNOME_LIVE_SCRIPT_DIR="$script_dir"
-xvfb-run -a -s '-screen 0 1280x900x24 -nolisten tcp' \
+timeout --kill-after=5s 240 xvfb-run -a -s '-screen 0 1280x900x24 -nolisten tcp' \
     dbus-run-session -- bash -euo pipefail <<'SESSION'
 gsettings set org.gnome.shell enabled-extensions "['computer-use-linux@avifenesh.dev']"
 gsettings set org.gnome.shell disable-user-extensions false

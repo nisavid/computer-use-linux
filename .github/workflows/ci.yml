@@ -30,7 +30,7 @@ jobs:
       - name: Install real GNOME Shell and virtual display
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr python3-gi gir1.2-gtk-3.0 libgl1-mesa-dri
+          sudo apt-get install --no-install-recommends -y gnome-shell dbus-x11 xvfb xauth xterm xdotool scrot tesseract-ocr python3-gi python3-pil gir1.2-gtk-3.0 libgl1-mesa-dri
       - name: Exercise actual consent UI
         run: bash scripts/gnome_shell_live_test.sh "$GITHUB_WORKSPACE"
       - name: Preserve Shell logs, screenshots, and test assertions
