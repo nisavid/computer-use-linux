@@ -96,8 +96,12 @@ def buttons(name):
     ocr_path = ARTIFACTS / (name + '-ocr.png')
     with Image.open(path) as captured:
         captured.convert('L').point(lambda value: 0 if value > 180 else 255).save(ocr_path)
-    result = subprocess.run(['tesseract', str(ocr_path), 'stdout', '--psm', '6', 'tsv'],
-                            check=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ['tesseract', str(ocr_path), 'stdout', '--psm', '6', 'tsv'],
+            check=True, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError('Tesseract timed out while locating consent buttons') from error
     (ARTIFACTS / (name + '.tsv')).write_text(result.stdout)
     words = list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))
     for deny in words:

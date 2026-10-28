@@ -533,7 +533,14 @@ mod tests {
             ));
             // Use the production Unix transport when available. Restricted
             // runners can still verify sender retention on a private TCP bus.
-            let probe_path = config_path.with_extension("socket");
+            let probe_path = std::path::Path::new("/tmp").join(format!(
+                "cul-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
             let unix = match std::os::unix::net::UnixListener::bind(&probe_path) {
                 Ok(listener) => {
                     drop(listener);
