@@ -258,7 +258,7 @@ def assert_screenshot_error_contract(binary: pathlib.Path) -> None:
         # The plugin launcher still needs these commands for cached startup.
         # The server can restore standard PATH entries during environment
         # hydration, so shadow desktop clients before those entries are added.
-        for name in ["uname", "touch", "find", "rm"]:
+        for name in ["uname", "touch", "find", "rm", "dirname", "sha256sum", "cut"]:
             command = shutil.which(name)
             if command is None:
                 raise AssertionError(f"required launcher command not found: {name}")

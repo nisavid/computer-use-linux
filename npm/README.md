@@ -9,6 +9,8 @@ mutating and can change real application state. The MCP tool list includes
 `ToolAnnotations` so hosts can distinguish read-only observation from mutating
 desktop actions.
 
+`type_text` accepts at most 1000 Unicode characters and 4000 UTF-8 bytes per request. Larger input is rejected before focus or input changes. Execution has a 60-second deadline, followed by at most six seconds of key-release and clipboard cleanup. A timeout can leave a typed prefix; inspect the target before retrying. Send larger text as separate bounded requests.
+
 Discovery responses expose process names and PIDs without process arguments or terminal working directories. Detailed metadata stays internal for terminal selectors.
 
 Plain left `click` by element index or selector prefers a native AT-SPI
@@ -79,8 +81,10 @@ mcp_servers:
 ```
 
 The package downloads the matching Linux x86_64 or aarch64 binary from the
-GitHub release for this package version and verifies the `.sha256` asset before
-installing it. It also installs the matching `computer-use-linux-cosmic` helper
+GitHub release for this package version and verifies digests bundled in the npm
+package before installing it. Downloaded checksum files are not trusted. HTTPS
+mirrors must serve the same pinned bytes; HTTP bases and redirects are rejected.
+It also installs the matching `computer-use-linux-cosmic` helper
 used for COSMIC desktop window targeting.
 
 When installed through Pi, the package supplies native, dynamically loaded

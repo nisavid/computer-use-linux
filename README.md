@@ -78,6 +78,8 @@ and measure from its clipped screenshot crop origin. Divide preview `x` and
 GDK surface or widget-local coordinates; decorations and clipping can change
 the origin. A missing window target is rejected.
 
+`type_text` accepts at most 1000 Unicode characters and 4000 UTF-8 bytes per request. Larger input is rejected before focus or input changes. Execution has a 60-second deadline, followed by at most six seconds of key-release and clipboard cleanup. A timeout can leave a typed prefix; inspect the target before retrying. Send larger text as separate bounded requests.
+
 Targeted `press_key`/`type_text` results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus. Click/screenshot/input results warn when the target window or coordinate is partially or fully off-screen. `get_app_state` returns a compact readiness block by default; pass `verbose: true` for the full diagnostics report. It also reports `tree_scoped` (false when no app target narrowed the AT-SPI tree, with a warning in `message`) and `accessibility_tree_truncated` (true when a node, depth, read, or metadata budget stopped traversal with unread elements left, or the shared connection failed).
 
 AT-SPI discovery has a three-second total deadline and skips providers whose summaries take more than 300 ms, retaining completed summaries. Provider messages are capped at 256 KiB before allocation; names and other metadata fields at 4096 bytes; actions at 64 per element; and retained snapshot metadata at 4 MiB. Excess metadata is rejected rather than shortened. A transport failure returns an explicit discovery error; snapshots retain completed nodes and report truncation. Text readback keeps its separate 4096-character Unicode limit. A snapshot that exhausts its metadata budget reports `accessibility_tree_truncated`; scope the request to a narrower app or window to recover more detail.
@@ -231,9 +233,13 @@ The binary speaks the `rmcp` 2024-11-05 stdio protocol. Pass `mcp` as the only a
 This repo is a plugin marketplace for both Claude Code and Codex. The plugin
 registers the MCP server and ships the `computer-use-linux` skill. On first
 start it downloads the release binaries pinned to the plugin version, checks
-each against its published `.sha256`, and caches them under
-`~/.cache/computer-use-linux/plugin/`. It needs `curl` or `wget`, and nothing
-else is installed.
+each against SHA-256 digests bundled in the plugin, and caches them under
+`~/.cache/computer-use-linux/plugin/`. It verifies both cached files on every
+launch. Automatic downloads require `curl` and allow only HTTPS, including
+redirects; nothing else is installed. Wget-only hosts can install curl or use
+`COMPUTER_USE_LINUX_BIN` to select a trusted local build.
+Verified downloads use a separate cache namespace from older plugin launchers,
+so an overlapping old download cannot replace a verified executable.
 
 Claude Code:
 
@@ -438,7 +444,7 @@ files.
 | Variable | Effect |
 | --- | --- |
 | `COMPUTER_USE_LINUX_BIN` | Run this absolute binary path instead of the one bundled by the npm package. Relative paths are ignored. |
-| `COMPUTER_USE_LINUX_DOWNLOAD_BASE` | Override the GitHub release base URL the installer downloads from (mirrors, air-gapped hosts). |
+| `COMPUTER_USE_LINUX_DOWNLOAD_BASE` | Override the release base with an HTTPS mirror serving the exact pinned binaries. Does not override bundled digests. For local builds, use the local-binary options. |
 | `COMPUTER_USE_LINUX_SKIP_DOWNLOAD=1` | Skip the post-install binary download entirely. |
 | `COMPUTER_USE_LINUX_LOCAL_BINARY` / `…_LOCAL_COSMIC_HELPER` | Install from a local build instead of downloading (used by CI and local testing). |
 

@@ -16,6 +16,12 @@ The fork carries these runtime behavior changes:
   Tokio runtime. The installer refreshes enabled extension files and requests a
   session reload. `scripts/gnome_extension_dbus_test.js` covers the bus boundary.
 
+- `src/remote_desktop.rs`: session setup, input, responses, and cleanup are
+  pinned to a unique portal owner. Ownership loss permanently revokes cached
+  capabilities. Private-bus regressions live in `src/remote_desktop/owner_tests.rs`.
+- `src/x11_display.rs`: pre-capture image budgets, bounded incoming X11 frames
+  and independent reply/unsolicited-event byte budgets, and rejection of
+  unsolicited descriptors. Source pixel and decoded-byte limits are shared through `src/screenshot.rs`/`src/lib.rs`.
 - `src/server.rs` and `src/terminal.rs`: discovery serialization omits process arguments and terminal working directories while internal filtering and selectors retain them. Pi catalog hashes reflect the minimized schemas.
 
 - `src/windowing/target.rs`: standalone app ID, WM class, and title selectors
@@ -45,6 +51,13 @@ The fork also carries development dependency integrity enforcement:
   before the Pi CI job installs dependencies.
 - `CONTRIBUTING.md` records the Pi installation checks and lock regeneration
   constraint.
+
+The fork also pins automatic npm/plugin release downloads independently of
+downloaded checksums. Version-bound manifests ship with each installer; the
+plugin checks cached binaries before reuse and requires curl for HTTPS-only
+downloads. The npm publication workflow generates its manifest from immutable
+build artifacts. `CONTRIBUTING.md` records the trusted-build update procedure
+for source-distributed plugin pins.
 
 The fork also uses zbus 6 and private AT-SPI bindings in `src/atspi.rs` and
 `src/atspi/`. The published AT-SPI wrappers require zbus 5 and its retired
