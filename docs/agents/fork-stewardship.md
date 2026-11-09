@@ -72,6 +72,11 @@ and connection behavior; the adapted definitions retain upstream MIT attribution
 in `THIRD_PARTY_LICENSES/atspi-MIT.txt`. Portal, GNOME, and KWin callers use the
 zbus 6 API while retaining their sender, path, and owner checks.
 
+The shared command-output collector waits for stdout and stderr readiness instead
+of sleeping between empty reads, while retaining bounded output and deadline
+handling. The capability-probe tests cover continuous output and concurrent
+output on both pipes.
+
 The three informational retirement exceptions have been removed from
 `.cargo/audit.toml`; the existing build-only quick-xml exceptions remain.
 
