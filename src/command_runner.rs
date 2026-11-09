@@ -170,11 +170,35 @@ pub(crate) fn output_blocking_with_timeout(
             terminate_blocking_process(&mut child, pgid);
             return Err(timeout_error(action, timeout));
         }
-        // Continue draining a busy producer without a fixed pause after every
-        // chunk. Each drain is still capped and the deadline is checked above,
-        // so continuous output cannot starve stderr or bypass the output limit.
+        // Wait for pipe activity instead of sleeping through newly available
+        // output. Keep the wait bounded so child exit and deadline are checked.
         if stdout_bytes.len() + stderr_bytes.len() == previous_bytes {
-            thread::sleep(BLOCKING_POLL_INTERVAL);
+            let mut pipes = [
+                libc::pollfd {
+                    fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let wait = deadline
+                .saturating_duration_since(StdInstant::now())
+                .min(BLOCKING_POLL_INTERVAL);
+            let wait_ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+            let result =
+                unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as libc::nfds_t, wait_ms) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    terminate_blocking_process(&mut child, pgid);
+                    return Err(error)
+                        .with_context(|| format!("failed to wait for {action} output"));
+                }
+            }
         }
     }
 }

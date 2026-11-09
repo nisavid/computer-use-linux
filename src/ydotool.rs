@@ -817,6 +817,25 @@ esac
     }
 
     #[test]
+    fn capability_probe_drains_both_pipes_concurrently() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "(yes stdout | head -c 200000) & (yes stderr | head -c 200000 >&2) & wait",
+        ]);
+
+        let output = command_output_with_timeout(
+            &mut command,
+            "concurrent noisy probe",
+            Duration::from_secs(5),
+        )
+        .expect("both noisy pipes should complete");
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 200_000);
+        assert!(output.stderr.len() >= 200_000);
+    }
+
+    #[test]
     fn capability_probe_continuous_output_remains_bounded() {
         let mut command = Command::new("sh");
         command.args(["-c", "exec yes output"]);
