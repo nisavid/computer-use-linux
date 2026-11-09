@@ -105,3 +105,11 @@ input lock or control the private bus daemon's portal-owner lookup reply.
 The portal Start controls cover session setup. The prepared-write and
 first-key controls cover the corresponding transport replies. The inner
 waits and native KDE behavior require separate evidence.
+
+The `cancelled_kde_` Rust tests use write-held marker-only executables to
+exercise busy retries in the wtype and xdotool helper paths. Each pairs a
+cancelled retry with an uncancelled retry and checks the launch marker. The
+`plasma_without_desktop_variable_can_reach_raw_fallbacks` test checks the
+relevant backend-selection predicates without changing the process environment.
+These controls exercise the helper and policy seams; they do not observe a
+native compositor or a full portal-to-helper transition.

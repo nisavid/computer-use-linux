@@ -51,7 +51,7 @@ pub(crate) async fn spawn_retrying_busy(command: &mut Command) -> io::Result<Chi
     spawn_retrying_busy_checked(command, || Ok(())).await
 }
 
-async fn spawn_retrying_busy_checked(
+pub(crate) async fn spawn_retrying_busy_checked(
     command: &mut Command,
     check_spawn: impl Fn() -> io::Result<()>,
 ) -> io::Result<Child> {
@@ -78,15 +78,6 @@ pub(crate) async fn output_with_timeout(
     timeout: Duration,
 ) -> Result<Output> {
     output_with_input(command, action, timeout, None, || Ok(())).await
-}
-
-pub(crate) async fn output_with_stdin(
-    command: Command,
-    action: &str,
-    timeout: Duration,
-    input: Vec<u8>,
-) -> Result<Output> {
-    output_with_stdin_checked(command, action, timeout, input, || Ok(())).await
 }
 
 /// Check permission before each spawn attempt. A started child is supervised normally.
@@ -701,11 +692,12 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "cat"]);
 
-        let output = output_with_stdin(
+        let output = output_with_stdin_checked(
             command,
             "echo stdin",
             Duration::from_secs(1),
             b"portal input".to_vec(),
+            || Ok(()),
         )
         .await
         .expect("stdin command should complete");
