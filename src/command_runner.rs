@@ -48,8 +48,16 @@ pub(crate) fn spawn_std_retrying_busy(command: &mut StdCommand) -> io::Result<st
 
 /// Tokio `Command::spawn` that retries a transient ETXTBSY.
 pub(crate) async fn spawn_retrying_busy(command: &mut Command) -> io::Result<Child> {
+    spawn_retrying_busy_checked(command, || Ok(())).await
+}
+
+async fn spawn_retrying_busy_checked(
+    command: &mut Command,
+    check_spawn: impl Fn() -> io::Result<()>,
+) -> io::Result<Child> {
     let mut attempt = 0;
     loop {
+        check_spawn()?;
         match command.spawn() {
             Err(error) if is_text_file_busy(&error) && attempt < TEXT_FILE_BUSY_RETRIES => {
                 attempt += 1;
@@ -69,7 +77,7 @@ pub(crate) async fn output_with_timeout(
     action: &str,
     timeout: Duration,
 ) -> Result<Output> {
-    output_with_input(command, action, timeout, None).await
+    output_with_input(command, action, timeout, None, || Ok(())).await
 }
 
 pub(crate) async fn output_with_stdin(
@@ -78,7 +86,18 @@ pub(crate) async fn output_with_stdin(
     timeout: Duration,
     input: Vec<u8>,
 ) -> Result<Output> {
-    output_with_input(command, action, timeout, Some(input)).await
+    output_with_stdin_checked(command, action, timeout, input, || Ok(())).await
+}
+
+/// Check permission before each spawn attempt. A started child is supervised normally.
+pub(crate) async fn output_with_stdin_checked(
+    command: Command,
+    action: &str,
+    timeout: Duration,
+    input: Vec<u8>,
+    check_spawn: impl Fn() -> io::Result<()>,
+) -> Result<Output> {
+    output_with_input(command, action, timeout, Some(input), check_spawn).await
 }
 
 pub(crate) fn output_blocking(command: &mut StdCommand, action: &str) -> Result<Output> {
@@ -174,6 +193,7 @@ async fn output_with_input(
     action: &str,
     timeout: Duration,
     input: Option<Vec<u8>>,
+    check_spawn: impl Fn() -> io::Result<()>,
 ) -> Result<Output> {
     command
         .kill_on_drop(true)
@@ -185,7 +205,7 @@ async fn output_with_input(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = spawn_retrying_busy(&mut command)
+    let child = spawn_retrying_busy_checked(&mut command, check_spawn)
         .await
         .with_context(|| format!("failed to {action}"))?;
     supervise_child(child, action, timeout, input).await
@@ -495,6 +515,10 @@ mod tests {
     /// A script whose own write handle is still open: `exec` must fail with
     /// ETXTBSY until the handle closes.
     fn busy_script(label: &str) -> (PathBuf, std::fs::File) {
+        busy_script_with_contents(label, b"#!/bin/sh\nexit 0\n")
+    }
+
+    fn busy_script_with_contents(label: &str, contents: &[u8]) -> (PathBuf, std::fs::File) {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         let path = std::env::temp_dir().join(format!(
@@ -506,7 +530,7 @@ mod tests {
                 .as_nanos()
         ));
         let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        file.write_all(contents).unwrap();
         file.flush().unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         (path, file)
@@ -688,6 +712,67 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"portal input");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_stdin_spawn_checks_cancellation_before_retry() {
+        use std::cell::Cell;
+
+        for cancel_on_backoff in [true, false] {
+            let (path, writer) = busy_script_with_contents(
+                "stdin-retry",
+                b"#!/bin/sh\nprintf ran > \"$1\"\nexec cat\n",
+            );
+            let marker = path.with_extension("ran");
+            let first_error = StdCommand::new(&path).arg(&marker).spawn().unwrap_err();
+            assert!(is_text_file_busy(&first_error));
+
+            let checks = Cell::new(0);
+            let cancelled = Cell::new(false);
+            let mut command = Command::new(&path);
+            command.arg(&marker);
+            let running = output_with_stdin_checked(
+                command,
+                "run fixture command",
+                Duration::from_secs(1),
+                b"fixture stdin".to_vec(),
+                || {
+                    checks.set(checks.get() + 1);
+                    if cancelled.get() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "fixture cancelled",
+                        ));
+                    }
+                    Ok(())
+                },
+            );
+            tokio::pin!(running);
+            // The first attempt hits the still-open writer. Poll once to reach
+            // the backoff without letting this runtime drive the retry timer.
+            assert!(futures_util::poll!(running.as_mut()).is_pending());
+            assert_eq!(checks.get(), 1);
+            assert!(!marker.exists());
+            cancelled.set(cancel_on_backoff);
+            drop(writer);
+
+            let result = running.await;
+            if cancel_on_backoff {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::Interrupted,
+                );
+                assert!(!marker.exists());
+            } else {
+                let output = result.unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"fixture stdin");
+                assert_eq!(fs::read(&marker).unwrap(), b"ran");
+                fs::remove_file(marker).unwrap();
+            }
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[tokio::test]

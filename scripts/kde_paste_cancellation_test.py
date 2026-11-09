@@ -38,6 +38,7 @@ RAW_COMMANDS = {"xdotool", "ydotool", "wtype"}
 SHIMS = RAW_COMMANDS | {"systemctl", "gdbus", "busctl", "ibus"}
 START_CASES = {"cancel-start-success", "cancel-start-denied"}
 CANCELLATION_CASES = START_CASES | {"cancel-prepared", "cancel-dispatched"}
+PASTE_REPLY_TIMEOUT = "paste-reply-timeout"
 
 
 def require(condition, message):
@@ -136,6 +137,7 @@ class Portal(dbus.service.Object):
         super().__init__(name, DESKTOP)
         self.name = name
         self.state = state
+        self.withheld_v_reply = None
 
     def respond(self, sender, options, results, *, start_code=None, hold=False):
         path = portal_path(sender, "request", options["handle_token"])
@@ -181,6 +183,12 @@ class Portal(dbus.service.Object):
     )
     def NotifyKeyboardKeycode(self, session, options, number, state, reply, error):
         self.state.key(session, "code", number, state)
+        if self.state.mode == PASTE_REPLY_TIMEOUT and int(number) == 47 and int(state) == 1:
+            # The key has already changed the synthetic field. Keep the
+            # reply pending while continuing to serve release notifications.
+            self.withheld_v_reply = reply
+            self.state.record("paste_reply_withheld", session=str(session))
+            return
         if (
             self.state.mode == "cancel-dispatched"
             and int(number) == 29
@@ -313,16 +321,21 @@ class Client:
         self.send(id=request_id, method="tools/call", params={"name": name, "arguments": arguments})
 
 
-def action_ok(frame):
+def action_payload(frame):
     result = frame.get("result", {})
     if result.get("isError"):
-        return False
+        return None
     action = result.get("structuredContent")
     if action is None:
         for item in result.get("content", []):
             if item.get("type") == "text":
                 action = json.loads(item["text"])
                 break
+    return action
+
+
+def action_ok(frame):
+    action = action_payload(frame)
     return isinstance(action, dict) and action.get("ok") is True
 
 
@@ -378,12 +391,10 @@ def cancel_at_barrier(client, control, output, mode):
     require(time.monotonic() < gate_deadline, "fixture reply release missed barrier budget")
 
 
-def check_completed_paste(events, typing, after_probe):
+def check_paste_effect(events, after_probe):
     require(
-        action_ok(typing)
-        and after_probe["field"] == PASTED_FIELD
-        and after_probe["clipboard"] == ORIGINAL,
-        "started paste did not complete and restore the clipboard",
+        after_probe["field"] == PASTED_FIELD and after_probe["clipboard"] == ORIGINAL,
+        "fixture paste effect or clipboard restoration missing",
     )
     writes = [(index, event["value"]) for index, event in enumerate(events)
               if event["event"] == "clipboard_write"]
@@ -499,7 +510,7 @@ def scenario(binary, output, mode):
                     require(initialized.get("result", {}).get("protocolVersion"), "initialize failed")
                     client.send(method="notifications/initialized")
                     client.tool(2, "type_text", text=PREPARED)
-                    if mode != "control":
+                    if mode in CANCELLATION_CASES:
                         cancel_at_barrier(client, control, output, mode)
                     typing = client.receive(2, time.monotonic() + 10)
                     wait_for(
@@ -513,6 +524,8 @@ def scenario(binary, output, mode):
                         expected_keys = PASTE_KEYS + ESCAPE_KEYS
                     else:
                         require(not before_probe["held"], "keys remained held after typing")
+                        if mode == PASTE_REPLY_TIMEOUT:
+                            require(before_probe["keys"] == PASTE_KEYS, "expected one chord and reverse releases")
                         expected_keys = before_probe["keys"] + ESCAPE_KEYS
                         client.tool(4, "press_key", key="Escape")
                     require(action_ok(client.receive(4, time.monotonic() + 8)), "input lock probe failed")
@@ -537,7 +550,23 @@ def scenario(binary, output, mode):
         )
         return 0
     if mode == "cancel-dispatched":
-        check_completed_paste(fixture_events(output), typing, after_probe)
+        require(action_ok(typing), "started paste did not report completion")
+        check_paste_effect(fixture_events(output), after_probe)
+        return 0
+    if mode == PASTE_REPLY_TIMEOUT:
+        events = fixture_events(output)
+        require(
+            sum(event["event"] == "paste_reply_withheld" for event in events) == 1,
+            "expected one withheld V reply",
+        )
+        check_paste_effect(events, after_probe)
+        action = action_payload(typing)
+        require(isinstance(action, dict) and action.get("ok") is False, "expected a typing error")
+        message = action.get("message", "")
+        require("RemoteDesktop NotifyKeyboardKeycode timed out" in message, "missing portal timeout")
+        if "Some or all paste input may have landed. Inspect the target before retrying." not in message:
+            print("RED: applied_paste_error_omitted_uncertainty", file=sys.stderr)
+            return 1
         return 0
     if mode in START_CASES:
         start_codes = [
@@ -565,7 +594,7 @@ def main():
     _, binary, output, host_mount, host_pid, host_net, *selection = sys.argv
     require(len(selection) <= 1, "select one cancellation case")
     mode = selection[0] if selection else "cancel-prepared"
-    require(mode in CANCELLATION_CASES, f"unknown cancellation case {mode}")
+    require(mode in CANCELLATION_CASES | {PASTE_REPLY_TIMEOUT}, f"unknown paste case {mode}")
     for kind, host in [("mnt", host_mount), ("pid", host_pid), ("net", host_net)]:
         actual = os.readlink(f"/proc/self/ns/{kind}")
         require(actual != host, f"fixture shares host {kind} namespace")

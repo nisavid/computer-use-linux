@@ -877,20 +877,17 @@ async fn press_key_chord_if(
     let input_guard = Arc::clone(&session.input_lock).lock_owned().await;
     session.ensure_valid()?;
     let proxy = remote_desktop_proxy(&session.connection).await?;
-    // Commit to the first submission before arming any key release. From
-    // here the chord owns the attempt and releases its keys on completion.
-    if !permit_dispatch() {
-        return Ok(false);
-    }
     let mut release_guard = KeyboardReleaseGuard::new(session, input_guard);
-    for modifier in modifiers {
+    let mut permit_dispatch = Some(permit_dispatch);
+    for pressed in modifiers.iter().copied().chain(std::iter::once(key)) {
         session.ensure_valid()?;
-        release_guard.push(*modifier);
-        notify_keyboard_key(&proxy, &session.session_handle, *modifier, KEY_PRESSED).await?;
+        // Commit once, after validation and before arming the first release.
+        if permit_dispatch.take().is_some_and(|permit| !permit()) {
+            return Ok(false);
+        }
+        release_guard.push(pressed);
+        notify_keyboard_key(&proxy, &session.session_handle, pressed, KEY_PRESSED).await?;
     }
-    session.ensure_valid()?;
-    release_guard.push(key);
-    notify_keyboard_key(&proxy, &session.session_handle, key, KEY_PRESSED).await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
     notify_keyboard_key(&proxy, &session.session_handle, key, KEY_RELEASED).await?;
     release_guard.pop();

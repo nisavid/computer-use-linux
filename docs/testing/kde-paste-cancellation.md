@@ -3,7 +3,7 @@
 This fixture drives the built `computer-use-linux mcp` executable over stdio
 against private fake RemoteDesktop and Klipper services. It first establishes
 one uncancelled physical chord and clipboard restoration. It then runs the
-selected cancellation case with fresh fake services. The services record
+selected paste case with fresh fake services. The services record
 keyboard notifications, clipboard changes, and effects on a synthetic field.
 
 Set `KDE_PASTE_CASE` to select one case per invocation. Each invocation
@@ -17,6 +17,8 @@ creates a fresh evidence directory.
   Escape can obtain a new portal session.
 - `cancel-dispatched` accepts the first Ctrl keycode press and holds its
   reply. The client queues Escape while that reply remains held.
+- `paste-reply-timeout` applies the V press to the synthetic field and
+  withholds its reply. The service continues to answer key releases.
 
 Use a fresh private evidence directory. Set `CANDIDATE_BINARY` to the
 absolute path of the admitted build to check. The command below assumes a
@@ -86,9 +88,17 @@ no held keys, and the successful follow-up.
 For `cancel-dispatched`, exit `0` requires one complete chord with reverse
 key release, a single prepared write and restoration, and the queued Escape
 after restoration. The exact keyboard sequence rules out a second paste
-attempt in this fixture. A nonzero exit outside the classified dispatch
-failure supplies no passing evidence. Keep the original prepared-write RED
-directory and its recorded fixture digest when running a successor.
+attempt in this fixture.
+
+For `paste-reply-timeout`, exit `0` requires one synthetic paste, the
+original portal timeout plus a warning that paste input may have landed,
+reverse key releases, clipboard restoration, and a successful follow-up
+Escape. Exit `1` with `applied_paste_error_omitted_uncertainty` means the
+effect and cleanup were observed but the result omitted the warning.
+
+Other nonzero exits supply no passing evidence. Keep the original
+prepared-write RED directory and its recorded fixture digest when running
+a successor.
 
 The fake services do not expose an observable wait at the inner portal
 input lock or control the private bus daemon's portal-owner lookup reply.

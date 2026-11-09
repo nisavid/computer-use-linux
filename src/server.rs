@@ -5352,11 +5352,20 @@ async fn run_ydotool_type_text(
     let mut command = TokioCommand::new(&support.executable);
     command.args(["type", "--file", "-"]);
     command.env("YDOTOOL_SOCKET", socket);
-    let output = crate::command_runner::output_with_stdin(
+    let output = crate::command_runner::output_with_stdin_checked(
         command,
         "run ydotool type",
         typing_command_timeout(deadline, ydotool_type_timeout(text))?,
         text.as_bytes().to_vec(),
+        || {
+            if is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    KDE_PASTE_CANCELLED,
+                ));
+            }
+            Ok(())
+        },
     )
     .await
     .map_err(|error| format!("{error:#}"))?;
@@ -5418,7 +5427,7 @@ impl KdeClipboardPasteError {
         }
     }
 
-    fn after_portal_input(message: String) -> Self {
+    fn portal_chord_error(message: String) -> Self {
         Self {
             message,
             can_fallback_to_ydotool: false,
@@ -5451,12 +5460,20 @@ async fn run_kde_clipboard_paste_text(
     write_result.map_err(KdeClipboardPasteError::before_text_input)?;
 
     let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
-    let paste_result =
-        match press_keycode_chord(session, modifiers, keycode, || !is_cancelled()).await {
-            Ok(false) => return Err(KdeClipboardPasteError::cancelled()),
-            Ok(true) => Ok(()),
-            Err(error) => Err(format!("{error:#}")),
-        };
+    let mut committed = false;
+    let chord = press_keycode_chord(session, modifiers, keycode, || {
+        committed = !is_cancelled();
+        committed
+    })
+    .await;
+    let paste_result = match chord {
+        Ok(false) => return Err(KdeClipboardPasteError::cancelled()),
+        Ok(true) => Ok(()),
+        Err(error) if committed => Err(format!(
+            "{error:#}. Some or all paste input may have landed. Inspect the target before retrying."
+        )),
+        Err(error) => Err(format!("{error:#}")),
+    };
 
     sleep(kde_clipboard_restore_delay(text)).await;
     let restore_result = kde_set_clipboard_contents(&previous).await;
@@ -5466,11 +5483,11 @@ async fn run_kde_clipboard_paste_text(
 
     match (paste_result, restore_result) {
         (Ok(_), Ok(_)) => Ok("Action pasted through KDE clipboard integration.".to_string()),
-        (Err(error), Ok(_)) => Err(KdeClipboardPasteError::after_portal_input(error)),
+        (Err(error), Ok(_)) => Err(KdeClipboardPasteError::portal_chord_error(error)),
         (Ok(_), Err(restore_error)) => Ok(format!(
             "Action pasted through KDE clipboard integration. Warning: previous KDE clipboard contents could not be restored: {restore_error}"
         )),
-        (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::after_portal_input(
+        (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::portal_chord_error(
             format!("{error}; previous KDE clipboard contents could not be restored: {restore_error}"),
         )),
     }
