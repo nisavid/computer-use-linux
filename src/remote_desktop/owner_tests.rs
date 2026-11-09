@@ -203,7 +203,9 @@ async fn portal_owner_change_revokes_cached_input_and_pins_in_flight_calls() {
             DEVICE_KEYBOARD | DEVICE_POINTER
         );
         type_text_with_keysyms(&keyboard, &[97]).await.unwrap();
-        press_keycode_chord(&keyboard, &[29], 30).await.unwrap();
+        assert!(press_keycode_chord(&keyboard, &[29], 30, || true)
+            .await
+            .unwrap());
         scroll(&pointer, None, ScrollDirection::Down, 1)
             .await
             .unwrap();

@@ -58,6 +58,7 @@ const TYPE_TEXT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SCROLL_PAGES: f64 = 100.0;
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
+const KDE_PASTE_CANCELLED: &str = "Text input cancelled before paste dispatch.";
 const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
@@ -1699,27 +1700,12 @@ impl ComputerUseLinux {
     async fn type_text(
         &self,
         Parameters(params): Parameters<TypeTextParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Json<ActionOutput> {
-        if let Err(message) = validate_type_text(&params.text) {
-            return Json(typing_error(message));
-        }
-        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        let deadline = Instant::now() + TYPE_TEXT_TIMEOUT;
-        let server = self.clone();
-        let cleanup = Arc::new(Mutex::new(TypingCleanup::default()));
-        let operation_cleanup = Arc::clone(&cleanup);
-        let (_input_guard, result) = run_bounded_typing_input(
-            input_guard,
-            deadline,
-            async move {
-                Ok(server
-                    .type_text_inner(params, deadline, operation_cleanup)
-                    .await)
-            },
-            finish_typing_cleanup(cleanup),
-        )
-        .await;
-        typing_output(result)
+        let cancellation = context.ct.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        self.run_type_text(params, move || cancellation.is_cancelled())
+            .await
     }
 
     #[tool(
@@ -2934,11 +2920,39 @@ impl ComputerUseLinux {
         }
     }
 
+    async fn run_type_text(
+        &self,
+        params: TypeTextParams,
+        is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Json<ActionOutput> {
+        if let Err(message) = validate_type_text(&params.text) {
+            return Json(typing_error(message));
+        }
+        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let deadline = Instant::now() + TYPE_TEXT_TIMEOUT;
+        let server = self.clone();
+        let cleanup = Arc::new(Mutex::new(TypingCleanup::default()));
+        let operation_cleanup = Arc::clone(&cleanup);
+        let (_input_guard, result) = run_bounded_typing_input(
+            input_guard,
+            deadline,
+            async move {
+                Ok(server
+                    .type_text_inner(params, deadline, operation_cleanup, &is_cancelled)
+                    .await)
+            },
+            finish_typing_cleanup(cleanup),
+        )
+        .await;
+        typing_output(result)
+    }
+
     async fn type_text_inner(
         &self,
         params: TypeTextParams,
         deadline: Instant,
         cleanup: Arc<Mutex<TypingCleanup>>,
+        is_cancelled: &(impl Fn() -> bool + Sync),
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let window_target = params.window_target();
@@ -2954,9 +2968,11 @@ impl ComputerUseLinux {
                 });
             }
         };
-        if self.should_prefer_kde_clipboard_text_backend() {
+        let kde_paste = self.should_prefer_kde_clipboard_text_backend();
+        let paste_cancelled = || kde_paste && is_cancelled();
+        if kde_paste && !is_cancelled() {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(session)) if !is_cancelled() => {
                     cleanup.lock().unwrap().session = Some(session.clone());
                     let kde_focus = if window_target.has_target() {
                         match self.focus_target_for_input(&window_target).await {
@@ -2982,6 +2998,7 @@ impl ComputerUseLinux {
                         &params.text,
                         paste_shortcut,
                         &cleanup,
+                        is_cancelled,
                     )
                     .await
                     {
@@ -3012,9 +3029,17 @@ impl ComputerUseLinux {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(_) => {}
             }
+        }
+        if paste_cancelled() {
+            return Json(action_result_with_focus(
+                "type_text",
+                Err(KDE_PASTE_CANCELLED.to_string()),
+                received,
+                focus,
+            ));
         }
         if self.should_prefer_portal_keyboard_backend().await {
             if let Ok(keysyms) = keysyms_for_text(&params.text) {
@@ -3072,11 +3097,14 @@ impl ComputerUseLinux {
             };
             let text = params.text.clone();
             let result = async {
+                if paste_cancelled() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
                 run_xdotool_or_fallback_with_timeout(
                     Path::new("xdotool"),
                     &args,
                     command_timeout,
-                    || run_ydotool_type_text(&text, deadline),
+                    || run_ydotool_type_text(&text, deadline, &paste_cancelled),
                 )
                 .await
             }
@@ -3102,8 +3130,11 @@ impl ComputerUseLinux {
         if self.should_prefer_wtype_keyboard() {
             let text = params.text.clone();
             let result = async {
+                if paste_cancelled() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
                 run_wtype_type_text_or_fallback(Path::new("wtype"), &text, deadline, || {
-                    run_ydotool_type_text(&text, deadline)
+                    run_ydotool_type_text(&text, deadline, &paste_cancelled)
                 })
                 .await
             }
@@ -3129,7 +3160,7 @@ impl ComputerUseLinux {
         }
         let text = params.text.clone();
         let result = async {
-            run_ydotool_type_text(&text, deadline)
+            run_ydotool_type_text(&text, deadline, &paste_cancelled)
                 .await
                 .map(|output| vec![output])
         }
@@ -5307,8 +5338,16 @@ async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
 async fn run_ydotool_type_text(
     text: &str,
     deadline: Instant,
+    is_cancelled: &(impl Fn() -> bool + Sync),
 ) -> std::result::Result<Output, String> {
-    let support = ydotool::ensure_supported_async().await?;
+    if is_cancelled() {
+        return Err(KDE_PASTE_CANCELLED.to_string());
+    }
+    let support = ydotool::ensure_supported_async().await;
+    if is_cancelled() {
+        return Err(KDE_PASTE_CANCELLED.to_string());
+    }
+    let support = support?;
     let socket = ydotool::socket_path_for_command()?;
     let mut command = TokioCommand::new(&support.executable);
     command.args(["type", "--file", "-"]);
@@ -5363,6 +5402,14 @@ struct KdeClipboardPasteError {
 }
 
 impl KdeClipboardPasteError {
+    fn cancelled() -> Self {
+        Self {
+            message: KDE_PASTE_CANCELLED.to_string(),
+            can_fallback_to_ydotool: false,
+            clear_portal_keyboard_session: false,
+        }
+    }
+
     fn before_text_input(message: String) -> Self {
         Self {
             message,
@@ -5385,19 +5432,31 @@ async fn run_kde_clipboard_paste_text(
     text: &str,
     paste_shortcut: KdeClipboardPasteShortcut,
     cleanup: &Arc<Mutex<TypingCleanup>>,
+    is_cancelled: &(impl Fn() -> bool + Sync),
 ) -> std::result::Result<String, KdeClipboardPasteError> {
-    let previous = kde_clipboard_contents()
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    let previous = kde_clipboard_contents().await;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    let previous = previous.map_err(KdeClipboardPasteError::before_text_input)?;
     cleanup.lock().unwrap().clipboard = Some(previous.clone());
-    kde_set_clipboard_contents(text)
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
+    // Keep ownership of a write that can take effect before its reply arrives.
+    let write_result = kde_set_clipboard_contents(text).await;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    write_result.map_err(KdeClipboardPasteError::before_text_input)?;
 
     let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
-    let paste_result = press_keycode_chord(session, modifiers, keycode)
-        .await
-        .map_err(|error| format!("{error:#}"));
+    let paste_result =
+        match press_keycode_chord(session, modifiers, keycode, || !is_cancelled()).await {
+            Ok(false) => return Err(KdeClipboardPasteError::cancelled()),
+            Ok(true) => Ok(()),
+            Err(error) => Err(format!("{error:#}")),
+        };
 
     sleep(kde_clipboard_restore_delay(text)).await;
     let restore_result = kde_set_clipboard_contents(&previous).await;
@@ -8285,7 +8344,7 @@ mod tests {
         .unwrap();
         let Json(result) = timeout(
             Duration::from_millis(100),
-            server.type_text(Parameters(params)),
+            server.run_type_text(params, || false),
         )
         .await
         .unwrap();

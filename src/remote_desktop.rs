@@ -838,13 +838,21 @@ pub async fn type_text_with_keysyms(
     Ok(())
 }
 
+/// Returns false when the caller declines dispatch after portal preparation.
 pub async fn press_keycode_chord(
     session: &PortalKeyboardSession,
     modifiers: &[i32],
     keycode: i32,
-) -> Result<()> {
+    permit_dispatch: impl FnOnce() -> bool,
+) -> Result<bool> {
     let modifiers: Vec<PortalKey> = modifiers.iter().copied().map(PortalKey::Keycode).collect();
-    press_key_chord(session, &modifiers, PortalKey::Keycode(keycode)).await
+    press_key_chord_if(
+        session,
+        &modifiers,
+        PortalKey::Keycode(keycode),
+        permit_dispatch,
+    )
+    .await
 }
 
 /// Press `key` while holding `modifiers`. Keysyms are resolved by the
@@ -855,9 +863,25 @@ pub async fn press_key_chord(
     modifiers: &[PortalKey],
     key: PortalKey,
 ) -> Result<()> {
+    press_key_chord_if(session, modifiers, key, || true)
+        .await
+        .map(|_| ())
+}
+
+async fn press_key_chord_if(
+    session: &PortalKeyboardSession,
+    modifiers: &[PortalKey],
+    key: PortalKey,
+    permit_dispatch: impl FnOnce() -> bool,
+) -> Result<bool> {
     let input_guard = Arc::clone(&session.input_lock).lock_owned().await;
     session.ensure_valid()?;
     let proxy = remote_desktop_proxy(&session.connection).await?;
+    // Commit to the first submission before arming any key release. From
+    // here the chord owns the attempt and releases its keys on completion.
+    if !permit_dispatch() {
+        return Ok(false);
+    }
     let mut release_guard = KeyboardReleaseGuard::new(session, input_guard);
     for modifier in modifiers {
         session.ensure_valid()?;
@@ -874,7 +898,7 @@ pub async fn press_key_chord(
         notify_keyboard_key(&proxy, &session.session_handle, *modifier, KEY_RELEASED).await?;
         release_guard.pop();
     }
-    Ok(())
+    Ok(true)
 }
 
 impl PointerReleaseGuard {

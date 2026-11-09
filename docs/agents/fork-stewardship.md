@@ -10,6 +10,10 @@
 
 The fork carries these runtime behavior changes:
 
+- KDE clipboard typing observes request cancellation before its first paste
+  key submission while retaining cleanup and input serialization. The
+  constructed public-MCP regression is `scripts/kde_paste_cancellation_test.py`.
+
 - The GNOME Shell window-control extension requires explicit desktop consent per
   unique D-Bus connection before window or monitor access. Grants are revoked on
   disconnect or reload; the Rust client retains its verified connection per
