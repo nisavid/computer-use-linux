@@ -8281,12 +8281,9 @@ mod tests {
             let program = dir.join("wtype");
             let marker = dir.join("ran");
             let mut writer = std::fs::File::create(&program).unwrap();
-            write!(
-                writer,
-                "#!/bin/sh\nprintf ran > '{}'\ncat >/dev/null\n",
-                marker.display()
-            )
-            .unwrap();
+            writer
+                .write_all(b"#!/bin/sh\nprintf ran > \"${0%/*}/ran\"\ncat >/dev/null\n")
+                .unwrap();
             writer.flush().unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(
@@ -8341,7 +8338,9 @@ mod tests {
             let program = dir.join("xdotool");
             let marker = dir.join("ran");
             let mut writer = std::fs::File::create(&program).unwrap();
-            write!(writer, "#!/bin/sh\nprintf ran > '{}'\n", marker.display()).unwrap();
+            writer
+                .write_all(b"#!/bin/sh\nprintf ran > \"${0%/*}/ran\"\n")
+                .unwrap();
             writer.flush().unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(
