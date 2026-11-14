@@ -39,6 +39,19 @@ missing, run `.agents/bootstrap-fork-ops.sh`. It verifies the fork origin,
 provisions the read-only `upstream` remote, disables upstream pushes, and
 fetches upstream `main`.
 
+## Private admission reentry
+
+If you hold an existing appointment as this repository's Dispatch or Sage,
+resolve its private role entry on reentry and before covered work. Read the
+absolute path from `git config --local --get computer-use-linux.dispatchEntry`
+for Dispatch or `git config --local --get computer-use-linux.sageEntry` for
+Sage. Resolve relative paths from the directory containing the private entry.
+Follow the entry to the current admission record and recover the boundary and
+applicable holds. Withhold affected starts and ask the admission
+owner to reconcile any missing or mismatched pointer. Other roles, including
+workers, use the admission route for their own assignment. A pointer supplies
+instructions only and does not confer admission.
+
 ## Operating Policy
 
 - This repository uses agentic engineering and operations. Agents should perform assigned tasks autonomously until they reach a boundary that requires stakeholder policy or an unavailable control surface.
