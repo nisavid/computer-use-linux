@@ -344,8 +344,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>()
-            .expect("get_app_state output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>(),
         description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = true,
