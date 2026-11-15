@@ -119,6 +119,11 @@ fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
     }
 }
 
+fn public_output_schema<T: JsonSchema + std::any::Any>() -> Arc<rmcp::model::JsonObject> {
+    rmcp::handler::server::tool::schema_for_input::<T>()
+        .unwrap_or_else(|error| panic!("invalid public output schema: {error}"))
+}
+
 impl ComputerUseLinux {
     fn mcp_tool_router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         self.router_with_completion(env::var(COMPLETION_ENABLE_ENV).as_deref() == Ok("1"))
@@ -135,7 +140,30 @@ impl ComputerUseLinux {
         if !shell_execution_enabled() {
             router.map.remove("run_shell");
         }
-        for route in router.map.values_mut() {
+        for (name, route) in &mut router.map {
+            let output_schema = match name.as_ref() {
+                "complete_interaction" => Some(public_output_schema::<CompletionOutput>()),
+                "doctor" => Some(public_output_schema::<DoctorReport>()),
+                "setup_accessibility" => Some(public_output_schema::<SetupReport>()),
+                "setup_window_targeting" => {
+                    Some(public_output_schema::<WindowTargetingSetupReport>())
+                }
+                "list_apps" => Some(public_output_schema::<ListAppsOutput>()),
+                "list_windows" => Some(public_output_schema::<ListWindowsOutput>()),
+                "focused_window" => Some(public_output_schema::<FocusedWindowOutput>()),
+                "activate_window" => Some(public_output_schema::<ActivateWindowOutput>()),
+                "get_app_state" => Some(public_output_schema::<GetAppStateOutput>()),
+                "click" | "perform_action" | "set_value" | "scroll" | "drag" | "press_key"
+                | "type_text" => Some(public_output_schema::<ActionOutput>()),
+                "run_shell" => Some(public_output_schema::<RunShellOutput>()),
+                "move_window" | "resize_window" => {
+                    Some(public_output_schema::<WindowGeometryOutput>())
+                }
+                _ => None,
+            };
+            if let Some(output_schema) = output_schema {
+                route.attr.output_schema = Some(output_schema);
+            }
             let input_schema = Arc::make_mut(&mut route.attr.input_schema);
             for value in input_schema.values_mut() {
                 sanitize_unsigned_integer_formats(value);
@@ -344,7 +372,6 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>(),
         description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = true,
