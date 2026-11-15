@@ -41,16 +41,17 @@ fetches upstream `main`.
 
 ## Private admission reentry
 
-If you hold an existing appointment as this repository's Dispatch or Sage,
-resolve its private role entry on reentry and before covered work. Read the
-absolute path from `git config --local --get computer-use-linux.dispatchEntry`
-for Dispatch or `git config --local --get computer-use-linux.sageEntry` for
-Sage. Resolve relative paths from the directory containing the private entry.
-Follow the entry to the current admission record and recover the boundary and
-applicable holds. Withhold affected starts and ask the admission
-owner to reconcile any missing or mismatched pointer. Other roles, including
-workers, use the admission route for their own assignment. A pointer supplies
-instructions only and does not confer admission.
+If you hold an existing Director, Dispatch, or Sage appointment for this
+repository, resolve its private role entry on reentry and before covered work.
+Read the matching absolute path with `git config --local --get` using
+`computer-use-linux.directorEntry`, `computer-use-linux.dispatchEntry`, or
+`computer-use-linux.sageEntry`. Resolve relative paths from the directory
+containing the private entry. Follow its role and admission references and
+recover the current boundary and holds. Withhold affected starts and ask the
+entry or admission owner to reconcile a missing or mismatched pointer.
+Workers and other roles use their own assignment and admission route.
+An entry pointer conveys the existing appointment and supplies instructions;
+new appointments and admission require their own accepted authority.
 
 ## Operating Policy
 
