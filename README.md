@@ -226,7 +226,7 @@ You will still need `ydotoold` running and AT-SPI enabled (run `computer-use-lin
 
 ## Wire it into your MCP host
 
-The binary speaks the `rmcp` 2024-11-05 stdio protocol. Pass `mcp` as the only argument; everything else is configured through MCP tool calls.
+The binary speaks the `rmcp` 2024-11-05 stdio protocol. Pass `mcp` as the only argument; everything else is configured through MCP tool calls. Each incoming newline-delimited JSON-RPC message is limited to 16 MiB (16,777,216 bytes), including the terminating line feed. The server discards a longer line without sending a JSON-RPC response, keeps the process running, and reads later requests normally.
 
 ### Claude Code and Codex plugin
 
