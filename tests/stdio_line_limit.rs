@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -22,20 +22,25 @@ impl Drop for ChildGuard {
 
 struct McpServer {
     child: ChildGuard,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     responses: Receiver<Result<Vec<u8>, String>>,
     stdout_reader: JoinHandle<()>,
     stderr_reader: JoinHandle<Vec<u8>>,
 }
 
 fn spawn_server() -> McpServer {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_computer-use-linux"))
-        .arg("mcp")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_computer-use-linux"));
+    command.arg("mcp");
+    spawn_command(&mut command)
+}
+
+fn spawn_command(command: &mut Command) -> McpServer {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn computer-use-linux MCP server");
+        .expect("spawn MCP test child");
     let stdin = child.stdin.take().expect("server stdin is piped");
     let stdout = child.stdout.take().expect("server stdout is piped");
     let mut stderr = child.stderr.take().expect("server stderr is piped");
@@ -65,17 +70,11 @@ fn spawn_server() -> McpServer {
     });
     McpServer {
         child: ChildGuard(child),
-        stdin,
+        stdin: Some(stdin),
         responses: response_rx,
         stdout_reader,
         stderr_reader,
     }
-}
-
-fn send_line(stdin: &mut ChildStdin, payload: &[u8]) {
-    stdin.write_all(payload).expect("write request payload");
-    stdin.write_all(b"\n").expect("write request delimiter");
-    stdin.flush().expect("flush request");
 }
 
 fn padded_ping(id: u64, json_bytes: usize) -> Vec<u8> {
@@ -86,103 +85,252 @@ fn padded_ping(id: u64, json_bytes: usize) -> Vec<u8> {
     request
 }
 
-fn receive_until_id(
-    responses: &Receiver<Result<Vec<u8>, String>>,
-    expected_id: u64,
-    observed: &mut Vec<Value>,
-) -> Value {
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = responses
-            .recv_timeout(remaining)
-            .unwrap_or_else(|error| panic!("waiting for response {expected_id}: {error}"))
-            .unwrap_or_else(|error| panic!("reading server stdout: {error}"));
-        let response: Value = serde_json::from_slice(&line).expect("response is valid JSON");
-        let matches = response["id"] == json!(expected_id);
-        observed.push(response.clone());
-        if matches {
-            return response;
-        }
+fn classify_message(message: Value, expected_id: Option<u64>) -> Result<Option<Value>, String> {
+    if message.get("jsonrpc") != Some(&json!("2.0")) {
+        return Err(format!("unexpected JSON-RPC message: {message}"));
     }
+    if let Some(id) = message.get("id") {
+        let is_response = message.get("method").is_none()
+            && (message.get("result").is_some() ^ message.get("error").is_some());
+        if is_response && expected_id.is_some_and(|expected| id == &json!(expected)) {
+            return Ok(Some(message));
+        }
+        let kind = if is_response { "response" } else { "message" };
+        return Err(format!("unexpected JSON-RPC {kind}: {message}"));
+    }
+    if message.get("method").is_some_and(Value::is_string)
+        && message.get("result").is_none()
+        && message.get("error").is_none()
+    {
+        return Ok(None);
+    }
+    Err(format!("unexpected JSON-RPC message: {message}"))
 }
 
-fn wait_for_exit(child: &mut Child) -> ExitStatus {
+fn kill_and_reap(child: &mut Child) -> Result<ExitStatus, String> {
+    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+        return Ok(status);
+    }
+    child.kill().map_err(|error| error.to_string())?;
+    child.wait().map_err(|error| error.to_string())
+}
+
+fn wait_for_exit(child: &mut Child) -> Result<ExitStatus, String> {
     let deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
-        if let Some(status) = child.try_wait().expect("poll server exit") {
-            return status;
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status);
         }
         if Instant::now() >= deadline {
-            child.kill().expect("kill server after exit timeout");
-            let status = child.wait().expect("reap timed-out server");
-            panic!("server did not exit after stdin closed: {status}");
+            let status = kill_and_reap(child)?;
+            return Err(format!("server did not exit after stdin closed: {status}"));
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
+impl McpServer {
+    fn send_line(&mut self, payload: Vec<u8>, timeout: Duration) -> Result<(), String> {
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| "server stdin is already closed".to_owned())?;
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result = (|| {
+                stdin.write_all(&payload)?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()
+            })()
+            .map_err(|error| error.to_string());
+            let _ = completion_tx.send((stdin, result));
+        });
+
+        match completion_rx.recv_timeout(timeout) {
+            Ok((stdin, result)) => {
+                self.stdin = Some(stdin);
+                writer
+                    .join()
+                    .map_err(|_| "request writer panicked".to_owned())?;
+                result
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                kill_and_reap(&mut self.child.0)
+                    .map_err(|error| format!("reap child after write timeout: {error}"))?;
+                writer
+                    .join()
+                    .map_err(|_| "request writer panicked after timeout".to_owned())?;
+                Err(format!("writing request timed out after {timeout:?}"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                writer
+                    .join()
+                    .map_err(|_| "request writer panicked".to_owned())?;
+                Err("request writer exited without reporting a result".to_owned())
+            }
+        }
+    }
+
+    fn receive_until_id(&self, expected_id: u64, timeout: Duration) -> Result<Value, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .responses
+                .recv_timeout(remaining)
+                .map_err(|error| format!("waiting for response {expected_id}: {error}"))?
+                .map_err(|error| format!("reading server stdout: {error}"))?;
+            let message: Value = serde_json::from_slice(&line)
+                .map_err(|error| format!("response is not valid JSON: {error}"))?;
+            if let Some(response) = classify_message(message, Some(expected_id))? {
+                return Ok(response);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<(ExitStatus, Vec<u8>), String> {
+        drop(self.stdin.take());
+        let status = wait_for_exit(&mut self.child.0)?;
+        self.stdout_reader
+            .join()
+            .map_err(|_| "stdout reader panicked".to_owned())?;
+        let mut messages = Vec::new();
+        while let Ok(line) = self.responses.try_recv() {
+            let line = line.map_err(|error| format!("reading server stdout: {error}"))?;
+            let message: Value = serde_json::from_slice(&line)
+                .map_err(|error| format!("response is not valid JSON: {error}"))?;
+            messages.push(message);
+        }
+        let stderr = self
+            .stderr_reader
+            .join()
+            .map_err(|_| "stderr reader panicked".to_owned())?;
+        for message in messages {
+            classify_message(message, None)?;
+        }
+        if !status.success() {
+            return Err(format!(
+                "server exited with {status}; stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        Ok((status, stderr))
+    }
+}
+
 #[test]
 fn stdio_line_limit_drops_oversized_request_and_recovers() {
-    let McpServer {
-        mut child,
-        mut stdin,
-        responses,
-        stdout_reader,
-        stderr_reader,
-    } = spawn_server();
-    let mut observed = Vec::new();
+    let mut server = spawn_server();
 
-    send_line(
-        &mut stdin,
-        br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stdio-line-limit-test","version":"1.0"}}}"#,
-    );
-    let initialize = receive_until_id(&responses, 1, &mut observed);
+    server
+        .send_line(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stdio-line-limit-test","version":"1.0"}}}"#.to_vec(),
+            RESPONSE_TIMEOUT,
+        )
+        .expect("send initialize request");
+    let initialize = server
+        .receive_until_id(1, RESPONSE_TIMEOUT)
+        .expect("receive initialize response");
     assert!(initialize.get("result").is_some());
-    send_line(
-        &mut stdin,
-        br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-    );
+    server
+        .send_line(
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
+            RESPONSE_TIMEOUT,
+        )
+        .expect("send initialized notification");
 
     let accepted = padded_ping(2, MAX_INCOMING_LINE_BYTES - 1);
     assert_eq!(accepted.len() + 1, MAX_INCOMING_LINE_BYTES);
-    send_line(&mut stdin, &accepted);
-    drop(accepted);
+    server
+        .send_line(accepted, RESPONSE_TIMEOUT)
+        .expect("send maximum-size request");
     assert_eq!(
-        receive_until_id(&responses, 2, &mut observed)["result"],
+        server
+            .receive_until_id(2, RESPONSE_TIMEOUT)
+            .expect("receive maximum-size response")["result"],
         json!({})
     );
 
     let oversized = padded_ping(3, MAX_INCOMING_LINE_BYTES);
     assert_eq!(oversized.len() + 1, MAX_INCOMING_LINE_BYTES + 1);
-    send_line(&mut stdin, &oversized);
-    drop(oversized);
-    send_line(&mut stdin, br#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#);
+    server
+        .send_line(oversized, RESPONSE_TIMEOUT)
+        .expect("send oversized request");
+    server
+        .send_line(
+            br#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#.to_vec(),
+            RESPONSE_TIMEOUT,
+        )
+        .expect("send recovery request");
     assert_eq!(
-        receive_until_id(&responses, 4, &mut observed)["result"],
+        server
+            .receive_until_id(4, RESPONSE_TIMEOUT)
+            .expect("receive recovery response")["result"],
         json!({})
     );
     assert!(
-        child.0.try_wait().expect("poll live server").is_none(),
+        server
+            .child
+            .0
+            .try_wait()
+            .expect("poll live server")
+            .is_none(),
         "server exited before recovering from the oversized request"
     );
 
-    drop(stdin);
-    let status = wait_for_exit(&mut child.0);
-    stdout_reader.join().expect("join stdout reader");
-    while let Ok(line) = responses.try_recv() {
-        let line = line.unwrap_or_else(|error| panic!("reading server stdout: {error}"));
-        observed.push(serde_json::from_slice(&line).expect("response is valid JSON"));
-    }
-    let stderr = stderr_reader.join().expect("join stderr reader");
+    server
+        .finish()
+        .expect("server exits cleanly without a late oversized-request response");
+}
 
+#[test]
+fn stdio_writer_timeout_kills_and_reaps_stalled_child() {
+    let mut command = Command::new("sleep");
+    command.arg("60");
+    let mut server = spawn_command(&mut command);
+    let started = Instant::now();
+
+    let error = server
+        .send_line(
+            padded_ping(1, MAX_INCOMING_LINE_BYTES),
+            Duration::from_millis(200),
+        )
+        .expect_err("a child that never reads stdin must time out");
+
+    assert!(error.contains("timed out"), "unexpected error: {error}");
     assert!(
-        !observed.iter().any(|response| response["id"] == json!(3)),
-        "oversized request unexpectedly received a response: {observed:?}"
+        started.elapsed() < Duration::from_secs(2),
+        "stalled write did not fail promptly"
     );
     assert!(
-        status.success(),
-        "server exited with {status}; stderr: {}",
-        String::from_utf8_lossy(&stderr)
+        server
+            .child
+            .0
+            .try_wait()
+            .expect("poll stalled child")
+            .is_some(),
+        "stalled child was not reaped"
+    );
+}
+
+#[test]
+fn stdio_oracle_rejects_null_id_error() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        r#"printf '%s\n' '{"jsonrpc":"2.0","method":"fixture/ready"}' '{"jsonrpc":"2.0","id":4,"result":{}}' '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}'"#,
+    ]);
+    let server = spawn_command(&mut command);
+    let response = server
+        .receive_until_id(4, Duration::from_secs(1))
+        .expect("receive the fixture response after its notification");
+    assert_eq!(response["result"], json!({}));
+
+    let error = server
+        .finish()
+        .expect_err("the final drain must reject an id:null error response");
+    assert!(
+        error.contains("unexpected JSON-RPC response"),
+        "unexpected error: {error}"
     );
 }
