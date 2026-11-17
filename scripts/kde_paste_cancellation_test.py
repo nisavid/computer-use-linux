@@ -37,7 +37,7 @@ ESCAPE_KEYS = [["code", 1, 1], ["code", 1, 0]]
 RAW_COMMANDS = {"xdotool", "ydotool", "wtype"}
 SHIMS = RAW_COMMANDS | {"systemctl", "gdbus", "busctl", "ibus"}
 START_CASES = {"cancel-start-success", "cancel-start-denied"}
-CANCELLATION_CASES = START_CASES | {"cancel-prepared", "cancel-dispatched"}
+CANCELLATION_CASES = START_CASES | {"cancel-read", "cancel-prepared", "cancel-dispatched"}
 PASTE_REPLY_TIMEOUT = "paste-reply-timeout"
 
 
@@ -209,10 +209,16 @@ class Klipper(dbus.service.Object):
         super().__init__(name, "/klipper")
         self.state = state
 
-    @dbus.service.method(CLIPBOARD, in_signature="", out_signature="s")
-    def getClipboardContents(self):
+    @dbus.service.method(
+        CLIPBOARD, in_signature="", out_signature="s", async_callbacks=("reply", "error"),
+    )
+    def getClipboardContents(self, reply, error):
         self.state.record("clipboard_read", value=self.state.clipboard)
-        return self.state.clipboard
+        value = self.state.clipboard
+        if self.state.mode == "cancel-read" and self.state.barrier_kind is None:
+            self.state.hold_reply("clipboard_read_reply", lambda: reply(value), value=value)
+            return
+        reply(value)
 
     @dbus.service.method(
         CLIPBOARD, in_signature="s", out_signature="", async_callbacks=("reply", "error"),
@@ -366,9 +372,10 @@ def cancel_at_barrier(client, control, output, mode):
             "expected exactly the first Ctrl press at the barrier",
         )
     else:
-        expected_kind, expected_clipboard = (
-            ("prepared_reply", PREPARED) if mode == "cancel-prepared" else ("start_response", ORIGINAL)
-        )
+        expected_kind, expected_clipboard = {
+            "cancel-read": ("clipboard_read_reply", ORIGINAL),
+            "cancel-prepared": ("prepared_reply", PREPARED),
+        }.get(mode, ("start_response", ORIGINAL))
         require(
             before["barrier_kind"] == expected_kind
             and before["clipboard"] == expected_clipboard
@@ -576,6 +583,11 @@ def scenario(binary, output, mode):
         ]
         expected = [2, 0] if mode == "cancel-start-denied" else [0]
         require(start_codes[:len(expected)] == expected, "unexpected portal Start responses")
+    if mode == "cancel-read":
+        require(
+            not any(event["event"] == "clipboard_write" for event in fixture_events(output)),
+            "cancelled clipboard read caused a clipboard write",
+        )
     if before_probe["keys"]:
         print("RED: cancelled_type_text_dispatched_keyboard", file=sys.stderr)
         return 1

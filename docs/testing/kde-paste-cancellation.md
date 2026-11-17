@@ -11,6 +11,8 @@ creates a fresh evidence directory.
 
 - `cancel-prepared` is the default. Fake Klipper accepts the text and holds
   the write reply.
+- `cancel-read` holds the initial clipboard-read reply until after cancellation.
+  The clipboard must remain untouched, with no clipboard write.
 - `cancel-start-success` holds the portal `Start` response and releases a
   keyboard grant after cancellation.
 - `cancel-start-denied` releases a denial after cancellation. A subsequent
