@@ -512,7 +512,9 @@ def scenario(binary, output, mode):
                     client.tool(2, "type_text", text=PREPARED)
                     if mode in CANCELLATION_CASES:
                         cancel_at_barrier(client, control, output, mode)
-                    typing = client.receive(2, time.monotonic() + 10)
+                    # A cancelled request may have no response; observe cleanup and
+                    # serialization through the fixture and a subsequent request.
+                    typing = None if mode in CANCELLATION_CASES else client.receive(2, time.monotonic() + 10)
                     wait_for(
                         lambda: True if snapshot(output)["clipboard"] == ORIGINAL else None,
                         5, "clipboard was not restored",
@@ -550,7 +552,6 @@ def scenario(binary, output, mode):
         )
         return 0
     if mode == "cancel-dispatched":
-        require(action_ok(typing), "started paste did not report completion")
         check_paste_effect(fixture_events(output), after_probe)
         return 0
     if mode == PASTE_REPLY_TIMEOUT:
@@ -579,8 +580,8 @@ def scenario(binary, output, mode):
         print("RED: cancelled_type_text_dispatched_keyboard", file=sys.stderr)
         return 1
     require(
-        before_probe["field"] == INITIAL_FIELD and not action_ok(typing),
-        "cancelled request did not preserve its target and report cancellation",
+        before_probe["field"] == INITIAL_FIELD,
+        "cancelled request changed its target",
     )
     return 0
 

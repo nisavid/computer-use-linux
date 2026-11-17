@@ -71,11 +71,13 @@ fixture failure.
 In each cancellation case, the fake service records the selected barrier
 and holds the reply or signal. The client sends `notifications/cancelled`
 for the original numeric request ID, then sends `ping` on the same stream.
-The pinned rmcp 2.1.0 stdio reader processes one newline-delimited message
+The pinned rmcp 3.9.0 stdio reader processes one newline-delimited message
 at a time, and its service loop applies cancellation before handling the
 next message. A successful pong while the reply remains held establishes
-the ordering for this version. Recheck that property if the MCP dependency
-or transport changes.
+the ordering for this version. The transport drops a cancelled request’s
+response, so the fixture observes cleanup and serialization through the service
+trace and subsequent input request. Recheck these properties if the MCP
+dependency or transport changes.
 
 For the cases that cancel before dispatch, exit `1` with
 `cancelled_type_text_dispatched_keyboard` identifies keyboard dispatch after
