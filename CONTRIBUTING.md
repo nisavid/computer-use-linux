@@ -93,8 +93,10 @@ Before uploading release assets, CI checks each architecture's build against
 the committed pins. Builds remap checkout and Cargo home paths; this reduces
 path-dependent output but does not promise reproducibility across toolchains
 or build environments. Public release creation waits for both architecture
-checks. Publication is restricted to `agent-sh/computer-use-linux`, matching
-the installers' default origin; this fork has no independent release channel.
+checks. This upstream workflow publishes only from `agent-sh/computer-use-linux`,
+matching the installers' default origin. For fork release preparation and its
+separate delivery gates, use `docs/agents/release-preparation.md` and
+`docs/agents/release-unit.md`.
 Publication also checks all downloaded workflow artifacts
 against those pins. A rebuild that changes bytes must receive updated reviewed
 pins before release; it cannot silently break source-distributed plugins.

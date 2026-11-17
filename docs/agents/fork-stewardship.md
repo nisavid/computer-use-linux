@@ -166,13 +166,31 @@ disabled workflow with `gh workflow enable --repo nisavid/computer-use-linux`.
 
 ## Releases and publication
 
-The fork has no independent release channel. Do not create or push version
-tags, publish fork GitHub releases, or publish to crates.io or npm without
-explicit direction. Keep every release version equal to `Cargo.toml`'s: CI's
-npm wrapper job checks `package.json`, and `scripts/check_plugins.sh` checks
-the plugin launcher, both plugin manifests, and
-`.claude-plugin/marketplace.json`. Treat a release tag,
-binaries, checksums, and package artifacts as one reviewed release unit.
+The selected fork release profile is KDE Wayland on x86_64, delivered through
+an account-importable ZIP and an immutable remote catalog. Both packages use
+one full version and the same checksum-pinned fork runtime. Follow
+`release-preparation.md` for version proposals, construction, draft staging,
+qualification, publication, stable-catalog promotion, and recovery; its
+`release-unit.md` reference defines the builder/publisher interfaces.
+
+The incorporated upstream baseline is verified separately from a latest-release
+observation. Preserve the actual incorporated identity and carried divergence;
+newer upstream is comparison input until accepted integration establishes it.
+The amended allocation decision linked from the procedure controls active
+preparation. Preserve prior preparation results as historical evidence.
+
+Version consistency checks cover `Cargo.toml`, the npm wrapper manifest,
+launcher, plugin manifests, and `.claude-plugin/marketplace.json`. Bind the
+version-derived tag, runtime, checksum pins, packages, and catalog to one
+reviewed manifest. Keep upstream product names and crate/npm publishers
+unchanged. Never activate those publishers merely by changing their existing
+upstream repository guard.
+
+Each release stage retains its current authority and evidence gates. Draft
+qualification precedes unchanged-asset publication; ordinary public-download
+and route receipts precede guarded movement of `refs/heads/latest-stable`.
+Procedure/source implementation alone authorizes no allocation, tag, release,
+account upload, publisher activation, or promotion.
 
 ## Generated and runtime boundaries
 

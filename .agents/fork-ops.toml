@@ -11,7 +11,7 @@ source_order = ["explicit-user-direction", "current-upstream-product-truth", "fo
 upstream_canon = "Upstream source, documentation, releases, and maintainer guidance are canonical for product behavior unless fork-local authority defines a divergence."
 inference_labeling = "Label important inferences when direct evidence is unavailable."
 required_context_paths = ["AGENTS.md", "docs/agents/domain.md", "docs/agents/fork-stewardship.md"]
-pre_change_requirements = ["Run ./.agents/bootstrap-fork-ops.sh before upstream-track operations.", "Verify current refs and worktree state.", "Review the fork divergence inventory.", "Identify the affected generated and runtime surfaces.", "Select validation gates for the affected behavior."]
+pre_change_requirements = ["Run ./.agents/bootstrap-fork-ops.sh before upstream-track operations.", "Verify current refs and worktree state.", "Review the fork divergence inventory.", "Identify the affected generated and runtime surfaces.", "Select validation gates for the affected behavior.", "Before version proposals, release construction/staging/qualification/publication, stable-catalog promotion, or recovery, load docs/agents/release-preparation.md and its release-unit interface."]
 durable_discovery_destinations = ["AGENTS.md for always-loaded operating rules.", "docs/agents/fork-stewardship.md for maintained fork policy."]
 escalation_policy = "Escalate consequential conflicts, unknown stakeholder policy, unavailable control surfaces, and upstream operations without explicit direction."
 
@@ -45,7 +45,7 @@ kind = "github_latest_release"
 selection_source = "github-releases"
 include_drafts = false
 include_prereleases = false
-notes = "Select the current stable upstream release from live GitHub Releases."
+notes = "Observe the current stable upstream release from live GitHub Releases for comparison. This channel does not establish the fork candidate's incorporated baseline or authorize integration/release; use docs/agents/release-preparation.md for separately verified provenance and delivery."
 
 [[upstream_tracks]]
 id = "upstream-main"
@@ -115,6 +115,20 @@ kind = "doc"
 path = "docs/agents/fork-stewardship.md"
 domain = "authority"
 portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "doc"
+path = "docs/agents/release-preparation.md"
+domain = "release-preparation"
+portability_hint = "fork-specific"
+notes = "Maintained version, manifest, draft-first delivery, qualification, promotion, and recovery procedure; release-unit.md defines its consumer interfaces."
+
+[[local_surfaces]]
+kind = "doc"
+path = "docs/agents/release-unit.md"
+domain = "release-preparation"
+portability_hint = "fork-specific"
+notes = "Incorporated-baseline, release-manifest, and receipt interfaces consumed by the release procedure, builder, publisher, and qualification routes."
 
 [[local_surfaces]]
 kind = "doc"

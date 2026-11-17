@@ -1,5 +1,11 @@
 # Resolve a verified upstream release input
 
+This procedure observes latest stable upstream for comparison. Its record does
+not establish that the selected commit is incorporated into a fork candidate.
+For release provenance and a known historical incorporated baseline, use the
+separate verification path in `docs/agents/release-preparation.md`. Preserve this
+selector and the existing drift entry points when developing release delivery.
+
 From an isolated checkout with the configured read-only upstream remote and no
 concurrent fetches, use Git, authenticated GitHub CLI, and Python 3.11 or newer.
 Choose a fresh output path in a directory you own.

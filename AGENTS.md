@@ -28,6 +28,10 @@ This repository is the maintained `nisavid/computer-use-linux` fork of
 `agent-sh/computer-use-linux`. Before assessing or synchronizing upstream,
 changing carried divergence, or preparing a release, read
 `docs/agents/fork-stewardship.md` and `.agents/fork-ops.toml`.
+Before proposing or reconciling a version, constructing or staging release
+assets, qualifying either installation route, publishing, promoting the stable
+catalog, or recovering a partial release, use
+`docs/agents/release-preparation.md`.
 
 Use `onboarding-forks-for-agent-maintenance` when revisiting the fork's
 authority and operating contract. Use `fork-ops` for supported configuration,
