@@ -11,9 +11,12 @@ readonly default_stale_days=14
 usage() {
   printf '%s\n' 'Usage: .agents/upstream-drift.sh [--fork-ref REF] [--upstream-ref REF]'
   printf '%s\n' '                                 [--stale-days N] [--report FILE]'
+  printf '%s\n' '       .agents/upstream-drift.sh --release-input FILE'
   printf '%s\n' 'Report how far the fork trails upstream main and the latest stable upstream release.'
   printf '%s\n' 'Prints key=value lines; --report also writes a Markdown summary to FILE.'
-  printf '%s\n' 'Run .agents/bootstrap-fork-ops.sh first. Requires git and an authenticated gh.'
+  printf '%s\n' 'Record mode: see docs/testing/upstream-release-input.md.'
+  printf '%s\n' 'Run .agents/bootstrap-fork-ops.sh first. Requires git and authenticated gh.'
+  printf '%s\n' 'Record mode also requires Python 3.11 or newer.'
 }
 
 die() {
@@ -21,7 +24,46 @@ die() {
   exit 1
 }
 
+resolve_upstream_release() {
+  local encoded_tag
+  if [[ "$1" == record ]]; then
+    selected_release="$(gh api --hostname github.com "repos/$upstream_repo/releases/latest" --jq '@base64')" ||
+      die "could not read the latest $upstream_repo release"
+    encoded_tag="$(printf '%s' "$selected_release" | python3 -c 'import base64,json,sys; v=json.loads(base64.b64decode(sys.stdin.buffer.read(),validate=True)); print(base64.b64encode(v["tag_name"].encode()).decode())')" ||
+      die 'invalid selected release tag'
+  else
+    encoded_tag="$(gh api --hostname github.com "repos/$upstream_repo/releases/latest" --jq '.tag_name | @base64')" ||
+      die "could not read the latest $upstream_repo release"
+  fi
+  # Read decoded bytes without command substitution: trailing newlines matter,
+  # and a NUL is invalid in a Git ref rather than a byte to discard.
+  if IFS= read -r -d '' release_tag < <(printf '%s' "$encoded_tag" | base64 --decode); then
+    die 'invalid selected release tag'
+  fi
+  [[ "$(printf '%s' "$release_tag" | base64 -w 0)" == "$encoded_tag" ]] || die 'invalid selected release tag'
+  git check-ref-format "refs/tags/$release_tag" >/dev/null 2>&1 || die 'invalid selected release tag'
+  git fetch --quiet --no-tags --no-prune --refmap= upstream "refs/tags/$release_tag" ||
+    die "could not fetch upstream tag $release_tag"
+  release_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}')" || die "could not resolve $release_tag to a commit"
+}
+
+retain_upstream_release() {
+  local script_path
+  script_path="$(realpath -- "${BASH_SOURCE[0]}")" || die 'could not locate the release resolver'
+  printf '%s' "$selected_release" | python3 "${script_path%/*}/upstream-release-input.py" "$upstream_repo" "$release_tag" "$release_sha" "$1"
+}
+
 main() {
+  if [[ "${1:-}" == --release-input ]]; then
+    (($# == 2)) && [[ -n "$2" ]] || die '--release-input needs one file and no other options'
+    command -v git >/dev/null 2>&1 || die 'git is required'
+    command -v gh >/dev/null 2>&1 || die 'gh is required'
+    command -v python3 >/dev/null 2>&1 || die 'python3 is required'
+    local release_tag release_sha selected_release
+    resolve_upstream_release record
+    retain_upstream_release "$2"
+    return
+  fi
   local fork_ref="$default_fork_ref"
   local upstream_ref="$default_upstream_ref"
   local stale_days="$default_stale_days"
@@ -80,13 +122,8 @@ main() {
   # The stable release channel in .agents/fork-ops.toml: GitHub's latest
   # release, which excludes drafts and prereleases.
   local release_tag release_url release_sha release_contained=true
-  release_tag="$(gh api "repos/$upstream_repo/releases/latest" --jq .tag_name)" ||
-    die "could not read the latest $upstream_repo release"
+  resolve_upstream_release drift
   release_url="https://github.com/$upstream_repo/releases/tag/$release_tag"
-  # Fetch into FETCH_HEAD only, so upstream tags never overwrite fork tags.
-  git fetch --quiet --no-tags upstream "refs/tags/$release_tag" ||
-    die "could not fetch upstream tag $release_tag"
-  release_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
   local ancestry_status=0
   git merge-base --is-ancestor "$release_sha" "$fork_sha" || ancestry_status=$?
   case "$ancestry_status" in
