@@ -120,6 +120,27 @@ fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
     }
 }
 
+fn checked_public_output_schema<T: JsonSchema + std::any::Any>(
+    tool_name: &str,
+    generated_schema: Option<&Arc<rmcp::model::JsonObject>>,
+) -> Arc<rmcp::model::JsonObject> {
+    let generated_schema = generated_schema.unwrap_or_else(|| {
+        panic!(
+            "{tool_name} has no handler-generated output schema for {}",
+            std::any::type_name::<T>()
+        )
+    });
+    let expected_schema = rmcp::handler::server::tool::schema_for_output::<T>();
+    assert_eq!(
+        generated_schema.as_ref(),
+        expected_schema.as_ref(),
+        "{tool_name} output schema does not match handler return type {}",
+        std::any::type_name::<T>()
+    );
+    rmcp::handler::server::tool::schema_for_input::<T>()
+        .unwrap_or_else(|error| panic!("invalid public output schema: {error}"))
+}
+
 impl ComputerUseLinux {
     fn mcp_tool_router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         self.router_with_completion(env::var(COMPLETION_ENABLE_ENV).as_deref() == Ok("1"))
@@ -136,7 +157,64 @@ impl ComputerUseLinux {
         if !shell_execution_enabled() {
             router.map.remove("run_shell");
         }
-        for route in router.map.values_mut() {
+        for (name, route) in &mut router.map {
+            let output_schema = match name.as_ref() {
+                "complete_interaction" => Some(checked_public_output_schema::<CompletionOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "doctor" => Some(checked_public_output_schema::<DoctorReport>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "setup_accessibility" => Some(checked_public_output_schema::<SetupReport>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "setup_window_targeting" => Some(checked_public_output_schema::<
+                    WindowTargetingSetupReport,
+                >(
+                    name, route.attr.output_schema.as_ref()
+                )),
+                "list_apps" => Some(checked_public_output_schema::<ListAppsOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "list_windows" => Some(checked_public_output_schema::<ListWindowsOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "focused_window" => Some(checked_public_output_schema::<FocusedWindowOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "activate_window" => Some(checked_public_output_schema::<ActivateWindowOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "get_app_state" => Some(checked_public_output_schema::<GetAppStateOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "click" | "perform_action" | "set_value" | "scroll" | "drag" | "press_key"
+                | "type_text" => Some(checked_public_output_schema::<ActionOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "run_shell" => Some(checked_public_output_schema::<RunShellOutput>(
+                    name,
+                    route.attr.output_schema.as_ref(),
+                )),
+                "move_window" | "resize_window" => Some(checked_public_output_schema::<
+                    WindowGeometryOutput,
+                >(
+                    name, route.attr.output_schema.as_ref()
+                )),
+                _ => None,
+            };
+            if let Some(output_schema) = output_schema {
+                route.attr.output_schema = Some(output_schema);
+            }
             let input_schema = Arc::make_mut(&mut route.attr.input_schema);
             for value in input_schema.values_mut() {
                 sanitize_unsigned_integer_formats(value);
@@ -345,8 +423,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>()
-            .expect("get_app_state output schema"),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>(),
         description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = true,
@@ -6399,6 +6476,12 @@ mod tests {
         assert_eq!(value["annotations"]["destructiveHint"], false);
         assert_eq!(value["annotations"]["idempotentHint"], false);
         assert_eq!(value["annotations"]["openWorldHint"], true);
+        let expected_output_schema =
+            rmcp::handler::server::tool::schema_for_input::<CompletionOutput>().unwrap();
+        assert_eq!(
+            tool.output_schema.as_deref(),
+            Some(expected_output_schema.as_ref())
+        );
     }
 
     #[tokio::test]
@@ -6443,6 +6526,13 @@ mod tests {
             unsupported.is_empty(),
             "unsupported unsigned integer formats: {unsupported:?}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "output schema does not match handler return type")]
+    fn public_output_schema_rejects_handler_return_type_mismatch() {
+        let generated = rmcp::handler::server::tool::schema_for_output::<ActivateWindowOutput>();
+        checked_public_output_schema::<ListAppsOutput>("activate_window", Some(&generated));
     }
 
     fn collect_unsigned_integer_formats(
