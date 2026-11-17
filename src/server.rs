@@ -58,6 +58,7 @@ const TYPE_TEXT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SCROLL_PAGES: f64 = 100.0;
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
+const KDE_PASTE_CANCELLED: &str = "Text input cancelled before paste dispatch.";
 const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
@@ -1776,27 +1777,12 @@ impl ComputerUseLinux {
     async fn type_text(
         &self,
         Parameters(params): Parameters<TypeTextParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Json<ActionOutput> {
-        if let Err(message) = validate_type_text(&params.text) {
-            return Json(typing_error(message));
-        }
-        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
-        let deadline = Instant::now() + TYPE_TEXT_TIMEOUT;
-        let server = self.clone();
-        let cleanup = Arc::new(Mutex::new(TypingCleanup::default()));
-        let operation_cleanup = Arc::clone(&cleanup);
-        let (_input_guard, result) = run_bounded_typing_input(
-            input_guard,
-            deadline,
-            async move {
-                Ok(server
-                    .type_text_inner(params, deadline, operation_cleanup)
-                    .await)
-            },
-            finish_typing_cleanup(cleanup),
-        )
-        .await;
-        typing_output(result)
+        let cancellation = context.ct.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        self.run_type_text(params, move || cancellation.is_cancelled())
+            .await
     }
 
     #[tool(
@@ -2986,9 +2972,10 @@ impl ComputerUseLinux {
     }
 
     fn is_kde_wayland_session(&self) -> bool {
-        self.is_wayland_session()
-            && (env_contains("XDG_CURRENT_DESKTOP", "kde")
-                || env_contains("DESKTOP_SESSION", "plasma"))
+        let wayland = self.is_wayland_session();
+        let desktop = env::var("XDG_CURRENT_DESKTOP").ok();
+        let session = env::var("DESKTOP_SESSION").ok();
+        kde_wayland_desktop(wayland, desktop.as_deref(), session.as_deref())
     }
 
     fn cached_portal_pointer_session(&self) -> Option<PortalPointerSession> {
@@ -3011,11 +2998,39 @@ impl ComputerUseLinux {
         }
     }
 
+    async fn run_type_text(
+        &self,
+        params: TypeTextParams,
+        is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Json<ActionOutput> {
+        if let Err(message) = validate_type_text(&params.text) {
+            return Json(typing_error(message));
+        }
+        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let deadline = Instant::now() + TYPE_TEXT_TIMEOUT;
+        let server = self.clone();
+        let cleanup = Arc::new(Mutex::new(TypingCleanup::default()));
+        let operation_cleanup = Arc::clone(&cleanup);
+        let (_input_guard, result) = run_bounded_typing_input(
+            input_guard,
+            deadline,
+            async move {
+                Ok(server
+                    .type_text_inner(params, deadline, operation_cleanup, &is_cancelled)
+                    .await)
+            },
+            finish_typing_cleanup(cleanup),
+        )
+        .await;
+        typing_output(result)
+    }
+
     async fn type_text_inner(
         &self,
         params: TypeTextParams,
         deadline: Instant,
         cleanup: Arc<Mutex<TypingCleanup>>,
+        is_cancelled: &(impl Fn() -> bool + Sync),
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let window_target = params.window_target();
@@ -3031,9 +3046,11 @@ impl ComputerUseLinux {
                 });
             }
         };
-        if self.should_prefer_kde_clipboard_text_backend() {
+        let kde_paste = self.should_prefer_kde_clipboard_text_backend();
+        let paste_cancelled = || kde_paste && is_cancelled();
+        if kde_paste && !is_cancelled() {
             match self.ensure_portal_keyboard_session().await {
-                Ok(Some(session)) => {
+                Ok(Some(session)) if !is_cancelled() => {
                     cleanup.lock().unwrap().session = Some(session.clone());
                     let kde_focus = if window_target.has_target() {
                         match self.focus_target_for_input(&window_target).await {
@@ -3059,6 +3076,7 @@ impl ComputerUseLinux {
                         &params.text,
                         paste_shortcut,
                         &cleanup,
+                        is_cancelled,
                     )
                     .await
                     {
@@ -3089,9 +3107,17 @@ impl ComputerUseLinux {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(_) => {}
             }
+        }
+        if paste_cancelled() {
+            return Json(action_result_with_focus(
+                "type_text",
+                Err(KDE_PASTE_CANCELLED.to_string()),
+                received,
+                focus,
+            ));
         }
         if self.should_prefer_portal_keyboard_backend().await {
             if let Ok(keysyms) = keysyms_for_text(&params.text) {
@@ -3149,11 +3175,15 @@ impl ComputerUseLinux {
             };
             let text = params.text.clone();
             let result = async {
-                run_xdotool_or_fallback_with_timeout(
+                if paste_cancelled() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
+                run_xdotool_or_fallback_with_timeout_checked(
                     Path::new("xdotool"),
                     &args,
                     command_timeout,
-                    || run_ydotool_type_text(&text, deadline),
+                    &paste_cancelled,
+                    || run_ydotool_type_text(&text, deadline, &paste_cancelled),
                 )
                 .await
             }
@@ -3179,9 +3209,16 @@ impl ComputerUseLinux {
         if self.should_prefer_wtype_keyboard() {
             let text = params.text.clone();
             let result = async {
-                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, deadline, || {
-                    run_ydotool_type_text(&text, deadline)
-                })
+                if paste_cancelled() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
+                run_wtype_type_text_or_fallback_checked(
+                    Path::new("wtype"),
+                    &text,
+                    deadline,
+                    &paste_cancelled,
+                    || run_ydotool_type_text(&text, deadline, &paste_cancelled),
+                )
                 .await
             }
             .await;
@@ -3206,7 +3243,7 @@ impl ComputerUseLinux {
         }
         let text = params.text.clone();
         let result = async {
-            run_ydotool_type_text(&text, deadline)
+            run_ydotool_type_text(&text, deadline, &paste_cancelled)
                 .await
                 .map(|output| vec![output])
         }
@@ -4475,10 +4512,10 @@ fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn env_contains(key: &str, needle: &str) -> bool {
-    env::var(key)
-        .ok()
-        .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
+fn kde_wayland_desktop(is_wayland: bool, desktop: Option<&str>, session: Option<&str>) -> bool {
+    is_wayland
+        && (desktop.is_some_and(|value| value.to_ascii_lowercase().contains("kde"))
+            || session.is_some_and(|value| value.to_ascii_lowercase().contains("plasma")))
 }
 
 /// True when an environment variable is set to `"1"` (an explicit on switch).
@@ -5384,17 +5421,34 @@ async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
 async fn run_ydotool_type_text(
     text: &str,
     deadline: Instant,
+    is_cancelled: &(impl Fn() -> bool + Sync),
 ) -> std::result::Result<Output, String> {
-    let support = ydotool::ensure_supported_async().await?;
+    if is_cancelled() {
+        return Err(KDE_PASTE_CANCELLED.to_string());
+    }
+    let support = ydotool::ensure_supported_async().await;
+    if is_cancelled() {
+        return Err(KDE_PASTE_CANCELLED.to_string());
+    }
+    let support = support?;
     let socket = ydotool::socket_path_for_command()?;
     let mut command = TokioCommand::new(&support.executable);
     command.args(["type", "--file", "-"]);
     command.env("YDOTOOL_SOCKET", socket);
-    let output = crate::command_runner::output_with_stdin(
+    let output = crate::command_runner::output_with_stdin_checked(
         command,
         "run ydotool type",
         typing_command_timeout(deadline, ydotool_type_timeout(text))?,
         text.as_bytes().to_vec(),
+        || {
+            if is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    KDE_PASTE_CANCELLED,
+                ));
+            }
+            Ok(())
+        },
     )
     .await
     .map_err(|error| format!("{error:#}"))?;
@@ -5440,6 +5494,14 @@ struct KdeClipboardPasteError {
 }
 
 impl KdeClipboardPasteError {
+    fn cancelled() -> Self {
+        Self {
+            message: KDE_PASTE_CANCELLED.to_string(),
+            can_fallback_to_ydotool: false,
+            clear_portal_keyboard_session: false,
+        }
+    }
+
     fn before_text_input(message: String) -> Self {
         Self {
             message,
@@ -5448,7 +5510,7 @@ impl KdeClipboardPasteError {
         }
     }
 
-    fn after_portal_input(message: String) -> Self {
+    fn portal_chord_error(message: String) -> Self {
         Self {
             message,
             can_fallback_to_ydotool: false,
@@ -5462,19 +5524,39 @@ async fn run_kde_clipboard_paste_text(
     text: &str,
     paste_shortcut: KdeClipboardPasteShortcut,
     cleanup: &Arc<Mutex<TypingCleanup>>,
+    is_cancelled: &(impl Fn() -> bool + Sync),
 ) -> std::result::Result<String, KdeClipboardPasteError> {
-    let previous = kde_clipboard_contents()
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    let previous = kde_clipboard_contents().await;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    let previous = previous.map_err(KdeClipboardPasteError::before_text_input)?;
     cleanup.lock().unwrap().clipboard = Some(previous.clone());
-    kde_set_clipboard_contents(text)
-        .await
-        .map_err(KdeClipboardPasteError::before_text_input)?;
+    // Keep ownership of a write that can take effect before its reply arrives.
+    let write_result = kde_set_clipboard_contents(text).await;
+    if is_cancelled() {
+        return Err(KdeClipboardPasteError::cancelled());
+    }
+    write_result.map_err(KdeClipboardPasteError::before_text_input)?;
 
     let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
-    let paste_result = press_keycode_chord(session, modifiers, keycode)
-        .await
-        .map_err(|error| format!("{error:#}"));
+    let mut committed = false;
+    let chord = press_keycode_chord(session, modifiers, keycode, || {
+        committed = !is_cancelled();
+        committed
+    })
+    .await;
+    let paste_result = match chord {
+        Ok(false) => return Err(KdeClipboardPasteError::cancelled()),
+        Ok(true) => Ok(()),
+        Err(error) if committed => Err(format!(
+            "{error:#}. Some or all paste input may have landed. Inspect the target before retrying."
+        )),
+        Err(error) => Err(format!("{error:#}")),
+    };
 
     sleep(kde_clipboard_restore_delay(text)).await;
     let restore_result = kde_set_clipboard_contents(&previous).await;
@@ -5484,11 +5566,11 @@ async fn run_kde_clipboard_paste_text(
 
     match (paste_result, restore_result) {
         (Ok(_), Ok(_)) => Ok("Action pasted through KDE clipboard integration.".to_string()),
-        (Err(error), Ok(_)) => Err(KdeClipboardPasteError::after_portal_input(error)),
+        (Err(error), Ok(_)) => Err(KdeClipboardPasteError::portal_chord_error(error)),
         (Ok(_), Err(restore_error)) => Ok(format!(
             "Action pasted through KDE clipboard integration. Warning: previous KDE clipboard contents could not be restored: {restore_error}"
         )),
-        (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::after_portal_input(
+        (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::portal_chord_error(
             format!("{error}; previous KDE clipboard contents could not be restored: {restore_error}"),
         )),
     }
@@ -5688,6 +5770,15 @@ async fn run_xdotool_with_timeout(
     args: &[String],
     command_timeout: Duration,
 ) -> XdotoolAttempt {
+    run_xdotool_with_timeout_checked(program, args, command_timeout, &|| false).await
+}
+
+async fn run_xdotool_with_timeout_checked(
+    program: &Path,
+    args: &[String],
+    command_timeout: Duration,
+    is_cancelled: &impl Fn() -> bool,
+) -> XdotoolAttempt {
     let mut command = TokioCommand::new(program);
     command.args(args);
     command.stdout(Stdio::piped());
@@ -5697,7 +5788,18 @@ async fn run_xdotool_with_timeout(
 
     // A busy-file spawn error is transient, not "xdotool is unavailable"; do
     // not let it route input to the ydotool fallback.
-    match crate::command_runner::spawn_retrying_busy(&mut command).await {
+    match crate::command_runner::spawn_retrying_busy_checked(&mut command, || {
+        if is_cancelled() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                KDE_PASTE_CANCELLED,
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    {
         Ok(child) => XdotoolAttempt::Finished(
             match crate::command_runner::output_child(child, "run xdotool", command_timeout)
                 .await
@@ -5708,6 +5810,12 @@ async fn run_xdotool_with_timeout(
                 Err(error) => Err(error),
             },
         ),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::Interrupted
+                && error.raw_os_error().is_none() =>
+        {
+            XdotoolAttempt::Finished(Err(KDE_PASTE_CANCELLED.to_string()))
+        }
         Err(_) => XdotoolAttempt::Unavailable,
     }
 }
@@ -5734,7 +5842,28 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = std::result::Result<Output, String>>,
 {
-    match run_xdotool_with_timeout(program, args, command_timeout).await {
+    run_xdotool_or_fallback_with_timeout_checked(
+        program,
+        args,
+        command_timeout,
+        &|| false,
+        fallback,
+    )
+    .await
+}
+
+async fn run_xdotool_or_fallback_with_timeout_checked<F, Fut>(
+    program: &Path,
+    args: &[String],
+    command_timeout: Duration,
+    is_cancelled: &impl Fn() -> bool,
+    fallback: F,
+) -> std::result::Result<KeyboardCommandResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = std::result::Result<Output, String>>,
+{
+    match run_xdotool_with_timeout_checked(program, args, command_timeout, is_cancelled).await {
         XdotoolAttempt::Unavailable => fallback().await.map(|output| KeyboardCommandResult {
             output,
             backend: KeyboardCommandBackend::Ydotool,
@@ -5746,10 +5875,11 @@ where
     }
 }
 
-async fn run_wtype_type_text_or_fallback<F, Fut>(
+async fn run_wtype_type_text_or_fallback_checked<F, Fut>(
     program: &Path,
     text: &str,
     deadline: Instant,
+    is_cancelled: &impl Fn() -> bool,
     fallback: F,
 ) -> std::result::Result<KeyboardCommandResult, String>
 where
@@ -5772,11 +5902,21 @@ where
 
     let mut command = TokioCommand::new(program);
     command.arg("-");
-    let output = crate::command_runner::output_with_stdin(
+    let output = crate::command_runner::output_with_stdin_checked(
         command,
         "run wtype",
         typing_command_timeout(deadline, ydotool_type_timeout(text))?,
         text.as_bytes().to_vec(),
+        || {
+            if is_cancelled() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    KDE_PASTE_CANCELLED,
+                ))
+            } else {
+                Ok(())
+            }
+        },
     )
     .await
     .map_err(|error| format!("{error:#}"))?;
@@ -8206,6 +8346,130 @@ mod tests {
         assert!(result.output.status.success());
     }
 
+    #[test]
+    fn plasma_without_desktop_variable_can_reach_raw_fallbacks() {
+        assert!(kde_wayland_desktop(true, None, Some("plasma")));
+        assert!(crate::diagnostics::wtype_compatible_wayland_desktop(None));
+        assert!(prefer_wtype_keyboard(false, true, true, true));
+        // Forced xdotool can appear after the initial KDE selection.
+        assert!(!prefer_xdotool_keyboard(false, true, true, true, false));
+        assert!(prefer_xdotool_keyboard(false, true, true, true, true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_kde_wtype_retry_never_starts_input() {
+        use std::cell::Cell;
+        use std::io::Write;
+
+        for cancel_on_backoff in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "cul-wtype-retry-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let program = dir.join("wtype");
+            let marker = dir.join("ran");
+            let mut writer = std::fs::File::create(&program).unwrap();
+            writer
+                .write_all(b"#!/bin/sh\nprintf ran > \"${0%/*}/ran\"\ncat >/dev/null\n")
+                .unwrap();
+            writer.flush().unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                std::process::Command::new(&program)
+                    .spawn()
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ETXTBSY)
+            );
+            let cancelled = Cell::new(false);
+            let operation = async {
+                if cancelled.get() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
+                run_wtype_type_text_or_fallback_checked(
+                    &program,
+                    "inert text",
+                    Instant::now() + TYPE_TEXT_TIMEOUT,
+                    &|| cancelled.get(),
+                    || async { panic!("unexpected fallback") },
+                )
+                .await
+            };
+            tokio::pin!(operation);
+            assert!(futures_util::poll!(operation.as_mut()).is_pending());
+            cancelled.set(cancel_on_backoff);
+            drop(writer);
+            let result = operation.await;
+            if cancel_on_backoff {
+                assert!(result.err().unwrap().contains(KDE_PASTE_CANCELLED));
+                assert!(!marker.exists(), "wtype marker proves a late launch");
+            } else {
+                assert!(result.is_ok(), "uncancelled wtype retry failed");
+                assert!(marker.exists(), "uncancelled wtype retry did not launch");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_kde_xdotool_retry_never_starts_input_or_fallback() {
+        use std::cell::Cell;
+        use std::io::Write;
+
+        for cancel_on_backoff in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "cul-xdotool-retry-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let program = dir.join("xdotool");
+            let marker = dir.join("ran");
+            let mut writer = std::fs::File::create(&program).unwrap();
+            writer
+                .write_all(b"#!/bin/sh\nprintf ran > \"${0%/*}/ran\"\n")
+                .unwrap();
+            writer.flush().unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                std::process::Command::new(&program)
+                    .spawn()
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ETXTBSY)
+            );
+            let cancelled = Cell::new(false);
+            let operation = async {
+                if cancelled.get() {
+                    return Err(KDE_PASTE_CANCELLED.to_string());
+                }
+                run_xdotool_or_fallback_with_timeout_checked(
+                    &program,
+                    &[],
+                    Duration::from_secs(1),
+                    &|| cancelled.get(),
+                    || async { panic!("unexpected fallback") },
+                )
+                .await
+            };
+            tokio::pin!(operation);
+            assert!(futures_util::poll!(operation.as_mut()).is_pending());
+            cancelled.set(cancel_on_backoff);
+            drop(writer);
+            let result = operation.await;
+            if cancel_on_backoff {
+                assert_eq!(result.err().unwrap(), KDE_PASTE_CANCELLED);
+                assert!(!marker.exists(), "xdotool marker proves a late launch");
+            } else {
+                assert!(result.is_ok(), "uncancelled xdotool retry failed");
+                assert!(marker.exists(), "uncancelled xdotool retry did not launch");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn wtype_receives_unicode_text_through_stdin() {
         let dir = std::env::temp_dir().join(format!(
@@ -8225,10 +8489,11 @@ mod tests {
             .expect("make fake wtype executable");
         let text = "Zwölf Yaks aßen Öl über München";
 
-        let result = run_wtype_type_text_or_fallback(
+        let result = run_wtype_type_text_or_fallback_checked(
             &wtype,
             text,
             Instant::now() + TYPE_TEXT_TIMEOUT,
+            &|| false,
             || async { panic!("available wtype must not fall back") },
         )
         .await
@@ -8241,10 +8506,11 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_wtype_uses_ydotool_fallback() {
-        let result = run_wtype_type_text_or_fallback(
+        let result = run_wtype_type_text_or_fallback_checked(
             Path::new("/definitely/missing/wtype"),
             "text",
             Instant::now() + TYPE_TEXT_TIMEOUT,
+            &|| false,
             || async {
                 TokioCommand::new("sh")
                     .args(["-c", "exit 0"])
@@ -8273,10 +8539,11 @@ mod tests {
         std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
             .expect("make fake wtype executable");
 
-        let result = run_wtype_type_text_or_fallback(
+        let result = run_wtype_type_text_or_fallback_checked(
             &wtype,
             "text",
             Instant::now() + TYPE_TEXT_TIMEOUT,
+            &|| false,
             || async {
                 std::fs::write(&fallback_marker, "ran").unwrap();
                 TokioCommand::new("true")
@@ -8375,7 +8642,7 @@ mod tests {
         .unwrap();
         let Json(result) = timeout(
             Duration::from_millis(100),
-            server.type_text(Parameters(params)),
+            server.run_type_text(params, || false),
         )
         .await
         .unwrap();

@@ -10,6 +10,10 @@
 
 The fork carries these runtime behavior changes:
 
+- KDE clipboard typing observes request cancellation before its first paste
+  key submission while retaining cleanup and input serialization. The
+  constructed public-MCP regression is `scripts/kde_paste_cancellation_test.py`.
+
 - The GNOME Shell window-control extension requires explicit desktop consent per
   unique D-Bus connection before window or monitor access. Grants are revoked on
   disconnect or reload; the Rust client retains its verified connection per
@@ -67,6 +71,11 @@ labels, and disabled P2P routing. Their isolated D-Bus tests cover wire formats
 and connection behavior; the adapted definitions retain upstream MIT attribution
 in `THIRD_PARTY_LICENSES/atspi-MIT.txt`. Portal, GNOME, and KWin callers use the
 zbus 6 API while retaining their sender, path, and owner checks.
+
+The shared command-output collector waits for stdout and stderr readiness instead
+of sleeping between empty reads, while retaining bounded output and deadline
+handling. The capability-probe tests cover continuous output and concurrent
+output on both pipes.
 
 The three informational retirement exceptions have been removed from
 `.cargo/audit.toml`; the existing build-only quick-xml exceptions remain.

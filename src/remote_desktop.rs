@@ -838,13 +838,21 @@ pub async fn type_text_with_keysyms(
     Ok(())
 }
 
+/// Returns false when the caller declines dispatch after portal preparation.
 pub async fn press_keycode_chord(
     session: &PortalKeyboardSession,
     modifiers: &[i32],
     keycode: i32,
-) -> Result<()> {
+    permit_dispatch: impl FnOnce() -> bool,
+) -> Result<bool> {
     let modifiers: Vec<PortalKey> = modifiers.iter().copied().map(PortalKey::Keycode).collect();
-    press_key_chord(session, &modifiers, PortalKey::Keycode(keycode)).await
+    press_key_chord_if(
+        session,
+        &modifiers,
+        PortalKey::Keycode(keycode),
+        permit_dispatch,
+    )
+    .await
 }
 
 /// Press `key` while holding `modifiers`. Keysyms are resolved by the
@@ -855,18 +863,31 @@ pub async fn press_key_chord(
     modifiers: &[PortalKey],
     key: PortalKey,
 ) -> Result<()> {
+    press_key_chord_if(session, modifiers, key, || true)
+        .await
+        .map(|_| ())
+}
+
+async fn press_key_chord_if(
+    session: &PortalKeyboardSession,
+    modifiers: &[PortalKey],
+    key: PortalKey,
+    permit_dispatch: impl FnOnce() -> bool,
+) -> Result<bool> {
     let input_guard = Arc::clone(&session.input_lock).lock_owned().await;
     session.ensure_valid()?;
     let proxy = remote_desktop_proxy(&session.connection).await?;
     let mut release_guard = KeyboardReleaseGuard::new(session, input_guard);
-    for modifier in modifiers {
+    let mut permit_dispatch = Some(permit_dispatch);
+    for pressed in modifiers.iter().copied().chain(std::iter::once(key)) {
         session.ensure_valid()?;
-        release_guard.push(*modifier);
-        notify_keyboard_key(&proxy, &session.session_handle, *modifier, KEY_PRESSED).await?;
+        // Commit once, after validation and before arming the first release.
+        if permit_dispatch.take().is_some_and(|permit| !permit()) {
+            return Ok(false);
+        }
+        release_guard.push(pressed);
+        notify_keyboard_key(&proxy, &session.session_handle, pressed, KEY_PRESSED).await?;
     }
-    session.ensure_valid()?;
-    release_guard.push(key);
-    notify_keyboard_key(&proxy, &session.session_handle, key, KEY_PRESSED).await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
     notify_keyboard_key(&proxy, &session.session_handle, key, KEY_RELEASED).await?;
     release_guard.pop();
@@ -874,7 +895,7 @@ pub async fn press_key_chord(
         notify_keyboard_key(&proxy, &session.session_handle, *modifier, KEY_RELEASED).await?;
         release_guard.pop();
     }
-    Ok(())
+    Ok(true)
 }
 
 impl PointerReleaseGuard {
