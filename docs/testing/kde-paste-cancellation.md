@@ -41,11 +41,20 @@ printf '%s\n' "$fixture_case" > "$evidence/scenario"
 sha256sum "$binary" "$fixture" docs/testing/kde-paste-cancellation.md \
   > "$evidence/SHA256SUMS"
 
+# Preserve the host's /lib64 mapping when present. Some merged-/usr hosts
+# omit it; others have a directory instead of a symlink.
+set --
+if test -L /lib64; then
+  set -- --symlink "$(readlink /lib64)" /lib64
+elif test -d /lib64; then
+  set -- --ro-bind /lib64 /lib64
+fi
+
 timeout --kill-after=3s 50s /usr/bin/bwrap \
   --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --unshare-ipc \
   --die-with-parent --new-session --clearenv \
   --ro-bind /usr /usr --symlink usr/bin /bin \
-  --symlink usr/lib /lib --symlink usr/lib /lib64 \
+  --symlink usr/lib /lib "$@" \
   --proc /proc --dev /dev --tmpfs /tmp --dir /run --dir /etc \
   --ro-bind "$evidence/passwd" /etc/passwd \
   --ro-bind "$evidence/group" /etc/group \
